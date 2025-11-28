@@ -15,22 +15,9 @@ on:
           - linux
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            platform: mac
-          - os: ubuntu-latest
-            platform: linux
-          - os: windows-latest
-            platform: windows
-
-    runs-on: ${{ matrix.os }}
-
-    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == matrix.platform }}
-
+  build-mac:
+    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'mac' }}
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +25,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -46,19 +33,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build for ${{ matrix.platform }}
+      - name: Build for macOS
         working-directory: apps/desktop
         run: |
           pnpm exec electron-vite build
-          pnpm exec electron-builder --${{ matrix.platform == 'windows' && 'win' || matrix.platform }} --publish never
+          pnpm exec electron-builder --mac --publish never
 
-      - name: Build additional Linux packages
-        if: matrix.platform == 'linux'
-        working-directory: apps/desktop
-        run: pnpm exec electron-builder --linux deb --publish never
-
-      - name: Upload macOS artifacts
-        if: matrix.platform == 'mac'
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: data-peek-mac
@@ -67,8 +48,31 @@ jobs:
             apps/desktop/dist/*.zip
           if-no-files-found: error
 
-      - name: Upload Windows artifacts
-        if: matrix.platform == 'windows'
+  build-windows:
+    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows' }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build for Windows
+        working-directory: apps/desktop
+        run: |
+          pnpm exec electron-vite build
+          pnpm exec electron-builder --win --publish never
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: data-peek-windows
@@ -76,8 +80,35 @@ jobs:
             apps/desktop/dist/*.exe
           if-no-files-found: error
 
-      - name: Upload Linux artifacts
-        if: matrix.platform == 'linux'
+  build-linux:
+    if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'linux' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build for Linux
+        working-directory: apps/desktop
+        run: |
+          pnpm exec electron-vite build
+          pnpm exec electron-builder --linux --publish never
+
+      - name: Build deb package
+        working-directory: apps/desktop
+        run: pnpm exec electron-builder --linux deb --publish never
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: data-peek-linux
