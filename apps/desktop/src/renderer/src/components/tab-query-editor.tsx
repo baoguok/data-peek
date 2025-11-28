@@ -213,9 +213,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
 
     if (!tableInfo) return null
 
-    const primaryKeyColumns = tableInfo.columns
-      .filter((c) => c.isPrimaryKey)
-      .map((c) => c.name)
+    const primaryKeyColumns = tableInfo.columns.filter((c) => c.isPrimaryKey).map((c) => c.name)
 
     return {
       schema: tab.schemaName,
