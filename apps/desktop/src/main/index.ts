@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, safeStorage } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -49,27 +49,40 @@ import {
   type AIMessage,
   type StoredChatMessage
 } from './ai-service'
+import { initAutoUpdater } from './updater'
 import type { LicenseActivationRequest, SchemaInfo } from '@shared/index'
 
-// electron-store v11 is ESM-only, use dynamic import
-type StoreType = import('electron-store').default<{ connections: ConnectionConfig[] }>
-type SavedQueriesStoreType = import('electron-store').default<{ savedQueries: SavedQuery[] }>
-let store: StoreType
-let savedQueriesStore: SavedQueriesStoreType
+import { DpSecureStorage } from './storage'
+
+/**
+ * Generate a machine-specific encryption key using Electron's safeStorage.
+ * Falls back to a static key if safeStorage is not available.
+ */
+function getEncryptionKey(): string {
+  const baseKey = 'data-peek-secure-storage-key'
+  if (safeStorage.isEncryptionAvailable()) {
+    return safeStorage.encryptString(baseKey).toString('base64')
+  }
+  return baseKey
+}
+
+let store: DpSecureStorage<{ connections: ConnectionConfig[] }>
+let savedQueriesStore: DpSecureStorage<{ savedQueries: SavedQuery[] }>
 
 async function initStore(): Promise<void> {
-  const Store = (await import('electron-store')).default
-  store = new Store<{ connections: ConnectionConfig[] }>({
+  const encryptionKey = getEncryptionKey()
+
+  store = await DpSecureStorage.create<{ connections: ConnectionConfig[] }>({
     name: 'data-peek-connections',
-    encryptionKey: 'data-peek-secure-storage-key', // Encrypts sensitive data
+    encryptionKey,
     defaults: {
       connections: []
     }
   })
 
-  savedQueriesStore = new Store<{ savedQueries: SavedQuery[] }>({
+  savedQueriesStore = await DpSecureStorage.create<{ savedQueries: SavedQuery[] }>({
     name: 'data-peek-saved-queries',
-    encryptionKey: 'data-peek-secure-storage-key',
+    encryptionKey,
     defaults: {
       savedQueries: []
     }
@@ -202,19 +215,35 @@ app.whenReady().then(async () => {
       try {
         const adapter = getAdapter(config)
         console.log('[main:db:query] Connecting...')
-        const start = Date.now()
-        const result = await adapter.query(config, query)
-        const duration = Date.now() - start
-        console.log('[main:db:query] Query completed in', duration, 'ms')
-        console.log('[main:db:query] Rows:', result.rowCount)
+
+        // Use queryMultiple to support multiple statements
+        const multiResult = await adapter.queryMultiple(config, query)
+
+        console.log('[main:db:query] Query completed in', multiResult.totalDurationMs, 'ms')
+        console.log('[main:db:query] Statement count:', multiResult.results.length)
 
         return {
           success: true,
           data: {
-            rows: result.rows,
-            fields: result.fields,
-            rowCount: result.rowCount,
-            durationMs: duration
+            // Return multi-statement results
+            results: multiResult.results,
+            totalDurationMs: multiResult.totalDurationMs,
+            statementCount: multiResult.results.length,
+            // Also include legacy single-result format for backward compatibility
+            // (uses first data-returning result or first result if none)
+            rows:
+              multiResult.results.find((r) => r.isDataReturning)?.rows ||
+              multiResult.results[0]?.rows ||
+              [],
+            fields:
+              multiResult.results.find((r) => r.isDataReturning)?.fields ||
+              multiResult.results[0]?.fields ||
+              [],
+            rowCount:
+              multiResult.results.find((r) => r.isDataReturning)?.rowCount ??
+              multiResult.results[0]?.rowCount ??
+              0,
+            durationMs: multiResult.totalDurationMs
           }
         }
       } catch (error: unknown) {
@@ -969,6 +998,9 @@ app.whenReady().then(async () => {
   )
 
   await createWindow()
+
+  // Initialize auto-updater (only runs in production)
+  initAutoUpdater()
 
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
