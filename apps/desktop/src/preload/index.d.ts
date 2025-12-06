@@ -2,7 +2,7 @@ import { ElectronAPI } from '@electron-toolkit/preload'
 import type {
   ConnectionConfig,
   IpcResponse,
-  DatabaseSchema,
+  DatabaseSchemaResponse,
   EditBatch,
   EditResult,
   TableDefinition,
@@ -27,6 +27,20 @@ interface AIConfig {
   baseUrl?: string
 }
 
+// Multi-provider config types
+interface AIProviderConfig {
+  apiKey?: string
+  baseUrl?: string
+}
+
+type AIProviderConfigs = Partial<Record<AIProvider, AIProviderConfig>>
+
+interface AIMultiProviderConfig {
+  providers: AIProviderConfigs
+  activeProvider: AIProvider
+  activeModels: Partial<Record<AIProvider, string>>
+}
+
 interface AIMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -35,50 +49,27 @@ interface AIMessage {
 // Structured AI response types
 type AIResponseType = 'message' | 'query' | 'chart' | 'metric' | 'schema'
 
-interface AIQueryResponse {
-  type: 'query'
+// Flat schema with nullable fields for AI provider compatibility
+interface AIChatResponse {
+  type: AIResponseType
   message: string
-  sql: string
-  explanation: string
-  warning?: string
+  // Query fields (null when type is not query)
+  sql: string | null
+  explanation: string | null
+  warning: string | null
+  requiresConfirmation: boolean | null
+  // Chart fields (null when type is not chart)
+  title: string | null
+  description: string | null
+  chartType: 'bar' | 'line' | 'pie' | 'area' | null
+  xKey: string | null
+  yKeys: string[] | null
+  // Metric fields (null when type is not metric)
+  label: string | null
+  format: 'number' | 'currency' | 'percent' | 'duration' | null
+  // Schema fields (null when type is not schema)
+  tables: string[] | null
 }
-
-interface AIChartResponse {
-  type: 'chart'
-  message: string
-  title: string
-  description?: string
-  chartType: 'bar' | 'line' | 'pie' | 'area'
-  sql: string
-  xKey: string
-  yKeys: string[]
-}
-
-interface AIMetricResponse {
-  type: 'metric'
-  message: string
-  label: string
-  sql: string
-  format: 'number' | 'currency' | 'percent' | 'duration'
-}
-
-interface AISchemaResponse {
-  type: 'schema'
-  message: string
-  tables: string[]
-}
-
-interface AIMessageResponse {
-  type: 'message'
-  message: string
-}
-
-type AIChatResponse =
-  | AIQueryResponse
-  | AIChartResponse
-  | AIMetricResponse
-  | AISchemaResponse
-  | AIMessageResponse
 
 // Stored response data types (without message field since it's in content)
 interface StoredQueryData {
@@ -144,8 +135,17 @@ interface DataPeekApi {
   }
   db: {
     connect: (config: ConnectionConfig) => Promise<IpcResponse<void>>
-    query: (config: ConnectionConfig, query: string) => Promise<IpcResponse<unknown>>
-    schemas: (config: ConnectionConfig) => Promise<IpcResponse<DatabaseSchema>>
+    query: (
+      config: ConnectionConfig,
+      query: string,
+      executionId?: string
+    ) => Promise<IpcResponse<unknown>>
+    cancelQuery: (executionId: string) => Promise<IpcResponse<{ cancelled: boolean }>>
+    schemas: (
+      config: ConnectionConfig,
+      forceRefresh?: boolean
+    ) => Promise<IpcResponse<DatabaseSchemaResponse>>
+    invalidateSchemaCache: (config: ConnectionConfig) => Promise<IpcResponse<void>>
     execute: (config: ConnectionConfig, batch: EditBatch) => Promise<IpcResponse<EditResult>>
     previewSql: (
       batch: EditBatch
@@ -198,6 +198,7 @@ interface DataPeekApi {
       type?: LicenseType,
       daysValid?: number
     ) => Promise<IpcResponse<LicenseStatus>>
+    openCustomerPortal: () => Promise<IpcResponse<void>>
   }
   savedQueries: {
     list: () => Promise<IpcResponse<SavedQuery[]>>
@@ -206,6 +207,13 @@ interface DataPeekApi {
     delete: (id: string) => Promise<IpcResponse<void>>
     incrementUsage: (id: string) => Promise<IpcResponse<SavedQuery>>
     onOpenDialog: (callback: () => void) => () => void
+  }
+  updater: {
+    onUpdateAvailable: (callback: (version: string) => void) => () => void
+    onUpdateDownloaded: (callback: (version: string) => void) => () => void
+    onDownloadProgress: (callback: (percent: number) => void) => () => void
+    onError: (callback: (message: string) => void) => () => void
+    quitAndInstall: () => void
   }
   ai: {
     getConfig: () => Promise<IpcResponse<AIConfig | null>>
@@ -237,6 +245,17 @@ interface DataPeekApi {
       updates: { messages?: StoredChatMessage[]; title?: string }
     ) => Promise<IpcResponse<ChatSession | null>>
     deleteSession: (connectionId: string, sessionId: string) => Promise<IpcResponse<boolean>>
+    // Multi-provider configuration
+    getMultiProviderConfig: () => Promise<IpcResponse<AIMultiProviderConfig | null>>
+    setMultiProviderConfig: (config: AIMultiProviderConfig | null) => Promise<IpcResponse<void>>
+    getProviderConfig: (provider: AIProvider) => Promise<IpcResponse<AIProviderConfig | null>>
+    setProviderConfig: (
+      provider: AIProvider,
+      config: AIProviderConfig
+    ) => Promise<IpcResponse<void>>
+    removeProviderConfig: (provider: AIProvider) => Promise<IpcResponse<void>>
+    setActiveProvider: (provider: AIProvider) => Promise<IpcResponse<void>>
+    setActiveModel: (provider: AIProvider, model: string) => Promise<IpcResponse<void>>
   }
 }
 

@@ -17,7 +17,8 @@ import {
   DatabaseZap,
   BarChart3,
   Bookmark,
-  Maximize2
+  Maximize2,
+  Square
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -42,6 +43,7 @@ import {
 import type { EditContext } from '@data-peek/shared'
 import { SQLEditor } from '@/components/sql-editor'
 import { formatSQL } from '@/lib/sql-formatter'
+import { keys } from '@/lib/utils'
 import { downloadCSV, downloadJSON, generateExportFilename } from '@/lib/export'
 import { buildSelectQuery } from '@/lib/sql-helpers'
 import type { QueryResult as IpcQueryResult, ForeignKeyInfo, ColumnInfo } from '@data-peek/shared'
@@ -152,17 +154,20 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
       return
     }
 
-    updateTabExecuting(tabId, true)
+    // Generate unique execution ID for cancellation support
+    const executionId = crypto.randomUUID()
+    updateTabExecuting(tabId, true, executionId)
 
     try {
-      const response = await window.api.db.query(tabConnection, tab.query)
+      const response = await window.api.db.query(tabConnection, tab.query, executionId)
 
       if (response.success && response.data) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const data = response.data as any
+        const data = response.data as
+          | { results: StatementResult[]; totalDurationMs: number; statementCount: number }
+          | IpcQueryResult
 
         // Check if we have multi-statement results
-        if (data.results && Array.isArray(data.results)) {
+        if ('results' in data && Array.isArray(data.results)) {
           // Multi-statement result
           const multiResult: MultiQueryResult = {
             statements: data.results as StatementResult[],
@@ -184,14 +189,15 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
           })
         } else {
           // Legacy single result (fallback)
+          const singleResult = data as IpcQueryResult
           const result = {
-            columns: data.fields.map((f: { name: string; dataType: string }) => ({
+            columns: singleResult.fields.map((f: { name: string; dataType: string }) => ({
               name: f.name,
               dataType: f.dataType
             })),
-            rows: data.rows,
-            rowCount: data.rowCount ?? data.rows.length,
-            durationMs: data.durationMs
+            rows: singleResult.rows,
+            rowCount: singleResult.rowCount ?? singleResult.rows.length,
+            durationMs: singleResult.durationMs
           }
 
           updateTabResult(tabId, result, null)
@@ -199,7 +205,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
 
           addToHistory({
             query: tab.query,
-            durationMs: data.durationMs,
+            durationMs: singleResult.durationMs,
             rowCount: result.rowCount,
             status: 'success',
             connectionId: tabConnection.id
@@ -234,6 +240,21 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
     markTabSaved,
     addToHistory
   ])
+
+  const handleCancelQuery = useCallback(async () => {
+    if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return
+    if (!tab.isExecuting || !tab.executionId) return
+
+    try {
+      const response = await window.api.db.cancelQuery(tab.executionId)
+      if (response.success) {
+        updateTabMultiResult(tabId, null, 'Query cancelled by user')
+        updateTabExecuting(tabId, false, null)
+      }
+    } catch (error) {
+      console.error('Failed to cancel query:', error)
+    }
+  }, [tab, tabId, updateTabMultiResult, updateTabExecuting])
 
   const handleFormatQuery = () => {
     if (!tab || tab.type === 'erd' || tab.type === 'table-designer' || !tab.query.trim()) return
@@ -700,22 +721,31 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                 <PanelTopClose className="size-3.5" />
               )}
             </Button>
-            <Button
-              size="sm"
-              className="gap-1.5 h-7"
-              disabled={tab.isExecuting || !tab.query.trim()}
-              onClick={handleRunQuery}
-            >
-              {tab.isExecuting ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
+            {tab.isExecuting ? (
+              <Button
+                size="sm"
+                variant="destructive"
+                className="gap-1.5 h-7"
+                onClick={handleCancelQuery}
+              >
+                <Square className="size-3.5" />
+                Cancel
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                className="gap-1.5 h-7"
+                disabled={!tab.query.trim()}
+                onClick={handleRunQuery}
+              >
                 <Play className="size-3.5" />
-              )}
-              Run
-              <kbd className="ml-1.5 rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground">
-                ⌘↵
-              </kbd>
-            </Button>
+                Run
+                <kbd className="ml-1.5 rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground">
+                  {keys.mod}
+                  {keys.enter}
+                </kbd>
+              </Button>
+            )}
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -751,7 +781,8 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                   <Wand2 className="size-3.5" />
                   Format
                   <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
-                    ⌘⇧F
+                    {keys.mod}
+                    {keys.shift}F
                   </kbd>
                 </Button>
                 <Button
@@ -1041,7 +1072,9 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-center space-y-2">
                   <p className="text-muted-foreground">Run a query to see results</p>
-                  <p className="text-xs text-muted-foreground/70">Press ⌘+Enter to execute</p>
+                  <p className="text-xs text-muted-foreground/70">
+                    Press {keys.mod}+Enter to execute
+                  </p>
                 </div>
               </div>
             )}
@@ -1061,26 +1094,30 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
 
       {/* Execution Plan Panel */}
       {executionPlan && (
-        <div
-          className="fixed inset-y-0 right-0 z-50 shadow-xl"
-          style={{ width: executionPlanWidth }}
-        >
-          {/* Resize handle */}
+        <>
+          {/* Backdrop overlay */}
+          <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setExecutionPlan(null)} />
           <div
-            className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-primary/50 transition-colors z-10"
-            onMouseDown={(e) => {
-              e.preventDefault()
-              isResizing.current = true
-              document.body.style.cursor = 'ew-resize'
-              document.body.style.userSelect = 'none'
-            }}
-          />
-          <ExecutionPlanViewer
-            plan={executionPlan.plan as Parameters<typeof ExecutionPlanViewer>[0]['plan']}
-            durationMs={executionPlan.durationMs}
-            onClose={() => setExecutionPlan(null)}
-          />
-        </div>
+            className="fixed top-0 bottom-0 right-0 z-50 shadow-xl bg-background"
+            style={{ width: executionPlanWidth }}
+          >
+            {/* Resize handle */}
+            <div
+              className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-primary/50 transition-colors z-10"
+              onMouseDown={(e) => {
+                e.preventDefault()
+                isResizing.current = true
+                document.body.style.cursor = 'ew-resize'
+                document.body.style.userSelect = 'none'
+              }}
+            />
+            <ExecutionPlanViewer
+              plan={executionPlan.plan as Parameters<typeof ExecutionPlanViewer>[0]['plan']}
+              durationMs={executionPlan.durationMs}
+              onClose={() => setExecutionPlan(null)}
+            />
+          </div>
+        </>
       )}
 
       {/* Save Query Dialog */}

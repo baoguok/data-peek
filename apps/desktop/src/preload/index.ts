@@ -3,7 +3,7 @@ import { electronAPI } from '@electron-toolkit/preload'
 import type {
   ConnectionConfig,
   IpcResponse,
-  DatabaseSchema,
+  DatabaseSchemaResponse,
   EditBatch,
   EditResult,
   TableDefinition,
@@ -21,11 +21,22 @@ import type {
   AIMessage,
   AIChatResponse,
   StoredChatMessage,
-  ChatSession
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig
 } from '@shared/index'
 
 // Re-export AI types for renderer consumers
-export type { AIProvider, AIConfig, AIMessage, AIChatResponse, StoredChatMessage, ChatSession }
+export type {
+  AIProvider,
+  AIConfig,
+  AIMessage,
+  AIChatResponse,
+  StoredChatMessage,
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig
+}
 
 // Custom APIs for renderer
 const api = {
@@ -42,10 +53,21 @@ const api = {
   db: {
     connect: (config: ConnectionConfig): Promise<IpcResponse<void>> =>
       ipcRenderer.invoke('db:connect', config),
-    query: (config: ConnectionConfig, query: string): Promise<IpcResponse<unknown>> =>
-      ipcRenderer.invoke('db:query', { config, query }),
-    schemas: (config: ConnectionConfig): Promise<IpcResponse<DatabaseSchema>> =>
-      ipcRenderer.invoke('db:schemas', config),
+    query: (
+      config: ConnectionConfig,
+      query: string,
+      executionId?: string
+    ): Promise<IpcResponse<unknown>> =>
+      ipcRenderer.invoke('db:query', { config, query, executionId }),
+    cancelQuery: (executionId: string): Promise<IpcResponse<{ cancelled: boolean }>> =>
+      ipcRenderer.invoke('db:cancel-query', executionId),
+    schemas: (
+      config: ConnectionConfig,
+      forceRefresh?: boolean
+    ): Promise<IpcResponse<DatabaseSchemaResponse>> =>
+      ipcRenderer.invoke('db:schemas', { config, forceRefresh }),
+    invalidateSchemaCache: (config: ConnectionConfig): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('db:invalidate-schema-cache', config),
     execute: (config: ConnectionConfig, batch: EditBatch): Promise<IpcResponse<EditResult>> =>
       ipcRenderer.invoke('db:execute', { config, batch }),
     previewSql: (
@@ -135,7 +157,9 @@ const api = {
       type?: LicenseType,
       daysValid?: number
     ): Promise<IpcResponse<LicenseStatus>> =>
-      ipcRenderer.invoke('license:activate-offline', { key, email, type, daysValid })
+      ipcRenderer.invoke('license:activate-offline', { key, email, type, daysValid }),
+    openCustomerPortal: (): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('license:customer-portal')
   },
   // Saved queries management
   savedQueries: {
@@ -155,6 +179,32 @@ const api = {
     }
   },
   // AI Assistant
+  // Auto-updater event listeners
+  updater: {
+    onUpdateAvailable: (callback: (version: string) => void): (() => void) => {
+      const handler = (_: unknown, version: string): void => callback(version)
+      ipcRenderer.on('updater:update-available', handler)
+      return () => ipcRenderer.removeListener('updater:update-available', handler)
+    },
+    onUpdateDownloaded: (callback: (version: string) => void): (() => void) => {
+      const handler = (_: unknown, version: string): void => callback(version)
+      ipcRenderer.on('updater:update-downloaded', handler)
+      return () => ipcRenderer.removeListener('updater:update-downloaded', handler)
+    },
+    onDownloadProgress: (callback: (percent: number) => void): (() => void) => {
+      const handler = (_: unknown, percent: number): void => callback(percent)
+      ipcRenderer.on('updater:download-progress', handler)
+      return () => ipcRenderer.removeListener('updater:download-progress', handler)
+    },
+    onError: (callback: (message: string) => void): (() => void) => {
+      const handler = (_: unknown, message: string): void => callback(message)
+      ipcRenderer.on('updater:error', handler)
+      return () => ipcRenderer.removeListener('updater:error', handler)
+    },
+    quitAndInstall: (): void => {
+      ipcRenderer.send('updater:quit-and-install')
+    }
+  },
   ai: {
     getConfig: (): Promise<IpcResponse<AIConfig | null>> => ipcRenderer.invoke('ai:get-config'),
     setConfig: (config: AIConfig): Promise<IpcResponse<void>> =>
@@ -195,7 +245,25 @@ const api = {
     ): Promise<IpcResponse<ChatSession | null>> =>
       ipcRenderer.invoke('ai:update-session', { connectionId, sessionId, updates }),
     deleteSession: (connectionId: string, sessionId: string): Promise<IpcResponse<boolean>> =>
-      ipcRenderer.invoke('ai:delete-session', { connectionId, sessionId })
+      ipcRenderer.invoke('ai:delete-session', { connectionId, sessionId }),
+    // Multi-provider configuration
+    getMultiProviderConfig: (): Promise<IpcResponse<AIMultiProviderConfig | null>> =>
+      ipcRenderer.invoke('ai:get-multi-provider-config'),
+    setMultiProviderConfig: (config: AIMultiProviderConfig | null): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-multi-provider-config', config),
+    getProviderConfig: (provider: AIProvider): Promise<IpcResponse<AIProviderConfig | null>> =>
+      ipcRenderer.invoke('ai:get-provider-config', provider),
+    setProviderConfig: (
+      provider: AIProvider,
+      config: AIProviderConfig
+    ): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-provider-config', { provider, config }),
+    removeProviderConfig: (provider: AIProvider): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:remove-provider-config', provider),
+    setActiveProvider: (provider: AIProvider): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-active-provider', provider),
+    setActiveModel: (provider: AIProvider, model: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-active-model', { provider, model })
   }
 }
 

@@ -1,6 +1,10 @@
-import { app } from 'electron'
-import { existsSync, unlinkSync } from 'fs'
+import { app, safeStorage } from 'electron'
+import { existsSync, unlinkSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { randomBytes } from 'crypto'
+import { createLogger } from './lib/logger'
+
+const log = createLogger('storage')
 
 // electron-store requires Record<string, any> constraint
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -12,6 +16,63 @@ type StoreOptions<T extends StoreRecord> = {
   defaults: T
 }
 
+// Cache the encryption key in memory for the session
+let cachedEncryptionKey: string | null = null
+
+/**
+ * Get or create a persistent encryption key using Electron's safeStorage.
+ * The key is generated once and stored encrypted on disk.
+ * Falls back to a static key if safeStorage is not available.
+ */
+export function getEncryptionKey(): string {
+  // Return cached key if available
+  if (cachedEncryptionKey) {
+    return cachedEncryptionKey
+  }
+
+  const userDataPath = app.getPath('userData')
+  const keyFilePath = join(userDataPath, '.encryption-key')
+
+  // Check if safeStorage is available
+  if (!safeStorage.isEncryptionAvailable()) {
+    log.warn('safeStorage not available, using static fallback key')
+    cachedEncryptionKey = 'data-peek-fallback-key-v1'
+    return cachedEncryptionKey
+  }
+
+  try {
+    if (existsSync(keyFilePath)) {
+      // Read and decrypt existing key
+      const encryptedKey = readFileSync(keyFilePath)
+      cachedEncryptionKey = safeStorage.decryptString(encryptedKey)
+      return cachedEncryptionKey
+    }
+  } catch {
+    log.warn('Failed to read encryption key, generating new one')
+    // Delete corrupted key file
+    try {
+      unlinkSync(keyFilePath)
+    } catch {
+      // Ignore deletion errors
+    }
+  }
+
+  // Generate a new random key
+  const newKey = randomBytes(32).toString('hex')
+  try {
+    const encryptedKey = safeStorage.encryptString(newKey)
+    writeFileSync(keyFilePath, encryptedKey)
+    cachedEncryptionKey = newKey
+    log.debug('Generated and stored new encryption key')
+    return cachedEncryptionKey
+  } catch (error) {
+    log.error('Failed to store encryption key:', error)
+    // Fall back to static key if we can't write
+    cachedEncryptionKey = 'data-peek-fallback-key-v1'
+    return cachedEncryptionKey
+  }
+}
+
 /**
  * Safely delete a store file if it exists
  */
@@ -21,10 +82,10 @@ function deleteStoreFile(storeName: string): void {
     const storePath = join(userDataPath, `${storeName}.json`)
     if (existsSync(storePath)) {
       unlinkSync(storePath)
-      console.log(`[storage] Deleted corrupted store: ${storePath}`)
+      log.warn('Deleted corrupted store:', storePath)
     }
   } catch (error) {
-    console.error(`[storage] Failed to delete store file:`, error)
+    log.error('Failed to delete store file:', error)
   }
 }
 
@@ -57,8 +118,8 @@ export class DpStorage<T extends StoreRecord> {
     try {
       const store = new Store<T>(options)
       return new DpStorage(store, options.name)
-    } catch (error) {
-      console.warn(`[storage] Store "${options.name}" corrupted, recreating:`, error)
+    } catch {
+      log.warn(`Store "${options.name}" corrupted, recreating`)
       deleteStoreFile(options.name)
       const store = new Store<T>(options)
       return new DpStorage(store, options.name)
@@ -103,6 +164,12 @@ export class DpStorage<T extends StoreRecord> {
 /**
  * DpSecureStorage - Encrypted storage with automatic corruption recovery
  *
+ * Uses a persistent encryption key stored securely via Electron's safeStorage.
+ * The key is generated once and reused across sessions.
+ *
+ * NOTE: Currently not in use due to corruption issues. Using DpStorage instead.
+ * TODO: Investigate and fix safeStorage corruption issues before re-enabling.
+ *
  * Usage:
  *   const store = await DpSecureStorage.create<{ secret: string }>({
  *     name: 'secure-store',
@@ -122,17 +189,18 @@ export class DpSecureStorage<T extends StoreRecord> {
    * Create a new encrypted storage instance with automatic corruption recovery
    */
   static async create<T extends StoreRecord>(
-    options: Omit<StoreOptions<T>, 'encryptionKey'> & { encryptionKey: string }
+    options: Omit<StoreOptions<T>, 'encryptionKey'>
   ): Promise<DpSecureStorage<T>> {
     const Store = (await import('electron-store')).default
+    const encryptionKey = getEncryptionKey()
 
     try {
-      const store = new Store<T>(options)
+      const store = new Store<T>({ ...options, encryptionKey })
       return new DpSecureStorage(store, options.name)
-    } catch (error) {
-      console.warn(`[storage] Secure store "${options.name}" corrupted, recreating:`, error)
+    } catch {
+      log.warn(`Secure store "${options.name}" corrupted, recreating`)
       deleteStoreFile(options.name)
-      const store = new Store<T>(options)
+      const store = new Store<T>({ ...options, encryptionKey })
       return new DpSecureStorage(store, options.name)
     }
   }

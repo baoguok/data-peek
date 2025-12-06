@@ -11,14 +11,18 @@ import type {
   IndexDefinition,
   SequenceInfo,
   CustomTypeInfo,
-  StatementResult
+  StatementResult,
+  RoutineInfo,
+  RoutineParameterInfo
 } from '@shared/index'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  ExplainResult,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
 
 const MSSQL_TYPE_MAP: Record<number, string> = {
   34: 'image',
@@ -387,7 +391,8 @@ export class MSSQLAdapter implements DatabaseAdapter {
 
   async queryMultiple(
     config: ConnectionConfig,
-    sqlQuery: string
+    sqlQuery: string,
+    options?: QueryOptions
   ): Promise<AdapterMultiQueryResult> {
     const pool = new sql.ConnectionPool(toMSSQLConfig(config))
     await pool.connect()
@@ -403,7 +408,14 @@ export class MSSQLAdapter implements DatabaseAdapter {
         const stmtStart = Date.now()
 
         try {
-          const result = await pool.request().query(statement)
+          const request = pool.request()
+
+          // Register the current request for cancellation support
+          if (options?.executionId) {
+            registerQuery(options.executionId, { type: 'mssql', request })
+          }
+
+          const result = await request.query(statement)
           const stmtDuration = Date.now() - stmtStart
 
           const rows = (result.recordset || []) as Record<string, unknown>[]
@@ -455,6 +467,11 @@ export class MSSQLAdapter implements DatabaseAdapter {
             durationMs: stmtDuration,
             isDataReturning
           })
+
+          // Unregister after each statement completes successfully
+          if (options?.executionId) {
+            unregisterQuery(options.executionId)
+          }
         } catch (error) {
           const stmtDuration = Date.now() - stmtStart
           const errorMessage = error instanceof Error ? error.message : String(error)
@@ -480,6 +497,10 @@ export class MSSQLAdapter implements DatabaseAdapter {
         totalDurationMs: Date.now() - totalStart
       }
     } finally {
+      // Unregister from tracker
+      if (options?.executionId) {
+        unregisterQuery(options.executionId)
+      }
       await pool.close()
     }
   }
@@ -581,7 +602,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
           )
       ])
 
-      const [columnsResult, foreignKeysResult] = await Promise.all([
+      const [columnsResult, foreignKeysResult, routinesResult, paramsResult] = await Promise.all([
         pool.request().query(`
           SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable,
                  c.column_default, c.ordinal_position, c.character_maximum_length,
@@ -616,8 +637,55 @@ export class MSSQLAdapter implements DatabaseAdapter {
             AND fk_schema.table_schema NOT IN (${schemaList})
             AND pk_schema.table_schema NOT IN (${schemaList})
           ORDER BY fk_schema.table_schema, fk_schema.table_name, fk_col.column_name
+        `),
+        pool.request().query(`
+          SELECT r.routine_schema, r.routine_name, r.routine_type,
+                 r.data_type as return_type, r.specific_name
+          FROM information_schema.routines r
+          WHERE r.routine_schema NOT IN (${schemaList})
+          ORDER BY r.routine_schema, r.routine_name
+        `),
+        pool.request().query(`
+          SELECT p.specific_schema, p.specific_name, p.parameter_name,
+                 p.data_type, p.parameter_mode, p.ordinal_position
+          FROM information_schema.parameters p
+          WHERE p.specific_schema NOT IN (${schemaList})
+            AND p.parameter_name IS NOT NULL
+          ORDER BY p.specific_schema, p.specific_name, p.ordinal_position
         `)
       ])
+
+      // Build parameters lookup map
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of paramsResult.recordset) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Build routines lookup map
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routinesResult.recordset) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const routineParams = paramsMap.get(paramsKey) || []
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: routineParams
+        })
+      }
 
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
@@ -626,7 +694,8 @@ export class MSSQLAdapter implements DatabaseAdapter {
       for (const row of schemasResult.recordset) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || []
         })
       }
 

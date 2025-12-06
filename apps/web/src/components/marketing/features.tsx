@@ -11,9 +11,20 @@ import {
   Pencil,
   FileJson,
   Clock,
+  Sparkles,
+  BarChart3,
+  Command,
+  Bookmark,
 } from 'lucide-react'
 
 const features = [
+  {
+    icon: Sparkles,
+    title: 'AI Assistant',
+    description: 'Ask questions in plain English, get SQL queries. Generate charts and insights from your data.',
+    color: '#a855f7',
+    highlight: true,
+  },
   {
     icon: Zap,
     title: 'Lightning Fast',
@@ -21,16 +32,22 @@ const features = [
     color: '#fbbf24',
   },
   {
+    icon: Command,
+    title: 'Command Palette',
+    description: 'Cmd+K to access everything. Find commands, switch connections, run queries instantly.',
+    color: '#22d3ee',
+  },
+  {
     icon: Keyboard,
     title: 'Keyboard-First',
     description: 'Power users can do everything without touching the mouse. Cmd+Enter to run, done.',
-    color: '#22d3ee',
+    color: '#60a5fa',
   },
   {
     icon: Code2,
     title: 'Monaco Editor',
     description: 'The same editor engine that powers VS Code. Syntax highlighting, autocomplete, formatting.',
-    color: '#a855f7',
+    color: '#f472b6',
   },
   {
     icon: Table2,
@@ -42,49 +59,61 @@ const features = [
     icon: GitBranch,
     title: 'ER Diagrams',
     description: 'Visualize your schema with interactive diagrams. See relationships at a glance.',
-    color: '#f472b6',
+    color: '#fb923c',
   },
   {
     icon: Pencil,
     title: 'Inline Editing',
-    description: 'Double-click to edit. Add, update, delete rows directly. Preview SQL before commit.',
-    color: '#fb923c',
+    description: 'Click to edit. Add, update, delete rows directly. Preview SQL before commit.',
+    color: '#fbbf24',
+  },
+  {
+    icon: Bookmark,
+    title: 'Saved Queries',
+    description: 'Bookmark your favorite queries. Organize with folders. Quick access when you need them.',
+    color: '#c084fc',
   },
   {
     icon: Eye,
     title: 'Query Plans',
-    description: 'EXPLAIN ANALYZE visualized. See exactly how PostgreSQL executes your queries.',
-    color: '#60a5fa',
+    description: 'EXPLAIN ANALYZE visualized. See exactly how your database executes queries.',
+    color: '#2dd4bf',
+  },
+  {
+    icon: BarChart3,
+    title: 'AI Charts',
+    description: 'Generate bar, line, pie, and area charts from your data with natural language.',
+    color: '#a855f7',
   },
   {
     icon: Clock,
     title: 'Query History',
     description: 'Every query saved automatically. Search, filter, and re-run past queries instantly.',
-    color: '#c084fc',
+    color: '#94a3b8',
   },
   {
     icon: FileJson,
     title: 'Export Anywhere',
     description: 'CSV, JSON, copy as SQL. Get your data out in the format you need.',
-    color: '#2dd4bf',
+    color: '#4ade80',
   },
   {
     icon: Moon,
     title: 'Dark & Light',
     description: 'Beautiful themes that match your system preference. Easy on the eyes, day or night.',
-    color: '#94a3b8',
+    color: '#60a5fa',
   },
   {
     icon: Shield,
     title: 'Privacy-First',
-    description: 'No telemetry, no tracking, no cloud. Your credentials stay encrypted on your machine.',
-    color: '#4ade80',
+    description: 'No telemetry, no tracking. Your credentials stay encrypted on your machine.',
+    color: '#22d3ee',
   },
   {
     icon: Database,
-    title: 'PostgreSQL Native',
-    description: 'Built specifically for PostgreSQL. Every feature optimized for Postgres workflows.',
-    color: '#22d3ee',
+    title: 'Multi-Database',
+    description: 'PostgreSQL, MySQL, and SQL Server. One client for all your databases.',
+    color: '#fb923c',
   },
 ]
 
@@ -170,7 +199,30 @@ export function Features() {
 
         {/* Feature Screenshots */}
         <div className="mt-16 sm:mt-24 grid grid-cols-1 md:grid-cols-2 gap-6 sm:gap-8">
-          {/* Query Editor Screenshot */}
+          {/* AI Assistant Screenshot - Charts */}
+          <div className="space-y-3 sm:space-y-4">
+            <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#a855f7]/10 border border-[#a855f7]/20 flex items-center justify-center">
+                <Sparkles className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#a855f7]" />
+              </div>
+              <h3
+                className="text-base sm:text-lg font-medium"
+                style={{ fontFamily: 'var(--font-display)' }}
+              >
+                AI Charts & Metrics
+              </h3>
+            </div>
+            <div className="rounded-lg sm:rounded-xl overflow-hidden border border-[--color-border]">
+              <img
+                src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/ai-assitant.png"
+                alt="AI Assistant generating charts and metrics"
+                className="w-full h-auto"
+                loading="lazy"
+              />
+            </div>
+          </div>
+
+          {/* AI Assistant Screenshot - Queries */}
           <div className="space-y-3 sm:space-y-4">
             <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
               <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[--color-accent]/10 border border-[--color-accent]/20 flex items-center justify-center">
@@ -180,21 +232,27 @@ export function Features() {
                 className="text-base sm:text-lg font-medium"
                 style={{ fontFamily: 'var(--font-display)' }}
               >
-                Query Editor
+                AI Query Generation
               </h3>
             </div>
-            <div className="screenshot-placeholder min-h-[220px] sm:min-h-[300px] rounded-lg sm:rounded-xl">
-              <div className="flex flex-col items-center gap-2 z-10 text-sm">
-                <span>screenshot_editor.png</span>
-              </div>
+            <div className="rounded-lg sm:rounded-xl overflow-hidden border border-[--color-border]">
+              <img
+                src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/ai-assitant-2.png"
+                alt="AI Assistant generating SQL queries"
+                className="w-full h-auto"
+                loading="lazy"
+              />
             </div>
           </div>
+        </div>
 
+        {/* Second row of screenshots */}
+        <div className="mt-6 sm:mt-8 grid grid-cols-1 md:grid-cols-2 gap-6 sm:gap-8">
           {/* ER Diagram Screenshot */}
           <div className="space-y-3 sm:space-y-4">
             <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
-              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#f472b6]/10 border border-[#f472b6]/20 flex items-center justify-center">
-                <GitBranch className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#f472b6]" />
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#fb923c]/10 border border-[#fb923c]/20 flex items-center justify-center">
+                <GitBranch className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#fb923c]" />
               </div>
               <h3
                 className="text-base sm:text-lg font-medium"
@@ -203,10 +261,61 @@ export function Features() {
                 ER Diagrams
               </h3>
             </div>
-            <div className="screenshot-placeholder min-h-[220px] sm:min-h-[300px] rounded-lg sm:rounded-xl">
-              <div className="flex flex-col items-center gap-2 z-10 text-sm">
-                <span>screenshot_erd.png</span>
+            <div className="rounded-lg sm:rounded-xl overflow-hidden border border-[--color-border]">
+              <img
+                src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/erd.png"
+                alt="Interactive ER diagram visualization"
+                className="w-full h-auto"
+                loading="lazy"
+              />
+            </div>
+          </div>
+
+          {/* Command Palette Screenshot */}
+          <div className="space-y-3 sm:space-y-4">
+            <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#22d3ee]/10 border border-[#22d3ee]/20 flex items-center justify-center">
+                <Command className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#22d3ee]" />
               </div>
+              <h3
+                className="text-base sm:text-lg font-medium"
+                style={{ fontFamily: 'var(--font-display)' }}
+              >
+                Command Palette
+              </h3>
+            </div>
+            <div className="rounded-lg sm:rounded-xl overflow-hidden border border-[--color-border]">
+              <img
+                src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/command-bar.png"
+                alt="Command palette for quick actions"
+                className="w-full h-auto"
+                loading="lazy"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Third row - Light Mode */}
+        <div className="mt-6 sm:mt-8">
+          <div className="space-y-3 sm:space-y-4">
+            <div className="flex items-center gap-2 sm:gap-3 mb-1 sm:mb-2">
+              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#60a5fa]/10 border border-[#60a5fa]/20 flex items-center justify-center">
+                <Moon className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#60a5fa]" />
+              </div>
+              <h3
+                className="text-base sm:text-lg font-medium"
+                style={{ fontFamily: 'var(--font-display)' }}
+              >
+                Light Mode
+              </h3>
+            </div>
+            <div className="rounded-lg sm:rounded-xl overflow-hidden border border-[--color-border]">
+              <img
+                src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/light-mode.png"
+                alt="Data Peek in light mode"
+                className="w-full h-auto"
+                loading="lazy"
+              />
             </div>
           </div>
         </div>

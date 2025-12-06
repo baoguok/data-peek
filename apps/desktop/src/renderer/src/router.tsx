@@ -9,6 +9,7 @@ import {
 } from '@tanstack/react-router'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Moon, Sun, Monitor, Sparkles, Command } from 'lucide-react'
+import { useAutoUpdater } from '@/hooks/use-auto-updater'
 import { ThemeProvider, useTheme } from '@/components/theme-provider'
 import {
   CommandPalette,
@@ -32,11 +33,12 @@ import { LicenseStatusIndicator } from '@/components/license-status-indicator'
 import { LicenseActivationModal } from '@/components/license-activation-modal'
 import { LicenseSettingsModal } from '@/components/license-settings-modal'
 import { AIChatPanel, AISettingsModal } from '@/components/ai'
+import { Notifications } from '@/components/notifications'
 import { useAIStore } from '@/stores/ai-store'
 import { Switch } from '@/components/ui/switch'
 import { Label } from '@/components/ui/label'
 import { useConnectionStore, useLicenseStore, useSettingsStore, useTabStore } from '@/stores'
-import { cn } from '@/lib/utils'
+import { cn, keys } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
@@ -73,9 +75,13 @@ function LayoutContent() {
   const isAISettingsOpen = useAIStore((s) => s.isSettingsOpen)
   const openAISettings = useAIStore((s) => s.openSettings)
   const closeAISettings = useAIStore((s) => s.closeSettings)
-  const aiConfig = useAIStore((s) => s.config)
+  const multiProviderConfig = useAIStore((s) => s.multiProviderConfig)
   const isAIConfigured = useAIStore((s) => s.isConfigured)
-  const setAIConfig = useAIStore((s) => s.setConfig)
+  const setProviderConfig = useAIStore((s) => s.setProviderConfig)
+  const removeProviderConfig = useAIStore((s) => s.removeProviderConfig)
+  const setActiveProvider = useAIStore((s) => s.setActiveProvider)
+  const setActiveModel = useAIStore((s) => s.setActiveModel)
+  const loadConfigFromMain = useAIStore((s) => s.loadConfigFromMain)
 
   // Get schemas for AI context
   const schemas = useConnectionStore((s) => s.schemas)
@@ -92,6 +98,11 @@ function LayoutContent() {
     },
     [activeConnection, createQueryTab, setActiveTab]
   )
+
+  // Load AI config from main process on mount
+  useEffect(() => {
+    loadConfigFromMain()
+  }, [loadConfigFromMain])
 
   // Handle connection switching
   const handleSelectConnection = useCallback(
@@ -114,7 +125,7 @@ function LayoutContent() {
         label: 'Open AI Assistant',
         description: 'Chat with AI to generate SQL queries',
         icon: <Sparkles className="size-4 text-blue-400" />,
-        shortcut: ['⌘', 'I'],
+        shortcut: [keys.mod, 'I'],
         category: 'AI',
         action: () => openAIPanel(),
         keywords: ['chat', 'assistant', 'generate', 'sql']
@@ -135,7 +146,7 @@ function LayoutContent() {
         label: 'Switch Connection',
         description: 'Open connection picker',
         icon: <Database className="size-4 text-emerald-400" />,
-        shortcut: ['⌘', 'P'],
+        shortcut: [keys.mod, 'P'],
         category: 'Connections',
         action: () => setIsConnectionPickerOpen(true),
         keywords: ['database', 'connect', 'switch']
@@ -160,7 +171,7 @@ function LayoutContent() {
         label: 'New Query Tab',
         description: 'Create a new query tab',
         icon: <Plus className="size-4 text-amber-400" />,
-        shortcut: ['⌘', 'T'],
+        shortcut: [keys.mod, 'T'],
         category: 'Queries',
         action: () => {
           const tabId = createQueryTab(activeConnection?.id || null)
@@ -193,7 +204,7 @@ function LayoutContent() {
         label: 'Toggle Sidebar',
         description: 'Show or hide the sidebar',
         icon: <Command className="size-4 text-purple-400" />,
-        shortcut: ['⌘', 'B'],
+        shortcut: [keys.mod, 'B'],
         category: 'Navigation',
         action: () => toggleSidebar(),
         keywords: ['panel', 'hide', 'show']
@@ -245,7 +256,7 @@ function LayoutContent() {
         label: conn.name,
         description: `Switch to ${conn.dbType} connection`,
         icon: <Database className="size-4 text-emerald-400" />,
-        shortcut: ['⌘', '⇧', String(index + 1)],
+        shortcut: [keys.mod, keys.shift, String(index + 1)],
         category: 'Connections',
         action: () => handleSelectConnection(conn.id),
         keywords: [conn.dbType, conn.host || '']
@@ -346,7 +357,7 @@ function LayoutContent() {
                   <Command className="size-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">Command Palette (⌘K)</TooltipContent>
+              <TooltipContent side="bottom">Command Palette ({keys.mod}+K)</TooltipContent>
             </Tooltip>
             {/* AI Assistant Button */}
             <Tooltip>
@@ -363,7 +374,7 @@ function LayoutContent() {
                   <Sparkles className="size-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">AI Assistant (⌘I)</TooltipContent>
+              <TooltipContent side="bottom">AI Assistant ({keys.mod}+I)</TooltipContent>
             </Tooltip>
             <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
             <LicenseStatusIndicator />
@@ -407,16 +418,30 @@ function LayoutContent() {
       <AISettingsModal
         isOpen={isAISettingsOpen}
         onClose={closeAISettings}
-        currentConfig={aiConfig}
-        onSave={async (config) => {
+        multiProviderConfig={multiProviderConfig}
+        onSaveProviderConfig={async (provider, config) => {
           // Save to local store
-          setAIConfig(config)
+          setProviderConfig(provider, config)
           // Save to main process
-          await window.api.ai.setConfig(config)
+          await window.api.ai.setProviderConfig(provider, config)
         }}
-        onClear={async () => {
-          setAIConfig(null)
-          await window.api.ai.clearConfig()
+        onRemoveProviderConfig={async (provider) => {
+          // Remove from local store
+          removeProviderConfig(provider)
+          // Remove from main process
+          await window.api.ai.removeProviderConfig(provider)
+        }}
+        onSetActiveProvider={async (provider) => {
+          // Set active in local store
+          setActiveProvider(provider)
+          // Set active in main process
+          await window.api.ai.setActiveProvider(provider)
+        }}
+        onSetActiveModel={async (provider, model) => {
+          // Set model in local store
+          setActiveModel(provider, model)
+          // Set model in main process
+          await window.api.ai.setActiveModel(provider, model)
         }}
       />
     </>
@@ -425,10 +450,14 @@ function LayoutContent() {
 
 // Root Layout wrapper that provides context
 function RootLayout() {
+  // Initialize auto-updater notifications
+  useAutoUpdater()
+
   return (
     <ThemeProvider defaultTheme="dark" storageKey="data-peek-theme">
       <SidebarProvider>
         <LayoutContent />
+        <Notifications />
       </SidebarProvider>
     </ThemeProvider>
   )
@@ -504,7 +533,9 @@ function SettingsPage() {
     hideQueryEditorByDefault,
     expandJsonByDefault,
     setHideQueryEditorByDefault,
-    setExpandJsonByDefault
+    setExpandJsonByDefault,
+    hideQuickQueryPanel,
+    setHideQuickQueryPanel
   } = useSettingsStore()
 
   return (
@@ -599,11 +630,14 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Tab Management</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'T']} description="Create new query tab" />
-                <ShortcutRow keys={['⌘', 'W']} description="Close current tab" />
-                <ShortcutRow keys={['⌘', '1-9']} description="Switch to tab by number" />
-                <ShortcutRow keys={['⌘', '⌥', '→']} description="Switch to next tab" />
-                <ShortcutRow keys={['⌘', '⌥', '←']} description="Switch to previous tab" />
+                <ShortcutRow keys={[keys.mod, 'T']} description="Create new query tab" />
+                <ShortcutRow keys={[keys.mod, 'W']} description="Close current tab" />
+                <ShortcutRow keys={[keys.mod, '1-9']} description="Switch to tab by number" />
+                <ShortcutRow keys={[keys.mod, keys.alt, '→']} description="Switch to next tab" />
+                <ShortcutRow
+                  keys={[keys.mod, keys.alt, '←']}
+                  description="Switch to previous tab"
+                />
               </div>
             </div>
 
@@ -611,9 +645,9 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Connections</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'P']} description="Open connection picker" />
+                <ShortcutRow keys={[keys.mod, 'P']} description="Open connection picker" />
                 <ShortcutRow
-                  keys={['⌘', '⇧', '1-9']}
+                  keys={[keys.mod, keys.shift, '1-9']}
                   description="Switch to connection by number"
                 />
               </div>
@@ -623,7 +657,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Sidebar</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'B']} description="Toggle sidebar visibility" />
+                <ShortcutRow keys={[keys.mod, 'B']} description="Toggle sidebar visibility" />
               </div>
             </div>
 
@@ -631,8 +665,8 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Query Editor</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'Enter']} description="Execute/run current query" />
-                <ShortcutRow keys={['⌘', 'Shift', 'F']} description="Format SQL query" />
+                <ShortcutRow keys={[keys.mod, 'Enter']} description="Execute/run current query" />
+                <ShortcutRow keys={[keys.mod, keys.shift, 'F']} description="Format SQL query" />
               </div>
             </div>
 
@@ -640,7 +674,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Foreign Keys</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'Click']} description="Open foreign key in new tab" />
+                <ShortcutRow keys={[keys.mod, 'Click']} description="Open foreign key in new tab" />
                 <ShortcutRow keys={['Click']} description="Open foreign key in side panel" />
               </div>
             </div>
@@ -649,7 +683,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">AI Assistant</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'I']} description="Toggle AI assistant panel" />
+                <ShortcutRow keys={[keys.mod, 'I']} description="Toggle AI assistant panel" />
               </div>
             </div>
 
@@ -657,7 +691,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">General</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'K']} description="Open command palette" />
+                <ShortcutRow keys={[keys.mod, 'K']} description="Open command palette" />
               </div>
             </div>
           </div>
@@ -688,6 +722,17 @@ function SettingsPage() {
               id="hide-editor"
               checked={hideQueryEditorByDefault}
               onCheckedChange={setHideQueryEditorByDefault}
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="hide-quick-query-panel">Hide quick query panel by default</Label>
+              <p className="text-xs text-muted-foreground">Hide the quick query panel by default</p>
+            </div>
+            <Switch
+              id="hide-quick-query-panel"
+              checked={hideQuickQueryPanel}
+              onCheckedChange={setHideQuickQueryPanel}
             />
           </div>
         </div>

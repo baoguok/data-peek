@@ -12,14 +12,18 @@ import type {
   IndexDefinition,
   SequenceInfo,
   CustomTypeInfo,
-  StatementResult
+  StatementResult,
+  RoutineInfo,
+  RoutineParameterInfo
 } from '@shared/index'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  ExplainResult,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
 
 /**
  * PostgreSQL OID to Type Name Mapping
@@ -299,9 +303,18 @@ export class PostgresAdapter implements DatabaseAdapter {
     }
   }
 
-  async queryMultiple(config: ConnectionConfig, sql: string): Promise<AdapterMultiQueryResult> {
+  async queryMultiple(
+    config: ConnectionConfig,
+    sql: string,
+    options?: QueryOptions
+  ): Promise<AdapterMultiQueryResult> {
     const client = new Client(config)
     await client.connect()
+
+    // Register for cancellation support
+    if (options?.executionId) {
+      registerQuery(options.executionId, { type: 'postgresql', client })
+    }
 
     const totalStart = Date.now()
     const results: StatementResult[] = []
@@ -361,6 +374,10 @@ export class PostgresAdapter implements DatabaseAdapter {
         totalDurationMs: Date.now() - totalStart
       }
     } finally {
+      // Unregister from tracker
+      if (options?.executionId) {
+        unregisterQuery(options.executionId)
+      }
       await client.end()
     }
   }
@@ -420,6 +437,8 @@ export class PostgresAdapter implements DatabaseAdapter {
         SELECT schema_name
         FROM information_schema.schemata
         WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND schema_name NOT LIKE 'pg_toast_temp_%'
+          AND schema_name NOT LIKE 'pg_temp_%'
         ORDER BY schema_name
       `)
 
@@ -431,6 +450,8 @@ export class PostgresAdapter implements DatabaseAdapter {
           table_type
         FROM information_schema.tables
         WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND table_schema NOT LIKE 'pg_toast_temp_%'
+          AND table_schema NOT LIKE 'pg_temp_%'
         ORDER BY table_schema, table_name
       `)
 
@@ -464,6 +485,8 @@ export class PostgresAdapter implements DatabaseAdapter {
           AND c.table_name = pk.table_name
           AND c.column_name = pk.column_name
         WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND c.table_schema NOT LIKE 'pg_toast_temp_%'
+          AND c.table_schema NOT LIKE 'pg_temp_%'
         ORDER BY c.table_schema, c.table_name, c.ordinal_position
       `)
 
@@ -486,7 +509,52 @@ export class PostgresAdapter implements DatabaseAdapter {
           AND ccu.table_schema = tc.constraint_schema
         WHERE tc.constraint_type = 'FOREIGN KEY'
           AND tc.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND tc.table_schema NOT LIKE 'pg_toast_temp_%'
+          AND tc.table_schema NOT LIKE 'pg_temp_%'
         ORDER BY tc.table_schema, tc.table_name, kcu.column_name
+      `)
+
+      // Query 5: Get all routines (functions and procedures)
+      const routinesResult = await client.query(`
+        SELECT
+          r.routine_schema,
+          r.routine_name,
+          r.routine_type,
+          r.data_type as return_type,
+          r.external_language as language,
+          p.provolatile as volatility,
+          d.description as comment,
+          r.specific_name
+        FROM information_schema.routines r
+        LEFT JOIN pg_catalog.pg_proc p
+          ON p.proname = r.routine_name
+        LEFT JOIN pg_catalog.pg_namespace n
+          ON n.nspname = r.routine_schema
+          AND p.pronamespace = n.oid
+        LEFT JOIN pg_catalog.pg_description d
+          ON d.objoid = p.oid
+        WHERE r.routine_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND r.routine_schema NOT LIKE 'pg_toast_temp_%'
+          AND r.routine_schema NOT LIKE 'pg_temp_%'
+        ORDER BY r.routine_schema, r.routine_name
+      `)
+
+      // Query 6: Get routine parameters
+      const parametersResult = await client.query(`
+        SELECT
+          p.specific_schema,
+          p.specific_name,
+          p.parameter_name,
+          p.data_type,
+          p.parameter_mode,
+          p.parameter_default,
+          p.ordinal_position
+        FROM information_schema.parameters p
+        WHERE p.specific_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND p.specific_schema NOT LIKE 'pg_toast_temp_%'
+          AND p.specific_schema NOT LIKE 'pg_temp_%'
+          AND p.parameter_name IS NOT NULL
+        ORDER BY p.specific_schema, p.specific_name, p.ordinal_position
       `)
 
       // Build foreign key lookup map: "schema.table.column" -> ForeignKeyInfo
@@ -501,6 +569,48 @@ export class PostgresAdapter implements DatabaseAdapter {
         })
       }
 
+      // Build parameters lookup map: "schema.specific_name" -> RoutineParameterInfo[]
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of parametersResult.rows) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          defaultValue: row.parameter_default || undefined,
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Build routines lookup map: "schema" -> RoutineInfo[]
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routinesResult.rows) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const params = paramsMap.get(paramsKey) || []
+
+        // Map PostgreSQL volatility codes to readable values
+        let volatility: 'IMMUTABLE' | 'STABLE' | 'VOLATILE' | undefined
+        if (row.volatility === 'i') volatility = 'IMMUTABLE'
+        else if (row.volatility === 's') volatility = 'STABLE'
+        else if (row.volatility === 'v') volatility = 'VOLATILE'
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: params,
+          language: row.language || undefined,
+          volatility,
+          comment: row.comment || undefined
+        })
+      }
+
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
 
@@ -508,7 +618,8 @@ export class PostgresAdapter implements DatabaseAdapter {
       for (const row of schemasResult.rows) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || []
         })
       }
 
