@@ -24,6 +24,7 @@
     "build:linux": "electron-vite build && electron-builder --linux"
   },
   "dependencies": {
+    "@data-peek/shared": "workspace:*",
     "@ai-sdk/anthropic": "^2.0.17",
     "@ai-sdk/google": "^2.0.12",
     "@ai-sdk/groq": "^2.0.8",
