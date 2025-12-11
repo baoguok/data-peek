@@ -177,6 +177,11 @@ function StatBadge({
  * Generate time axis markers for the timeline view
  */
 function generateTimeMarkers(totalMs: number): { position: number; label: string }[] {
+  // Handle edge case of zero or negative duration
+  if (totalMs <= 0) {
+    return [{ position: 0, label: '0ms' }]
+  }
+
   const markers: { position: number; label: string }[] = []
 
   // Determine nice intervals based on total duration

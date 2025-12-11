@@ -33,7 +33,8 @@ import {
   useConnectionStore,
   useQueryStore,
   useSettingsStore,
-  useTabTelemetry
+  useTabTelemetry,
+  notify
 } from '@/stores'
 import type { Tab, MultiQueryResult } from '@/stores/tab-store'
 import type { StatementResult } from '@data-peek/shared'
@@ -338,11 +339,11 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
             setTelemetry(response.data.telemetryRuns[0])
           }
         } else {
-          // Show error
-          console.error('Benchmark failed:', response.error)
+          // Show error notification to user
+          notify.error('Benchmark failed', response.error || 'An unexpected error occurred')
         }
       } catch (error) {
-        console.error('Benchmark error:', error)
+        notify.error('Benchmark failed', error instanceof Error ? error.message : 'An unexpected error occurred')
       } finally {
         setRunningBenchmark(false)
       }
@@ -1124,7 +1125,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                   </div>
                   <div className="flex items-center gap-2">
                     {/* Telemetry toggle button */}
-                    {telemetry && (
+                    {(telemetry || benchmark) && (
                       <TooltipProvider>
                         <Tooltip>
                           <TooltipTrigger asChild>
