@@ -1,246 +1,36 @@
 import { Client } from 'pg'
-import type {
-  ConnectionConfig,
-  SchemaInfo,
-  TableInfo,
-  ColumnInfo,
-  QueryField,
-  ForeignKeyInfo,
-  TableDefinition,
-  ColumnDefinition,
-  ConstraintDefinition,
-  IndexDefinition,
-  SequenceInfo,
-  CustomTypeInfo,
-  StatementResult
+import {
+  resolvePostgresType,
+  type ConnectionConfig,
+  type SchemaInfo,
+  type TableInfo,
+  type ColumnInfo,
+  type QueryField,
+  type ForeignKeyInfo,
+  type TableDefinition,
+  type ColumnDefinition,
+  type ConstraintDefinition,
+  type IndexDefinition,
+  type SequenceInfo,
+  type CustomTypeInfo,
+  type StatementResult,
+  type RoutineInfo,
+  type RoutineParameterInfo
 } from '@shared/index'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  ExplainResult,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
+import { closeTunnel, createTunnel, TunnelSession } from '../ssh-tunnel-service'
+import { splitStatements } from '../lib/sql-parser'
+import { telemetryCollector, TELEMETRY_PHASES } from '../telemetry-collector'
 
-/**
- * PostgreSQL OID to Type Name Mapping
- * Reference: https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat
- */
-const PG_TYPE_MAP: Record<number, string> = {
-  16: 'boolean',
-  17: 'bytea',
-  18: 'char',
-  19: 'name',
-  20: 'bigint',
-  21: 'smallint',
-  23: 'integer',
-  24: 'regproc',
-  25: 'text',
-  26: 'oid',
-  114: 'json',
-  142: 'xml',
-  600: 'point',
-  601: 'lseg',
-  602: 'path',
-  603: 'box',
-  604: 'polygon',
-  628: 'line',
-  700: 'real',
-  701: 'double precision',
-  718: 'circle',
-  790: 'money',
-  829: 'macaddr',
-  869: 'inet',
-  650: 'cidr',
-  1042: 'char',
-  1043: 'varchar',
-  1082: 'date',
-  1083: 'time',
-  1114: 'timestamp',
-  1184: 'timestamptz',
-  1186: 'interval',
-  1266: 'timetz',
-  1560: 'bit',
-  1562: 'varbit',
-  1700: 'numeric',
-  2950: 'uuid',
-  3802: 'jsonb',
-  3904: 'int4range',
-  3906: 'numrange',
-  3908: 'tsrange',
-  3910: 'tstzrange',
-  3912: 'daterange',
-  3926: 'int8range',
-  // Array types (common ones)
-  1000: 'boolean[]',
-  1001: 'bytea[]',
-  1005: 'smallint[]',
-  1007: 'integer[]',
-  1009: 'text[]',
-  1014: 'char[]',
-  1015: 'varchar[]',
-  1016: 'bigint[]',
-  1021: 'real[]',
-  1022: 'double precision[]',
-  1028: 'oid[]',
-  1115: 'timestamp[]',
-  1182: 'date[]',
-  1183: 'time[]',
-  1231: 'numeric[]',
-  2951: 'uuid[]',
-  3807: 'jsonb[]',
-  199: 'json[]'
-}
-
-/**
- * Resolve PostgreSQL OID to human-readable type name
- */
-function resolvePostgresType(dataTypeID: number): string {
-  return PG_TYPE_MAP[dataTypeID] ?? `unknown(${dataTypeID})`
-}
-
-/**
- * Split SQL into individual statements, respecting string literals and comments
- * Handles: single quotes, double quotes, dollar-quoted strings, line comments (--)
- * and block comments
- */
-function splitStatements(sql: string): string[] {
-  const statements: string[] = []
-  let current = ''
-  let i = 0
-
-  while (i < sql.length) {
-    const char = sql[i]
-    const nextChar = sql[i + 1]
-
-    // Handle single-quoted strings
-    if (char === "'") {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") {
-          // Escaped single quote
-          current += "''"
-          i += 2
-        } else if (sql[i] === "'") {
-          current += "'"
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle double-quoted identifiers
-    if (char === '"') {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === '"' && sql[i + 1] === '"') {
-          // Escaped double quote
-          current += '""'
-          i += 2
-        } else if (sql[i] === '"') {
-          current += '"'
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle dollar-quoted strings (PostgreSQL-specific)
-    if (char === '$') {
-      // Find the tag (e.g., $tag$ or $$)
-      let tag = '$'
-      let j = i + 1
-      while (j < sql.length && (sql[j].match(/[a-zA-Z0-9_]/) || sql[j] === '$')) {
-        tag += sql[j]
-        if (sql[j] === '$') {
-          j++
-          break
-        }
-        j++
-      }
-      if (tag.endsWith('$') && tag.length >= 2) {
-        // Valid dollar quote tag
-        current += tag
-        i = j
-        // Find closing tag
-        const closeIdx = sql.indexOf(tag, i)
-        if (closeIdx !== -1) {
-          current += sql.substring(i, closeIdx + tag.length)
-          i = closeIdx + tag.length
-        } else {
-          // No closing tag, consume rest
-          current += sql.substring(i)
-          i = sql.length
-        }
-        continue
-      }
-    }
-
-    // Handle line comments (--)
-    if (char === '-' && nextChar === '-') {
-      current += '--'
-      i += 2
-      while (i < sql.length && sql[i] !== '\n') {
-        current += sql[i]
-        i++
-      }
-      continue
-    }
-
-    // Handle block comments (/* */)
-    if (char === '/' && nextChar === '*') {
-      current += '/*'
-      i += 2
-      let depth = 1
-      while (i < sql.length && depth > 0) {
-        if (sql[i] === '/' && sql[i + 1] === '*') {
-          current += '/*'
-          depth++
-          i += 2
-        } else if (sql[i] === '*' && sql[i + 1] === '/') {
-          current += '*/'
-          depth--
-          i += 2
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Statement separator
-    if (char === ';') {
-      const stmt = current.trim()
-      if (stmt) {
-        statements.push(stmt)
-      }
-      current = ''
-      i++
-      continue
-    }
-
-    current += char
-    i++
-  }
-
-  // Don't forget the last statement (without trailing semicolon)
-  const lastStmt = current.trim()
-  if (lastStmt) {
-    statements.push(lastStmt)
-  }
-
-  return statements
-}
+/** Split SQL into statements for PostgreSQL */
+const splitPgStatements = (sql: string) => splitStatements(sql, 'postgresql')
 
 /**
  * Check if a SQL statement is data-returning (SELECT, RETURNING, etc.)
@@ -271,12 +61,22 @@ export class PostgresAdapter implements DatabaseAdapter {
   readonly dbType = 'postgresql' as const
 
   async connect(config: ConnectionConfig): Promise<void> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
+
     const client = new Client(config)
     await client.connect()
     await client.end()
+    closeTunnel(tunnelSession)
   }
 
   async query(config: ConnectionConfig, sql: string): Promise<AdapterQueryResult> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -296,25 +96,84 @@ export class PostgresAdapter implements DatabaseAdapter {
       }
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
-  async queryMultiple(config: ConnectionConfig, sql: string): Promise<AdapterMultiQueryResult> {
+  async queryMultiple(
+    config: ConnectionConfig,
+    sql: string,
+    options?: QueryOptions
+  ): Promise<AdapterMultiQueryResult> {
+    const collectTelemetry = options?.collectTelemetry ?? false
+    const executionId = options?.executionId ?? crypto.randomUUID()
+
+    // Start telemetry collection if requested
+    if (collectTelemetry) {
+      telemetryCollector.startQuery(executionId, false)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+    }
+
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
+
     const client = new Client(config)
+
+    if (collectTelemetry) {
+      telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.DB_HANDSHAKE)
+    }
+
     await client.connect()
+
+    if (collectTelemetry) {
+      telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.DB_HANDSHAKE)
+    }
+
+    // Set query timeout if specified (0 = no timeout)
+    const queryTimeoutMs = options?.queryTimeoutMs
+    if (
+      typeof queryTimeoutMs === 'number' &&
+      Number.isFinite(queryTimeoutMs) &&
+      queryTimeoutMs > 0
+    ) {
+      await client.query('SELECT set_config($1, $2, false)', [
+        'statement_timeout',
+        `${Math.floor(queryTimeoutMs)}ms`
+      ])
+    }
+
+    // Register for cancellation support
+    if (options?.executionId) {
+      registerQuery(options.executionId, { type: 'postgresql', client })
+    }
 
     const totalStart = Date.now()
     const results: StatementResult[] = []
+    let totalRowCount = 0
 
     try {
-      const statements = splitStatements(sql)
+      const statements = splitPgStatements(sql)
 
       for (let i = 0; i < statements.length; i++) {
         const statement = statements[i]
         const stmtStart = Date.now()
 
         try {
+          // Start execution phase timing
+          if (collectTelemetry) {
+            telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+          }
+
           const res = await client.query(statement)
+
+          if (collectTelemetry) {
+            telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+            telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.PARSE)
+          }
+
           const stmtDuration = Date.now() - stmtStart
 
           const fields: QueryField[] = (res.fields || []).map((f) => ({
@@ -324,16 +183,22 @@ export class PostgresAdapter implements DatabaseAdapter {
           }))
 
           const isDataReturning = isDataReturningStatement(statement)
+          const rowCount = res.rowCount ?? res.rows?.length ?? 0
+          totalRowCount += rowCount
 
           results.push({
             statement,
             statementIndex: i,
             rows: res.rows || [],
             fields,
-            rowCount: res.rowCount ?? res.rows?.length ?? 0,
+            rowCount,
             durationMs: stmtDuration,
             isDataReturning
           })
+
+          if (collectTelemetry) {
+            telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.PARSE)
+          }
         } catch (error) {
           // If a statement fails, add an error result and stop execution
           const stmtDuration = Date.now() - stmtStart
@@ -349,6 +214,11 @@ export class PostgresAdapter implements DatabaseAdapter {
             isDataReturning: false
           })
 
+          // Cancel telemetry on error
+          if (collectTelemetry) {
+            telemetryCollector.cancel(executionId)
+          }
+
           // Re-throw to stop execution of remaining statements
           throw new Error(
             `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
@@ -356,12 +226,24 @@ export class PostgresAdapter implements DatabaseAdapter {
         }
       }
 
-      return {
+      const result: AdapterMultiQueryResult = {
         results,
         totalDurationMs: Date.now() - totalStart
       }
+
+      // Finalize telemetry
+      if (collectTelemetry) {
+        result.telemetry = telemetryCollector.finalize(executionId, totalRowCount)
+      }
+
+      return result
     } finally {
+      // Unregister from tracker
+      if (options?.executionId) {
+        unregisterQuery(options.executionId)
+      }
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -370,6 +252,10 @@ export class PostgresAdapter implements DatabaseAdapter {
     sql: string,
     params: unknown[]
   ): Promise<{ rowCount: number | null }> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -378,6 +264,7 @@ export class PostgresAdapter implements DatabaseAdapter {
       return { rowCount: res.rowCount }
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -385,6 +272,10 @@ export class PostgresAdapter implements DatabaseAdapter {
     config: ConnectionConfig,
     statements: Array<{ sql: string; params: unknown[] }>
   ): Promise<{ rowsAffected: number; results: Array<{ rowCount: number | null }> }> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -407,19 +298,25 @@ export class PostgresAdapter implements DatabaseAdapter {
       throw error
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
   async getSchemas(config: ConnectionConfig): Promise<SchemaInfo[]> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
-
     try {
       // Query 1: Get all schemas (excluding system schemas)
       const schemasResult = await client.query(`
         SELECT schema_name
         FROM information_schema.schemata
         WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND schema_name NOT LIKE 'pg_toast_temp_%'
+          AND schema_name NOT LIKE 'pg_temp_%'
         ORDER BY schema_name
       `)
 
@@ -431,6 +328,8 @@ export class PostgresAdapter implements DatabaseAdapter {
           table_type
         FROM information_schema.tables
         WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND table_schema NOT LIKE 'pg_toast_temp_%'
+          AND table_schema NOT LIKE 'pg_temp_%'
         ORDER BY table_schema, table_name
       `)
 
@@ -464,6 +363,8 @@ export class PostgresAdapter implements DatabaseAdapter {
           AND c.table_name = pk.table_name
           AND c.column_name = pk.column_name
         WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND c.table_schema NOT LIKE 'pg_toast_temp_%'
+          AND c.table_schema NOT LIKE 'pg_temp_%'
         ORDER BY c.table_schema, c.table_name, c.ordinal_position
       `)
 
@@ -486,7 +387,52 @@ export class PostgresAdapter implements DatabaseAdapter {
           AND ccu.table_schema = tc.constraint_schema
         WHERE tc.constraint_type = 'FOREIGN KEY'
           AND tc.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND tc.table_schema NOT LIKE 'pg_toast_temp_%'
+          AND tc.table_schema NOT LIKE 'pg_temp_%'
         ORDER BY tc.table_schema, tc.table_name, kcu.column_name
+      `)
+
+      // Query 5: Get all routines (functions and procedures)
+      const routinesResult = await client.query(`
+        SELECT
+          r.routine_schema,
+          r.routine_name,
+          r.routine_type,
+          r.data_type as return_type,
+          r.external_language as language,
+          p.provolatile as volatility,
+          d.description as comment,
+          r.specific_name
+        FROM information_schema.routines r
+        LEFT JOIN pg_catalog.pg_proc p
+          ON p.proname = r.routine_name
+        LEFT JOIN pg_catalog.pg_namespace n
+          ON n.nspname = r.routine_schema
+          AND p.pronamespace = n.oid
+        LEFT JOIN pg_catalog.pg_description d
+          ON d.objoid = p.oid
+        WHERE r.routine_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND r.routine_schema NOT LIKE 'pg_toast_temp_%'
+          AND r.routine_schema NOT LIKE 'pg_temp_%'
+        ORDER BY r.routine_schema, r.routine_name
+      `)
+
+      // Query 6: Get routine parameters
+      const parametersResult = await client.query(`
+        SELECT
+          p.specific_schema,
+          p.specific_name,
+          p.parameter_name,
+          p.data_type,
+          p.parameter_mode,
+          p.parameter_default,
+          p.ordinal_position
+        FROM information_schema.parameters p
+        WHERE p.specific_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND p.specific_schema NOT LIKE 'pg_toast_temp_%'
+          AND p.specific_schema NOT LIKE 'pg_temp_%'
+          AND p.parameter_name IS NOT NULL
+        ORDER BY p.specific_schema, p.specific_name, p.ordinal_position
       `)
 
       // Build foreign key lookup map: "schema.table.column" -> ForeignKeyInfo
@@ -501,6 +447,48 @@ export class PostgresAdapter implements DatabaseAdapter {
         })
       }
 
+      // Build parameters lookup map: "schema.specific_name" -> RoutineParameterInfo[]
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of parametersResult.rows) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          defaultValue: row.parameter_default || undefined,
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Build routines lookup map: "schema" -> RoutineInfo[]
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routinesResult.rows) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const params = paramsMap.get(paramsKey) || []
+
+        // Map PostgreSQL volatility codes to readable values
+        let volatility: 'IMMUTABLE' | 'STABLE' | 'VOLATILE' | undefined
+        if (row.volatility === 'i') volatility = 'IMMUTABLE'
+        else if (row.volatility === 's') volatility = 'STABLE'
+        else if (row.volatility === 'v') volatility = 'VOLATILE'
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: params,
+          language: row.language || undefined,
+          volatility,
+          comment: row.comment || undefined
+        })
+      }
+
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
 
@@ -508,7 +496,8 @@ export class PostgresAdapter implements DatabaseAdapter {
       for (const row of schemasResult.rows) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || []
         })
       }
 
@@ -563,10 +552,15 @@ export class PostgresAdapter implements DatabaseAdapter {
       return Array.from(schemaMap.values())
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
   async explain(config: ConnectionConfig, sql: string, analyze: boolean): Promise<ExplainResult> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -588,6 +582,7 @@ export class PostgresAdapter implements DatabaseAdapter {
       }
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -596,6 +591,10 @@ export class PostgresAdapter implements DatabaseAdapter {
     schema: string,
     table: string
   ): Promise<TableDefinition> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -832,10 +831,15 @@ export class PostgresAdapter implements DatabaseAdapter {
       }
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
   async getSequences(config: ConnectionConfig): Promise<SequenceInfo[]> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -861,10 +865,15 @@ export class PostgresAdapter implements DatabaseAdapter {
       }))
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 
   async getTypes(config: ConnectionConfig): Promise<CustomTypeInfo[]> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const client = new Client(config)
     await client.connect()
 
@@ -912,6 +921,7 @@ export class PostgresAdapter implements DatabaseAdapter {
       ]
     } finally {
       await client.end()
+      closeTunnel(tunnelSession)
     }
   }
 }

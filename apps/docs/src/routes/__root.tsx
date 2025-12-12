@@ -3,61 +3,82 @@ import {
   HeadContent,
   Outlet,
   Scripts,
-} from '@tanstack/react-router';
-import * as React from 'react';
-import appCss from '@/styles/app.css?url';
-import { RootProvider } from 'fumadocs-ui/provider/tanstack';
+} from "@tanstack/react-router";
+import * as React from "react";
+import appCss from "@/styles/app.css?url";
+import { RootProvider } from "fumadocs-ui/provider/tanstack";
 
 export const Route = createRootRoute({
   head: () => ({
     meta: [
       {
-        charSet: 'utf-8',
+        charSet: "utf-8",
       },
       {
-        name: 'viewport',
-        content: 'width=device-width, initial-scale=1',
+        name: "viewport",
+        content: "width=device-width, initial-scale=1",
       },
       {
-        title: 'data-peek Docs',
+        title: "data-peek Docs",
       },
       {
-        name: 'description',
+        name: "description",
         content:
-          'Documentation for data-peek - A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
+          "Documentation for data-peek - A minimal, fast, lightweight SQL client for PostgreSQL and MySQL",
       },
       {
-        name: 'theme-color',
-        content: '#0a0a0b',
+        name: "theme-color",
+        content: "#0a0a0b",
       },
       {
-        property: 'og:title',
-        content: 'data-peek Documentation',
+        property: "og:title",
+        content: "data-peek Documentation",
       },
       {
-        property: 'og:description',
-        content: 'A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
+        property: "og:description",
+        content:
+          "A minimal, fast, lightweight SQL client for PostgreSQL and MySQL",
       },
       {
-        property: 'og:type',
-        content: 'website',
+        property: "og:type",
+        content: "website",
       },
       {
-        name: 'twitter:card',
-        content: 'summary_large_image',
+        name: "twitter:card",
+        content: "summary_large_image",
       },
       {
-        name: 'twitter:title',
-        content: 'data-peek Documentation',
+        name: "twitter:title",
+        content: "data-peek Documentation",
       },
       {
-        name: 'twitter:description',
-        content: 'A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
+        name: "twitter:description",
+        content:
+          "A minimal, fast, lightweight SQL client for PostgreSQL and MySQL",
       },
     ],
     links: [
-      { rel: 'stylesheet', href: appCss },
-      { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
+      { rel: "stylesheet", href: appCss },
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+    ],
+    scripts: [
+      {
+        src: "https://giveme.gilla.fun/script.js",
+      },
+      {
+        children: `(function(c,l,a,r,i,t,y){
+          c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
+          t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
+          y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
+        })(window, document, "clarity", "script", "ukb6oie3zz");`,
+      },
+      {
+        src: "https://cdn.littlestats.click/embed/wq9151m57h17nmx",
+      },
+      {
+        src: "https://scripts.simpleanalyticscdn.com/latest.js",
+        async: true,
+      },
     ],
   }),
   component: RootComponent,
@@ -73,7 +94,7 @@ function RootComponent() {
 
 function RootDocument({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
       </head>
@@ -81,8 +102,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <RootProvider
           theme={{
             enabled: true,
-            defaultTheme: 'dark',
-            forcedTheme: 'dark',
+            defaultTheme: "dark",
           }}
         >
           {children}

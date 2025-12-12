@@ -1,6 +1,28 @@
 'use client'
 
-import * as React from 'react'
+import { AddRowSheet, type ForeignKeyValue } from '@/components/add-row-sheet'
+import { EditToolbar } from '@/components/edit-toolbar'
+import { EditableCell } from '@/components/editable-cell'
+import { FKCellValue } from '@/components/fk-cell-value'
+import { JsonCellValue } from '@/components/json-cell-value'
+import { SqlPreviewModal } from '@/components/sql-preview-modal'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
+import { Input } from '@/components/ui/input'
+import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { generateLimitClause } from '@/lib/sql-helpers'
+import { getTypeColor } from '@/lib/type-colors'
+import { cn } from '@/lib/utils'
+import { useEditStore } from '@/stores/edit-store'
+import type { ColumnInfo, ConnectionConfig, EditContext, ForeignKeyInfo } from '@data-peek/shared'
 import {
   flexRender,
   getCoreRowModel,
@@ -13,32 +35,22 @@ import {
   type SortingState
 } from '@tanstack/react-table'
 import {
-  ArrowUpDown,
-  ArrowUp,
   ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
+  Copy,
   Filter,
-  X,
-  Trash2,
+  Link2,
+  MoreHorizontal,
   RotateCcw,
-  Link2
+  Trash2,
+  X
 } from 'lucide-react'
-import type { ForeignKeyInfo, ColumnInfo, EditContext, ConnectionConfig } from '@data-peek/shared'
-import { Input } from '@/components/ui/input'
-import { Button } from '@/components/ui/button'
-import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
-import { EditableCell } from '@/components/editable-cell'
-import { EditToolbar } from '@/components/edit-toolbar'
-import { SqlPreviewModal } from '@/components/sql-preview-modal'
-import { JsonCellValue } from '@/components/json-cell-value'
-import { FKCellValue } from '@/components/fk-cell-value'
-import { useEditStore } from '@/stores/edit-store'
+import * as React from 'react'
 
 export interface DataTableColumn {
   name: string
@@ -78,24 +90,6 @@ interface EditableDataTableProps<TData> {
   onChangesCommitted?: () => void
 }
 
-function getTypeColor(type: string): string {
-  const lower = type.toLowerCase()
-  if (lower.includes('uuid')) return 'text-purple-400'
-  if (lower.includes('varchar') || lower.includes('text') || lower.includes('char'))
-    return 'text-green-400'
-  if (
-    lower.includes('int') ||
-    lower.includes('numeric') ||
-    lower.includes('decimal') ||
-    lower.includes('bigint')
-  )
-    return 'text-blue-400'
-  if (lower.includes('timestamp') || lower.includes('date') || lower.includes('time'))
-    return 'text-orange-400'
-  if (lower.includes('bool')) return 'text-yellow-400'
-  return 'text-muted-foreground'
-}
-
 export function EditableDataTable<TData extends Record<string, unknown>>({
   tabId,
   columns: columnDefs,
@@ -118,6 +112,17 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     Array<{ operationId: string; sql: string; type: 'insert' | 'update' | 'delete' }>
   >([])
   const [isCommitting, setIsCommitting] = React.useState(false)
+
+  // Add Row Sheet state
+  const [showAddRowSheet, setShowAddRowSheet] = React.useState(false)
+  const [duplicateRowValues, setDuplicateRowValues] = React.useState<Record<
+    string,
+    unknown
+  > | null>(null)
+  const [foreignKeyValuesMap, setForeignKeyValuesMap] = React.useState<
+    Record<string, ForeignKeyValue[]>
+  >({})
+  const [loadingFkValues, setLoadingFkValues] = React.useState(false)
 
   // Edit store
   const {
@@ -184,7 +189,7 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     }
   }
 
-  // Handle add new row
+  // Handle add new row (inline quick add)
   const handleAddRow = () => {
     // Create default values for all columns
     const defaultValues: Record<string, unknown> = {}
@@ -193,6 +198,95 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     })
     addNewRow(tabId, defaultValues)
   }
+
+  // Handle add row with sheet (form-based)
+  const handleAddRowWithSheet = () => {
+    setDuplicateRowValues(null)
+    setShowAddRowSheet(true)
+  }
+
+  // Handle duplicate row
+  const handleDuplicateRow = (rowData: Record<string, unknown>) => {
+    setDuplicateRowValues(rowData)
+    setShowAddRowSheet(true)
+  }
+
+  // Handle sheet submit
+  const handleSheetSubmit = (values: Record<string, unknown>) => {
+    // Enter edit mode if not already in edit mode
+    if (!isEditMode && editContext) {
+      enterEditMode(tabId, editContext)
+    }
+    addNewRow(tabId, values)
+    setShowAddRowSheet(false)
+    setDuplicateRowValues(null)
+  }
+
+  // Convert DataTableColumn to ColumnInfo for the sheet
+  const columnInfos: ColumnInfo[] = columnDefs.map((col, idx) => ({
+    name: col.name,
+    dataType: col.dataType,
+    isPrimaryKey: col.isPrimaryKey ?? false,
+    isNullable: col.isNullable ?? true,
+    ordinalPosition: idx + 1,
+    foreignKey: col.foreignKey
+  }))
+
+  // Build enum values map
+  const enumValuesMap: Record<string, string[]> = {}
+  columnDefs.forEach((col) => {
+    if (col.enumValues && col.enumValues.length > 0) {
+      enumValuesMap[col.name] = col.enumValues
+    }
+  })
+
+  // Fetch FK values when sheet opens
+  React.useEffect(() => {
+    if (!showAddRowSheet || !connection) return
+
+    // Find columns with foreign keys
+    const fkColumns = columnDefs.filter((col) => col.foreignKey)
+    if (fkColumns.length === 0) return
+
+    const fetchFkValues = async () => {
+      setLoadingFkValues(true)
+      const fkValuesMap: Record<string, ForeignKeyValue[]> = {}
+
+      try {
+        // Fetch FK values for each column in parallel
+        await Promise.all(
+          fkColumns.map(async (col) => {
+            const fk = col.foreignKey!
+            // Query the referenced table - limit to 1000 rows for performance
+            // Use TOP for MSSQL, LIMIT for other databases
+            const limitClause = generateLimitClause(connection?.dbType, 1000)
+            const query =
+              connection?.dbType === 'mssql'
+                ? `SELECT ${limitClause} DISTINCT "${fk.referencedColumn}" FROM "${fk.referencedSchema}"."${fk.referencedTable}" ORDER BY "${fk.referencedColumn}"`
+                : `SELECT DISTINCT "${fk.referencedColumn}" FROM "${fk.referencedSchema}"."${fk.referencedTable}" ORDER BY "${fk.referencedColumn}" ${limitClause}`
+
+            try {
+              const result = await window.api.db.query(connection, query)
+              if (result.success && Array.isArray(result.data)) {
+                fkValuesMap[col.name] = (result.data as Record<string, unknown>[]).map((row) => ({
+                  value: row[fk.referencedColumn] as string | number
+                }))
+              }
+            } catch (err) {
+              console.error(`Failed to fetch FK values for ${col.name}:`, err)
+              fkValuesMap[col.name] = []
+            }
+          })
+        )
+
+        setForeignKeyValuesMap(fkValuesMap)
+      } finally {
+        setLoadingFkValues(false)
+      }
+    }
+
+    fetchFkValues()
+  }, [showAddRowSheet, connection, columnDefs])
 
   // Handle preview SQL
   const handlePreviewSql = async () => {
@@ -288,7 +382,7 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
         cell: ({ row }) => {
           const rowIndex = row.index
           const isDeleted = isRowMarkedForDeletion(tabId, rowIndex)
-          const originalRow = row.original
+          const originalRow = row.original as Record<string, unknown>
 
           return (
             <div className="flex items-center gap-1">
@@ -307,21 +401,34 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                   <TooltipContent>Restore row</TooltipContent>
                 </Tooltip>
               ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="size-6 text-muted-foreground hover:text-red-500"
-                      onClick={() =>
-                        markRowForDeletion(tabId, rowIndex, originalRow as Record<string, unknown>)
-                      }
+                      className="size-6 text-muted-foreground hover:text-foreground"
                     >
-                      <Trash2 className="size-3" />
+                      <MoreHorizontal className="size-3" />
                     </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Delete row</TooltipContent>
-                </Tooltip>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-40">
+                    <DropdownMenuItem
+                      onClick={() => handleDuplicateRow(originalRow)}
+                      className="gap-2"
+                    >
+                      <Copy className="size-4 text-amber-500" />
+                      Duplicate Row
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={() => markRowForDeletion(tabId, rowIndex, originalRow)}
+                      className="gap-2 text-red-500 focus:text-red-500"
+                    >
+                      <Trash2 className="size-4" />
+                      Delete Row
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               )}
             </div>
           )
@@ -331,8 +438,15 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     }
 
     // Data columns
-    columnDefs.forEach((col) => {
+    columnDefs.forEach((col, index) => {
+      // Generate a stable id for columns - MSSQL can return empty names for aggregates like COUNT(*)
+      // TanStack Table requires explicit id when header is a function and accessorKey might be empty
+      const columnId = col.name || `_col_${index}`
+      const displayName = col.name || `(column ${index + 1})`
+
       cols.push({
+        id: columnId,
+        // Keep accessorKey as col.name since that's how row data is keyed (even if empty)
         accessorKey: col.name,
         header: ({ column }) => {
           const isSorted = column.getIsSorted()
@@ -343,7 +457,7 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                 className="h-auto py-1 px-2 -mx-2 font-medium hover:bg-accent/50"
                 onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
               >
-                <span>{col.name}</span>
+                <span>{displayName}</span>
                 {col.isPrimaryKey && (
                   <span className="ml-1 text-amber-500" title="Primary Key">
                     🔑
@@ -575,6 +689,7 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                   isCommitting={isCommitting}
                   onToggleEditMode={handleToggleEditMode}
                   onAddRow={handleAddRow}
+                  onAddRowWithSheet={handleAddRowWithSheet}
                   onSaveChanges={handleSaveChanges}
                   onDiscardChanges={handleDiscardChanges}
                   onPreviewSql={handlePreviewSql}
@@ -763,6 +878,21 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
           sqlStatements={sqlStatements}
           onConfirm={handleConfirmCommit}
           isLoading={isCommitting}
+        />
+
+        {/* Add Row Sheet */}
+        <AddRowSheet
+          open={showAddRowSheet}
+          onOpenChange={setShowAddRowSheet}
+          columns={columnInfos}
+          tableName={editContext?.table ?? 'table'}
+          schemaName={editContext?.schema}
+          initialValues={duplicateRowValues ?? undefined}
+          enumValuesMap={enumValuesMap}
+          foreignKeyValuesMap={foreignKeyValuesMap}
+          loadingFkValues={loadingFkValues}
+          onSubmit={handleSheetSubmit}
+          isDuplicate={duplicateRowValues !== null}
         />
       </div>
     </TooltipProvider>

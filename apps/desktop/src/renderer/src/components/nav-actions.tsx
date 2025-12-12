@@ -26,12 +26,14 @@ import {
   SidebarMenuItem
 } from '@/components/ui/sidebar'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useQueryStore, useConnectionStore } from '@/stores'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatSQL } from '@/lib/sql-formatter'
+import { keys } from '@/lib/utils'
+import { useQueryStore, useConnectionStore } from '@/stores'
 
 export function NavActions() {
   const [isOpen, setIsOpen] = React.useState(false)
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard()
 
   const activeConnection = useConnectionStore((s) => s.getActiveConnection())
   const { currentQuery, isExecuting, result } = useQueryStore()
@@ -70,9 +72,7 @@ export function NavActions() {
 
   const handleCopyQuery = async () => {
     if (!currentQuery.trim()) return
-    await navigator.clipboard.writeText(currentQuery)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    await copy(currentQuery)
     setIsOpen(false)
   }
 
@@ -142,12 +142,13 @@ export function NavActions() {
             )}
             <span className="hidden sm:inline">Run</span>
             <kbd className="ml-0.5 hidden rounded bg-primary-foreground/20 px-1 py-0.5 text-[9px] font-medium sm:inline">
-              ⌘↵
+              {keys.mod}
+              {keys.enter}
             </kbd>
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          <p>Execute query (⌘+Enter)</p>
+          <p>Execute query ({keys.mod}+Enter)</p>
         </TooltipContent>
       </Tooltip>
 
@@ -165,7 +166,9 @@ export function NavActions() {
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          <p>Format SQL (⌘+Shift+F)</p>
+          <p>
+            Format SQL ({keys.mod}+{keys.shift}+F)
+          </p>
         </TooltipContent>
       </Tooltip>
 

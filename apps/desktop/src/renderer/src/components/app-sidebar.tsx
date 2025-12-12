@@ -20,12 +20,15 @@ import {
   SidebarRail,
   SidebarSeparator
 } from '@/components/ui/sidebar'
+import { cn } from '@/lib/utils'
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+  const platform = window.electron.process.platform
+
   return (
     <Sidebar className="border-r-0 bg-sidebar/80 backdrop-blur-xl" {...props}>
       {/* Header - Connection Switcher */}
-      <SidebarHeader className="pt-10">
+      <SidebarHeader className={cn(platform === 'darwin' && 'pt-10')}>
         <ConnectionSwitcher />
       </SidebarHeader>
 

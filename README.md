@@ -1,18 +1,65 @@
 # data-peek
 
-A minimal, fast PostgreSQL client desktop application. Built for developers who want to quickly peek at their data without the bloat. Also supports MySQL and Microsoft SQL Server.
+
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/Rohithgilla12/data-peek/total?style=for-the-badge)
+
+
+
+A minimal, fast SQL client desktop application with AI-powered querying. Built for developers who want to quickly peek at their data without the bloat. Supports PostgreSQL, MySQL, Microsoft SQL Server, and SQLite.
+
+
+
+<p align="center">
+  <img src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/hero.png" alt="Data Peek - SQL Client" width="100%" />
+</p>
+
+## Screenshots
+
+<details>
+<summary>AI Assistant - Generate charts and insights</summary>
+<img src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/ai-assitant.png" alt="AI Assistant Charts" width="100%" />
+</details>
+
+<details>
+<summary>AI Assistant - Natural language to SQL</summary>
+<img src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/ai-assitant-2.png" alt="AI Assistant Queries" width="100%" />
+</details>
+
+<details>
+<summary>ER Diagrams - Visualize relationships</summary>
+<img src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/erd.png" alt="ER Diagrams" width="100%" />
+</details>
+
+<details>
+<summary>Command Palette - Quick actions</summary>
+<img src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/command-bar.png" alt="Command Palette" width="100%" />
+</details>
+
+<details>
+<summary>Light Mode</summary>
+<img src="https://pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev/light-mode.png" alt="Light Mode" width="100%" />
+</details>
+
 
 ## Features
 
+- **AI Assistant** - Ask questions in plain English, get SQL queries. Generate charts and insights (BYOK)
 - **Fast** - Opens in under 2 seconds, low memory footprint
-- **Query Editor** - Monaco editor with SQL syntax highlighting and autocomplete
-- **Multi-tab Support** - Work with multiple queries simultaneously
+- **Query Editor** - Monaco editor with SQL syntax highlighting and smart autocomplete with table aliases
+- **Command Palette** - `Cmd+K` to access everything instantly
+- **Multi-tab & Multi-window** - Work with multiple queries and databases simultaneously
+- **Query Telemetry** - Detailed timing breakdown with waterfall visualization and benchmark mode
+- **SSH Tunnels** - Connect securely through bastion hosts
+- **Schema Explorer** - Browse tables, views, stored procedures, and functions
 - **Inline Editing** - Edit table data directly with INSERT/UPDATE/DELETE
 - **ERD Visualization** - See table relationships visually
 - **Query Plans** - Analyze query performance with EXPLAIN ANALYZE viewer
+- **Saved Queries** - Bookmark your favorite queries for quick access
+- **Cancel Queries** - Stop long-running queries mid-execution
+- **Auto-Updates** - Automatic updates with toast notifications
 - **Dark/Light Mode** - Easy on the eyes
 - **Keyboard-First** - Power users shouldn't need a mouse
-- **Secure** - Connection credentials encrypted locally, no telemetry
+- **Secure** - Connection credentials encrypted locally using OS keychain, no telemetry
 
 ## Installation
 
@@ -24,9 +71,11 @@ Download the latest release for your platform from [Releases](https://github.com
 - **Windows**: `.exe` installer
 - **Linux**: `.AppImage`, `.deb`, or `.tar.gz` (Arch)
 
-### macOS: "App is damaged" Fix
+### macOS: Code Signing
 
-Since the app isn't notarized with Apple yet, macOS Gatekeeper may show a warning. To fix:
+Starting from v0.4.0, data-peek is code signed and notarized for macOS. You should be able to open it directly without any warnings.
+
+If you're using an older version and see an "App is damaged" warning:
 
 **Option 1: Terminal command**
 ```bash
@@ -37,8 +86,6 @@ xattr -cr /Applications/data-peek.app
 1. Right-click (or Control+click) on data-peek.app
 2. Select "Open" from the menu
 3. Click "Open" in the dialog
-
-This only needs to be done once. Proper code signing is coming soon!
 
 ### Linux: Auto-Updates
 
@@ -97,7 +144,7 @@ This can happen when pnpm's cache skips Electron's postinstall script that downl
 | UI | shadcn/ui + Tailwind CSS |
 | State | Zustand |
 | Query Editor | Monaco |
-| Database | pg (PostgreSQL), mysql2 (MySQL), mssql (SQL Server) |
+| Database | pg (PostgreSQL), mysql2 (MySQL), mssql (SQL Server), better-sqlite3 (SQLite) |
 
 ## Project Structure
 
@@ -151,4 +198,5 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 ## Support
 
 - [GitHub Issues](https://github.com/Rohithgilla12/data-peek/issues) - Bug reports and feature requests
+- [GitHub Sponsors](https://github.com/sponsors/Rohithgilla12) - Support development
 - Twitter/X: [@gillarohith](https://x.com/gillarohith)
