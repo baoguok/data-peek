@@ -2,12 +2,22 @@
 
 import { useCallback } from 'react'
 import { ReactGridLayout } from 'react-grid-layout/legacy'
-import type { Layout, LayoutItem } from 'react-grid-layout'
+
 import { useDashboardStore } from '@/stores'
 import { WidgetCard } from './widget-card'
 import type { Dashboard, WidgetLayout } from '@shared/index'
 
 import 'react-grid-layout/css/styles.css'
+
+interface GridLayoutItem {
+  i: string
+  x: number
+  y: number
+  w: number
+  h: number
+  minW?: number
+  minH?: number
+}
 
 interface DashboardGridProps {
   dashboard: Dashboard
@@ -17,7 +27,7 @@ interface DashboardGridProps {
 export function DashboardGrid({ dashboard, editMode }: DashboardGridProps) {
   const updateWidgetLayouts = useDashboardStore((s) => s.updateWidgetLayouts)
 
-  const layout: LayoutItem[] = dashboard.widgets.map((widget) => ({
+  const layout: GridLayoutItem[] = dashboard.widgets.map((widget) => ({
     i: widget.id,
     x: widget.layout.x,
     y: widget.layout.y,
@@ -28,7 +38,7 @@ export function DashboardGrid({ dashboard, editMode }: DashboardGridProps) {
   }))
 
   const handleLayoutChange = useCallback(
-    (newLayout: Layout) => {
+    (newLayout: readonly GridLayoutItem[]) => {
       const layouts: Record<string, WidgetLayout> = {}
       for (const item of newLayout) {
         layouts[item.i] = {
