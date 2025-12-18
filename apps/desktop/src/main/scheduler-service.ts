@@ -31,7 +31,9 @@ const activeJobs = new Map<string, ScheduledTask>()
 let saveRunLock: Promise<void> = Promise.resolve()
 
 /**
- * Initialize the scheduler service and storage
+ * Initialize scheduler storage and start any active scheduled queries.
+ *
+ * @param connStore - Storage instance containing connection configurations used by scheduled queries
  */
 export async function initSchedulerService(
   connStore: DpStorage<{ connections: ConnectionConfig[] }>
@@ -60,7 +62,9 @@ export async function initSchedulerService(
 }
 
 /**
- * Get the cron expression for a schedule config
+ * Derives a cron expression from a schedule configuration.
+ *
+ * @returns The cron expression defined by the schedule, or `'0 * * * *'` (hourly) if the schedule has no expression or the preset is not found.
  */
 function getCronExpression(schedule: ScheduledQuery['schedule']): string {
   if (schedule.preset === 'custom') {
@@ -72,7 +76,10 @@ function getCronExpression(schedule: ScheduledQuery['schedule']): string {
 }
 
 /**
- * Calculate the next run time for a scheduled query
+ * Compute the next scheduled run timestamp for a schedule.
+ *
+ * @param schedule - Schedule configuration (preset or custom cron and optional timezone)
+ * @returns The next run time as a Unix timestamp in milliseconds. If the cron expression cannot be parsed, returns a timestamp one hour from now.
  */
 function getNextRunTime(schedule: ScheduledQuery['schedule']): number {
   const cronExpression = getCronExpression(schedule)
@@ -90,7 +97,13 @@ function getNextRunTime(schedule: ScheduledQuery['schedule']): number {
 }
 
 /**
- * Schedule a cron job for a query
+ * Schedules a cron job for the given scheduled query.
+ *
+ * Updates the query's nextRunAt, stops and replaces any existing job for the query,
+ * persists an 'error' status with `lastError` when the cron expression is invalid,
+ * and registers the new cron task in `activeJobs`.
+ *
+ * @param query - The scheduled query to schedule
  */
 function scheduleCronJob(query: ScheduledQuery): void {
   // Stop any existing job
@@ -140,7 +153,14 @@ function scheduleCronJob(query: ScheduledQuery): void {
 }
 
 /**
- * Execute a scheduled query
+ * Execute a scheduled query by its ID and record the run.
+ *
+ * Finds the scheduled query and, if it is active, executes it against the configured connection,
+ * records a run entry (timing, success, row count and result preview or error), updates the
+ * scheduled query's last run metadata and status, persists the run to history, updates the next
+ * scheduled run time for UI display, and optionally shows desktop notifications on completion or error.
+ *
+ * @param queryId - The ID of the scheduled query to execute
  */
 async function executeScheduledQuery(queryId: string): Promise<void> {
   const queries = scheduledQueriesStore.get('scheduledQueries', [])
@@ -245,8 +265,12 @@ async function executeScheduledQuery(queryId: string): Promise<void> {
 }
 
 /**
- * Save a run to history, respecting maxHistoryRuns
- * Uses a mutex to prevent concurrent read-modify-write race conditions
+ * Persist a scheduled query run and trim that query's run history to its configured maximum.
+ *
+ * Appends `run` to the global runs store, then keeps only the most recent `maxHistoryRuns`
+ * entries for the associated scheduled query (default 100), preserving runs for other queries.
+ *
+ * @param run - The scheduled query run to persist
  */
 async function saveRun(run: ScheduledQueryRun): Promise<void> {
   const currentLock = saveRunLock
@@ -280,7 +304,10 @@ async function saveRun(run: ScheduledQueryRun): Promise<void> {
 }
 
 /**
- * Show a desktop notification
+ * Display a native desktop notification with the given title and body when the platform supports notifications.
+ *
+ * @param title - Notification title shown to the user
+ * @param body - Notification body text shown to the user
  */
 function showNotification(title: string, body: string): void {
   if (Notification.isSupported()) {
@@ -294,7 +321,11 @@ function showNotification(title: string, body: string): void {
 }
 
 /**
- * Internal update without triggering reschedule
+ * Update a stored scheduled query's fields and persist the change without altering its schedule.
+ *
+ * @param id - The ID of the scheduled query to update
+ * @param updates - Partial fields to merge into the existing scheduled query
+ * @returns The updated `ScheduledQuery`, or `null` if no query with the given `id` exists
  */
 function updateScheduledQueryInternal(
   id: string,
@@ -318,21 +349,30 @@ function updateScheduledQueryInternal(
 }
 
 /**
- * List all scheduled queries
+ * Retrieve all scheduled queries.
+ *
+ * @returns An array of ScheduledQuery objects from storage.
  */
 export function listScheduledQueries(): ScheduledQuery[] {
   return scheduledQueriesStore.get('scheduledQueries', [])
 }
 
 /**
- * Get a scheduled query by ID
+ * Retrieve a scheduled query by its identifier.
+ *
+ * @returns The scheduled query with the matching `id`, or `undefined` if not found.
  */
 export function getScheduledQuery(id: string): ScheduledQuery | undefined {
   return scheduledQueriesStore.get('scheduledQueries', []).find((q) => q.id === id)
 }
 
 /**
- * Create a new scheduled query
+ * Create, persist, and schedule a new scheduled query.
+ *
+ * This generates an ID, sets initial status and timestamps, computes the next run time, stores the query in persistent storage, and schedules its first cron job.
+ *
+ * @param input - Properties for the new scheduled query (schedule, connection, query text, notification options, etc.)
+ * @returns The persisted ScheduledQuery including generated `id`, `status`, `nextRunAt`, `createdAt`, and `updatedAt`
  */
 export function createScheduledQuery(input: CreateScheduledQueryInput): ScheduledQuery {
   const now = Date.now()
@@ -357,7 +397,14 @@ export function createScheduledQuery(input: CreateScheduledQueryInput): Schedule
 }
 
 /**
- * Update a scheduled query
+ * Merge the provided updates into an existing scheduled query and persist the changes.
+ *
+ * If the schedule is updated, the next run time is recalculated. If the schedule or status
+ * changes, the cron job is reconfigured. The query's `updatedAt` timestamp is refreshed.
+ *
+ * @param id - The ID of the scheduled query to update
+ * @param updates - Partial updates to apply to the scheduled query
+ * @returns The updated `ScheduledQuery` if found and updated, or `null` if no query with the given `id` exists
  */
 export function updateScheduledQuery(
   id: string,
@@ -394,7 +441,13 @@ export function updateScheduledQuery(
 }
 
 /**
- * Delete a scheduled query
+ * Delete a scheduled query and its run history.
+ *
+ * Stops any active cron job for the query, removes the scheduled query from storage,
+ * and deletes all run history associated with that query.
+ *
+ * @param id - The ID of the scheduled query to delete
+ * @returns `true` if a scheduled query was removed, `false` if no matching query was found
  */
 export function deleteScheduledQuery(id: string): boolean {
   // Stop any active cron job
@@ -423,21 +476,29 @@ export function deleteScheduledQuery(id: string): boolean {
 }
 
 /**
- * Pause a scheduled query
+ * Pause a scheduled query.
+ *
+ * @param id - The ID of the scheduled query to pause
+ * @returns The updated `ScheduledQuery` with status `'paused'`, or `null` if no query with the given id exists
  */
 export function pauseScheduledQuery(id: string): ScheduledQuery | null {
   return updateScheduledQuery(id, { status: 'paused' })
 }
 
 /**
- * Resume a scheduled query
+ * Reactivates a scheduled query so it will be scheduled to run.
+ *
+ * @returns The updated `ScheduledQuery`, or `null` if no query with the given `id` exists.
  */
 export function resumeScheduledQuery(id: string): ScheduledQuery | null {
   return updateScheduledQuery(id, { status: 'active', lastError: undefined })
 }
 
 /**
- * Run a scheduled query immediately (outside of schedule)
+ * Trigger an immediate execution of the scheduled query identified by `id`.
+ *
+ * @param id - The scheduled query's unique identifier
+ * @returns The latest run for the scheduled query after execution, or `null` if the query was not found
  */
 export async function runScheduledQueryNow(id: string): Promise<ScheduledQueryRun | null> {
   const query = getScheduledQuery(id)
@@ -454,7 +515,13 @@ export async function runScheduledQueryNow(id: string): Promise<ScheduledQueryRu
 }
 
 /**
- * Get run history for a scheduled query
+ * Retrieve the run history for a scheduled query.
+ *
+ * Returns the runs for the given query ordered by `startedAt` from newest to oldest.
+ *
+ * @param queryId - The ID of the scheduled query to fetch runs for
+ * @param limit - Optional maximum number of runs to return
+ * @returns An array of `ScheduledQueryRun` objects sorted by `startedAt` descending; limited to `limit` items if provided
  */
 export function getScheduledQueryRuns(queryId: string, limit?: number): ScheduledQueryRun[] {
   const runs = scheduledQueryRunsStore.get('runs', [])
@@ -466,7 +533,10 @@ export function getScheduledQueryRuns(queryId: string, limit?: number): Schedule
 }
 
 /**
- * Get all recent runs across all scheduled queries
+ * Retrieve recent runs across all scheduled queries.
+ *
+ * @param limit - Maximum number of runs to return (defaults to 50)
+ * @returns An array of scheduled query runs sorted by `startedAt` descending, limited to the most recent `limit` entries
  */
 export function getAllRecentRuns(limit: number = 50): ScheduledQueryRun[] {
   const runs = scheduledQueryRunsStore.get('runs', [])
@@ -474,7 +544,9 @@ export function getAllRecentRuns(limit: number = 50): ScheduledQueryRun[] {
 }
 
 /**
- * Clear run history for a scheduled query
+ * Remove all run history entries associated with a scheduled query.
+ *
+ * @param queryId - The ID of the scheduled query whose runs should be removed
  */
 export function clearScheduledQueryRuns(queryId: string): void {
   const runs = scheduledQueryRunsStore.get('runs', [])
@@ -483,7 +555,7 @@ export function clearScheduledQueryRuns(queryId: string): void {
 }
 
 /**
- * Stop all scheduled queries (for app shutdown)
+ * Stops all active scheduled cron jobs and clears the internal job registry.
  */
 export function stopAllSchedules(): void {
   for (const [id, job] of activeJobs) {
@@ -494,7 +566,10 @@ export function stopAllSchedules(): void {
 }
 
 /**
- * Validate a cron expression
+ * Checks whether a cron expression is syntactically valid.
+ *
+ * @param expression - The cron expression to validate
+ * @returns An object with `valid: true` when the expression parses successfully; when invalid, `valid: false` and `error` contains the parser message
  */
 export function validateCronExpression(expression: string): { valid: boolean; error?: string } {
   try {
@@ -509,7 +584,12 @@ export function validateCronExpression(expression: string): { valid: boolean; er
 }
 
 /**
- * Get the next N scheduled run times for a cron expression
+ * Compute the next scheduled run timestamps for a cron expression.
+ *
+ * @param expression - The cron expression to parse
+ * @param count - Number of upcoming run times to return (default: 5)
+ * @param timezone - IANA timezone name to evaluate the cron expression in (defaults to the system timezone)
+ * @returns An array of timestamps (milliseconds since Unix epoch) for the next `count` runs; returns an empty array if the expression cannot be parsed
  */
 export function getNextRunTimes(
   expression: string,
