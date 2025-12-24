@@ -1,19 +1,18 @@
-import { useReducer, useEffect, useState } from 'react'
 import {
+  BarChart3,
+  CheckCircle2,
   Database,
   FileText,
-  Play,
-  Loader2,
-  CheckCircle2,
-  BarChart3,
   Hash,
-  Table2,
-  Search
+  Loader2,
+  Play,
+  Search,
+  Table2
 } from 'lucide-react'
+import { useEffect, useReducer, useState } from 'react'
 
+import { SQLEditor } from '@/components/sql-editor'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Dialog,
   DialogContent,
@@ -22,6 +21,9 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Select,
   SelectContent,
@@ -29,21 +31,24 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { SQLEditor } from '@/components/sql-editor'
-import { useConnectionStore, useSavedQueryStore, useDashboardStore } from '@/stores'
+import { cn } from '@/lib/utils'
+import { useConnectionStore, useDashboardStore, useSavedQueryStore } from '@/stores'
 import type {
-  CreateWidgetInput,
-  WidgetDataSource,
   ChartWidgetConfig,
+  CreateWidgetInput,
+  KPIFormat,
   KPIWidgetConfig,
   TableWidgetConfig,
-  WidgetType,
-  KPIFormat
+  WidgetDataSource,
+  WidgetType
 } from '@shared/index'
-import { dialogReducer, initialDialogState, CHART_TYPES, KPI_FORMATS } from './add-widget-dialog-reducer'
+import {
+  CHART_TYPES,
+  dialogReducer,
+  initialDialogState,
+  KPI_FORMATS
+} from './add-widget-dialog-reducer'
 import { AIWidgetSuggestion, type WidgetSuggestion } from './ai-widget-suggestion'
-import { cn } from '@/lib/utils'
 
 interface AddWidgetDialogProps {
   open: boolean
@@ -340,9 +345,7 @@ export function AddWidgetDialog({ open, onOpenChange, dashboardId }: AddWidgetDi
                     <Label className="text-[11px] text-muted-foreground">Saved Query</Label>
                     <Select
                       value={selectedQueryId}
-                      onValueChange={(v) =>
-                        dispatch({ type: 'SET_SELECTED_QUERY_ID', payload: v })
-                      }
+                      onValueChange={(v) => dispatch({ type: 'SET_SELECTED_QUERY_ID', payload: v })}
                     >
                       <SelectTrigger className="h-8 text-xs">
                         <SelectValue placeholder="Select a query..." />
@@ -431,7 +434,8 @@ export function AddWidgetDialog({ open, onOpenChange, dashboardId }: AddWidgetDi
                   <div className="flex items-center gap-2 p-2 rounded-md bg-emerald-500/10 border border-emerald-500/20">
                     <CheckCircle2 className="size-3.5 text-emerald-500 shrink-0" />
                     <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                      {previewData.length} row{previewData.length !== 1 ? 's' : ''}, {availableColumns.length} column{availableColumns.length !== 1 ? 's' : ''}
+                      {previewData.length} row{previewData.length !== 1 ? 's' : ''},{' '}
+                      {availableColumns.length} column{availableColumns.length !== 1 ? 's' : ''}
                     </span>
                   </div>
                   <div className="rounded-lg border overflow-hidden">
@@ -480,7 +484,10 @@ export function AddWidgetDialog({ open, onOpenChange, dashboardId }: AddWidgetDi
               )}
             </div>
 
-            <AIWidgetSuggestion queryResult={previewData} onSuggestionSelect={handleSuggestionSelect} />
+            <AIWidgetSuggestion
+              queryResult={previewData}
+              onSuggestionSelect={handleSuggestionSelect}
+            />
 
             {widgetType === 'chart' && (
               <div className="space-y-3">
@@ -500,7 +507,9 @@ export function AddWidgetDialog({ open, onOpenChange, dashboardId }: AddWidgetDi
                       )}
                     >
                       <ct.icon className="size-4" />
-                      <span className="text-[10px] font-medium">{ct.label.replace(' Chart', '')}</span>
+                      <span className="text-[10px] font-medium">
+                        {ct.label.replace(' Chart', '')}
+                      </span>
                     </button>
                   ))}
                 </div>

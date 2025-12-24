@@ -1,7 +1,9 @@
-import { Database, FileText, Search, Play, Loader2, CheckCircle2, RefreshCw } from 'lucide-react'
+import { CheckCircle2, Database, FileText, Loader2, Play, RefreshCw, Search } from 'lucide-react'
 
+import { SQLEditor } from '@/components/sql-editor'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Select,
   SelectContent,
@@ -9,25 +11,23 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { SQLEditor } from '@/components/sql-editor'
-import type {
-  WidgetType,
-  ChartWidgetType,
-  KPIFormat,
-  ConnectionConfig,
-  SavedQuery,
-  SchemaInfo
-} from '@shared/index'
 import { cn } from '@/lib/utils'
-import { AIWidgetSuggestion, type WidgetSuggestion } from './ai-widget-suggestion'
+import type {
+  ChartWidgetType,
+  ConnectionConfig,
+  KPIFormat,
+  SavedQuery,
+  SchemaInfo,
+  WidgetType
+} from '@shared/index'
 import {
-  WIDGET_TYPES,
   CHART_TYPES,
   KPI_FORMATS,
-  type DialogState,
-  type DialogAction
+  WIDGET_TYPES,
+  type DialogAction,
+  type DialogState
 } from './add-widget-dialog-reducer'
+import { AIWidgetSuggestion, type WidgetSuggestion } from './ai-widget-suggestion'
 
 interface TypeStepProps {
   widgetType: WidgetType
@@ -278,7 +278,7 @@ export function ConfigStep({
         <button
           onClick={onPreviewQuery}
           disabled={isLoadingPreview}
-          className="w-full flex items-center justify-between p-4 rounded-xl bg-gradient-to-r from-primary/5 to-primary/10 border border-primary/20 hover:border-primary/40 transition-all duration-200 group"
+          className="w-full flex items-center justify-between p-4 rounded-xl bg-linear-to-r from-primary/5 to-primary/10 border border-primary/20 hover:border-primary/40 transition-all duration-200 group"
         >
           <div className="flex items-center gap-3">
             <div className="flex size-10 items-center justify-center rounded-lg bg-primary/10 group-hover:bg-primary/20 transition-colors">
@@ -292,9 +292,7 @@ export function ConfigStep({
               <div className="font-medium text-sm">
                 {isLoadingPreview ? 'Loading preview...' : 'Preview your data'}
               </div>
-              <div className="text-xs text-muted-foreground">
-                Get AI-powered widget suggestions
-              </div>
+              <div className="text-xs text-muted-foreground">Get AI-powered widget suggestions</div>
             </div>
           </div>
           {!isLoadingPreview && (
@@ -311,7 +309,8 @@ export function ConfigStep({
               Preview loaded
             </span>
             <span className="text-xs text-muted-foreground">
-              {previewData.length} row{previewData.length !== 1 ? 's' : ''}, {availableColumns.length} column{availableColumns.length !== 1 ? 's' : ''}
+              {previewData.length} row{previewData.length !== 1 ? 's' : ''},{' '}
+              {availableColumns.length} column{availableColumns.length !== 1 ? 's' : ''}
             </span>
           </div>
           <button
