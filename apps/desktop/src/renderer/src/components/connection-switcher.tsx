@@ -1,7 +1,5 @@
-'use client'
-
 import { useEffect, useState } from 'react'
-import { ChevronDown, Plus, Settings, Loader2, Pencil, Trash2 } from 'lucide-react'
+import { ChevronDown, Plus, Settings, Loader2, Pencil, Trash2, Copy } from 'lucide-react'
 
 import {
   DropdownMenu,
@@ -36,7 +34,9 @@ export function ConnectionSwitcher() {
   const setConnectionStatus = useConnectionStore((s) => s.setConnectionStatus)
   const initializeConnections = useConnectionStore((s) => s.initializeConnections)
   const removeConnection = useConnectionStore((s) => s.removeConnection)
+  const addConnection = useConnectionStore((s) => s.addConnection)
   const isInitialized = useConnectionStore((s) => s.isInitialized)
+  const setupConnectionSync = useConnectionStore((s) => s.setupConnectionSync)
 
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [editingConnection, setEditingConnection] = useState<Connection | null>(null)
@@ -46,6 +46,12 @@ export function ConnectionSwitcher() {
   useEffect(() => {
     initializeConnections()
   }, [initializeConnections])
+
+  // Set up listener for connection updates from other windows
+  useEffect(() => {
+    const cleanup = setupConnectionSync()
+    return cleanup
+  }, [setupConnectionSync])
 
   const activeConnection = connections.find((c) => c.id === activeConnectionId)
 
@@ -72,6 +78,28 @@ export function ConnectionSwitcher() {
   const handleDeleteConnection = (e: React.MouseEvent, connection: Connection) => {
     e.stopPropagation()
     setDeletingConnection(connection)
+  }
+
+  const handleDuplicateConnection = async (e: React.MouseEvent, connection: Connection) => {
+    e.stopPropagation()
+    try {
+      const duplicatedConnection = {
+        ...connection,
+        id: crypto.randomUUID(),
+        name: `${connection.name} (copy)`,
+        isConnected: false,
+        isConnecting: false
+      }
+
+      const result = await window.api.connections.add(duplicatedConnection)
+      if (result.success && result.data) {
+        addConnection(result.data)
+      } else {
+        console.error('Failed to duplicate connection:', result.error)
+      }
+    } catch (error) {
+      console.error('Error duplicating connection:', error)
+    }
   }
 
   const confirmDelete = async () => {
@@ -174,6 +202,13 @@ export function ConnectionSwitcher() {
                   </span>
                 </div>
                 <div className="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    onClick={(e) => handleDuplicateConnection(e, connection)}
+                    className="p-1 hover:bg-muted rounded"
+                    title="Duplicate connection"
+                  >
+                    <Copy className="size-3.5" />
+                  </button>
                   <button
                     onClick={(e) => handleEditConnection(e, connection)}
                     className="p-1 hover:bg-muted rounded"

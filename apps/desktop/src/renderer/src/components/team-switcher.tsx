@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import { ChevronDown, Plus } from 'lucide-react'
 
@@ -13,6 +11,7 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from '@/components/ui/sidebar'
+import { keys } from '@/lib/utils'
 
 export function TeamSwitcher({
   teams
@@ -59,7 +58,10 @@ export function TeamSwitcher({
                   <team.logo className="size-4 shrink-0" />
                 </div>
                 {team.name}
-                <DropdownMenuShortcut>⌘{index + 1}</DropdownMenuShortcut>
+                <DropdownMenuShortcut>
+                  {keys.mod}
+                  {index + 1}
+                </DropdownMenuShortcut>
               </DropdownMenuItem>
             ))}
             <DropdownMenuSeparator />

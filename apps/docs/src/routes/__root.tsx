@@ -3,61 +3,48 @@ import {
   HeadContent,
   Outlet,
   Scripts,
-} from '@tanstack/react-router';
-import * as React from 'react';
-import appCss from '@/styles/app.css?url';
-import { RootProvider } from 'fumadocs-ui/provider/tanstack';
+} from "@tanstack/react-router";
+import * as React from "react";
+import appCss from "@/styles/app.css?url";
+import { RootProvider } from "fumadocs-ui/provider/tanstack";
+import { generateMetaTags, DOCS_CONFIG, getOrganizationStructuredData } from "@/lib/seo";
 
 export const Route = createRootRoute({
   head: () => ({
-    meta: [
-      {
-        charSet: 'utf-8',
-      },
-      {
-        name: 'viewport',
-        content: 'width=device-width, initial-scale=1',
-      },
-      {
-        title: 'data-peek Docs',
-      },
-      {
-        name: 'description',
-        content:
-          'Documentation for data-peek - A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
-      },
-      {
-        name: 'theme-color',
-        content: '#0a0a0b',
-      },
-      {
-        property: 'og:title',
-        content: 'data-peek Documentation',
-      },
-      {
-        property: 'og:description',
-        content: 'A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
-      },
-      {
-        property: 'og:type',
-        content: 'website',
-      },
-      {
-        name: 'twitter:card',
-        content: 'summary_large_image',
-      },
-      {
-        name: 'twitter:title',
-        content: 'data-peek Documentation',
-      },
-      {
-        name: 'twitter:description',
-        content: 'A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
-      },
-    ],
+    meta: generateMetaTags({
+      title: DOCS_CONFIG.title,
+      description: DOCS_CONFIG.description,
+      keywords: [
+        'data-peek documentation',
+        'PostgreSQL client docs',
+        'MySQL client docs',
+        'SQL client documentation',
+        'database client guide',
+        'SQL editor documentation',
+      ],
+    }),
     links: [
-      { rel: 'stylesheet', href: appCss },
-      { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
+      { rel: "stylesheet", href: appCss },
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+    ],
+    scripts: [
+      {
+        src: "https://giveme.gilla.fun/script.js",
+      },
+      {
+        children: `(function(c,l,a,r,i,t,y){
+          c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
+          t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
+          y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
+        })(window, document, "clarity", "script", "ukb6oie3zz");`,
+      },
+      {
+        src: "https://cdn.littlestats.click/embed/wq9151m57h17nmx",
+      },
+      {
+        src: "https://scripts.simpleanalyticscdn.com/latest.js",
+        async: true,
+      },
     ],
   }),
   component: RootComponent,
@@ -72,17 +59,22 @@ function RootComponent() {
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
+  const orgStructuredData = getOrganizationStructuredData();
+
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(orgStructuredData) }}
+        />
       </head>
       <body className="flex flex-col min-h-screen antialiased">
         <RootProvider
           theme={{
             enabled: true,
-            defaultTheme: 'dark',
-            forcedTheme: 'dark',
+            defaultTheme: "dark",
           }}
         >
           {children}

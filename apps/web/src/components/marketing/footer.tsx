@@ -1,31 +1,51 @@
-import Link from 'next/link'
-import { Database, Github, Twitter } from 'lucide-react'
+import Link from "next/link";
+import { Database, Github, Twitter } from "lucide-react";
 
 const footerLinks = {
   Product: [
-    { label: 'Features', href: '#features' },
-    { label: 'Pricing', href: '#pricing' },
-    { label: 'Download', href: '/download' },
-    { label: 'Changelog', href: '/changelog' },
+    { label: "Features", href: "/#features" },
+    { label: "Pricing", href: "/#pricing" },
+    { label: "Download", href: "/download" },
+    { label: "Databases", href: "/databases" },
+    { label: "Compare", href: "/compare" },
+    {
+      label: "GitHub",
+      href: "https://github.com/Rohithgilla12/data-peek",
+      external: true,
+    },
+  ],
+  Databases: [
+    { label: "PostgreSQL", href: "/databases/postgresql" },
+    { label: "MySQL", href: "/databases/mysql" },
+    { label: "SQL Server", href: "/databases/sql-server" },
+    { label: "SQLite", href: "/databases/sqlite" },
   ],
   Resources: [
-    { label: 'Documentation', href: '/docs' },
-    { label: 'FAQ', href: '#faq' },
-    { label: 'Blog', href: '/blog' },
-    { label: 'Support', href: '/support' },
+    {
+      label: "Documentation",
+      href: "https://docs.datapeek.dev/docs",
+      external: true,
+    },
+    { label: "Blog", href: "/blog" },
+    { label: "FAQ", href: "/#faq" },
+    { label: "Support", href: "mailto:gillarohith1@gmail.com", external: true },
   ],
   Legal: [
-    { label: 'Privacy Policy', href: '/privacy' },
-    { label: 'Terms of Service', href: '/terms' },
-    { label: 'License', href: '/license' },
+    { label: "Privacy Policy", href: "/privacy" },
+    { label: "Terms of Service", href: "/terms" },
+    {
+      label: "License (MIT)",
+      href: "https://github.com/Rohithgilla12/data-peek/blob/main/LICENSE",
+      external: true,
+    },
   ],
-}
+};
 
 export function Footer() {
   return (
     <footer className="relative border-t border-[--color-border] bg-[--color-surface]/50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-10 sm:py-16">
-        <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-5 gap-8 sm:gap-12">
+        <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-6 gap-8 sm:gap-12">
           {/* Brand */}
           <div className="col-span-2">
             <Link href="/" className="flex items-center gap-2 mb-3 sm:mb-4">
@@ -34,16 +54,17 @@ export function Footer() {
               </div>
               <span
                 className="text-base sm:text-lg font-semibold tracking-tight"
-                style={{ fontFamily: 'var(--font-display)' }}
+                style={{ fontFamily: "var(--font-display)" }}
               >
                 data-peek
               </span>
             </Link>
             <p
               className="text-xs sm:text-sm text-[--color-text-secondary] max-w-xs mb-4 sm:mb-6"
-              style={{ fontFamily: 'var(--font-body)' }}
+              style={{ fontFamily: "var(--font-body)" }}
             >
-              A fast, beautiful PostgreSQL client for developers who value simplicity.
+              A fast, AI-powered database client for developers who value
+              simplicity.
             </p>
 
             {/* Social Links */}
@@ -72,7 +93,7 @@ export function Footer() {
             <div key={category}>
               <h4
                 className="text-[10px] sm:text-xs uppercase tracking-[0.15em] text-[--color-text-muted] mb-3 sm:mb-4"
-                style={{ fontFamily: 'var(--font-mono)' }}
+                style={{ fontFamily: "var(--font-mono)" }}
               >
                 {category}
               </h4>
@@ -81,6 +102,11 @@ export function Footer() {
                   <li key={link.label}>
                     <Link
                       href={link.href}
+                      {...(typeof link === "object" &&
+                      "external" in link &&
+                      link.external
+                        ? { target: "_blank", rel: "noopener noreferrer" }
+                        : {})}
                       className="text-xs sm:text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] transition-colors"
                     >
                       {link.label}
@@ -96,16 +122,16 @@ export function Footer() {
         <div className="mt-10 sm:mt-16 pt-6 sm:pt-8 border-t border-[--color-border] flex flex-col md:flex-row items-center justify-between gap-3 sm:gap-4">
           <p
             className="text-xs sm:text-sm text-[--color-text-muted]"
-            style={{ fontFamily: 'var(--font-mono)' }}
+            style={{ fontFamily: "var(--font-mono)" }}
           >
             © {new Date().getFullYear()} data-peek. All rights reserved.
           </p>
           <p className="text-xs sm:text-sm text-[--color-text-muted]">
-            Made with{' '}
-            <span className="text-[--color-error]">♥</span> for developers
+            Made with <span className="text-[--color-error]">♥</span> for
+            developers
           </p>
         </div>
       </div>
     </footer>
-  )
+  );
 }

@@ -1,6 +1,4 @@
-'use client'
-
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Play,
   Download,
@@ -19,11 +17,12 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
-import { useQueryStore, useConnectionStore } from '@/stores'
+import { useQueryStore, useConnectionStore, useSnippetStore } from '@/stores'
 import { DataTable } from '@/components/data-table'
 import { SQLEditor } from '@/components/sql-editor'
 import { formatSQL } from '@/lib/sql-formatter'
 import { SaveQueryDialog } from '@/components/save-query-dialog'
+import { keys } from '@/lib/utils'
 
 export function QueryEditor() {
   const activeConnection = useConnectionStore((s) => s.getActiveConnection())
@@ -31,8 +30,15 @@ export function QueryEditor() {
   const { currentQuery, isExecuting, result, error } = useQueryStore()
   const setCurrentQuery = useQueryStore((s) => s.setCurrentQuery)
   const executeQuery = useQueryStore((s) => s.executeQuery)
+  const getAllSnippets = useSnippetStore((s) => s.getAllSnippets)
+  const initializeSnippets = useSnippetStore((s) => s.initializeSnippets)
+  const allSnippets = getAllSnippets()
 
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
+
+  useEffect(() => {
+    initializeSnippets()
+  }, [initializeSnippets])
 
   const handleRunQuery = () => {
     console.log('[QueryEditor] handleRunQuery called')
@@ -86,6 +92,7 @@ export function QueryEditor() {
             height={160}
             placeholder="SELECT * FROM your_table LIMIT 100;"
             schemas={schemas}
+            snippets={allSnippets}
           />
         </div>
 
@@ -104,7 +111,10 @@ export function QueryEditor() {
                 <Play className="size-3.5" />
               )}
               Run
-              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">⌘↵</kbd>
+              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                {keys.mod}
+                {keys.enter}
+              </kbd>
             </Button>
             <Button
               variant="ghost"
@@ -115,7 +125,10 @@ export function QueryEditor() {
             >
               <Wand2 className="size-3.5" />
               Format
-              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">⌘⇧F</kbd>
+              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                {keys.mod}
+                {keys.shift}F
+              </kbd>
             </Button>
             <Button
               variant="ghost"
