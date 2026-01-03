@@ -1,54 +1,52 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, customers, licenses } from "@/db";
+import { db, customers, licenses, webhookEvents } from "@/db";
 import { eq } from "drizzle-orm";
-import { generateLicenseKey, calculateUpdatesUntil } from "@/lib/license";
+import { calculateUpdatesUntil, generateLicenseKey } from "@/lib/license";
 import { Resend } from "resend";
+import DodoPayments from "dodopayments";
 
 const resend = new Resend(process.env.RESEND_API_KEY ?? "re_123");
+const dodo = new DodoPayments({
+  bearerToken: process.env.DODO_API_KEY,
+  webhookKey: process.env.DODO_WEBHOOK_SECRET,
+});
 
 // DodoPayments webhook event types
 type DodoEventType =
-  | "payment.completed"
+  | "payment.succeeded"
   | "payment.refunded"
-  | "payment.failed";
+  | "payment.failed"
+  | "subscription.active"
+  | "subscription.renewed"
+  | "subscription.cancelled";
 
 interface DodoWebhookPayload {
-  event: DodoEventType;
+  business_id: string;
+  timestamp: string;
+  type: DodoEventType;
   data: {
-    payment_id: string;
-    product_id: string;
-    customer: {
+    // Common fields
+    payment_id?: string;
+    subscription_id?: string;
+    product_id?: string;
+    customer?: {
       email: string;
       name?: string;
       customer_id: string;
     };
-    amount: number;
-    currency: string;
     metadata?: Record<string, string>;
+    // Payment specific
+    total_amount?: number;
+    currency?: string;
+    status?: string;
   };
 }
 
-// Verify DodoPayments webhook signature
-async function verifyWebhookSignature(
-  payload: string,
-  signature: string | null
-): Promise<boolean> {
-  if (!signature || !process.env.DODO_WEBHOOK_SECRET) {
-    console.warn("Missing webhook signature or secret");
-    return false;
-  }
-
-  // DodoPayments uses HMAC-SHA256 for webhook signatures
-  const crypto = await import("crypto");
-  const expectedSignature = crypto
-    .createHmac("sha256", process.env.DODO_WEBHOOK_SECRET)
-    .update(payload)
-    .digest("hex");
-
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
-  );
+// Helper to extract a unique event ID from the payload
+function getEventId(event: DodoWebhookPayload): string {
+  const { data, type, timestamp } = event;
+  // Try various ID fields, fallback to type + timestamp
+  return data.payment_id || data.subscription_id || `${type}-${timestamp}`;
 }
 
 // Send welcome email with license key
@@ -58,14 +56,18 @@ async function sendWelcomeEmail(
   licenseKey: string,
   updatesUntil: Date
 ) {
+  console.log(`Attempting to send welcome email to: ${email}`);
+
   if (!process.env.RESEND_API_KEY) {
     console.warn("RESEND_API_KEY not configured, skipping email");
     return;
   }
 
+  console.log(`RESEND_API_KEY is configured (length: ${process.env.RESEND_API_KEY.length})`);
+
   try {
-    await resend.emails.send({
-      from: "data-peek <hello@datapeek.app>",
+    const result = await resend.emails.send({
+      from: "data-peek <hello@send.datapeek.dev>",
       to: email,
       subject: "Your data-peek Pro license 🎉",
       html: `
@@ -83,7 +85,7 @@ async function sendWelcomeEmail(
 
           <h3>Quick Start:</h3>
           <ol>
-            <li>Download data-peek from <a href="https://datapeek.app/download" style="color: #22d3ee;">datapeek.app/download</a></li>
+            <li>Download data-peek from <a href="https://datapeek.dev/download" style="color: #22d3ee;">datapeek.dev/download</a></li>
             <li>Open the app and go to <strong>Settings → License</strong></li>
             <li>Enter your license key</li>
           </ol>
@@ -101,38 +103,96 @@ async function sendWelcomeEmail(
         </div>
       `,
     });
+    console.log(`Welcome email sent successfully to ${email}. Resend ID: ${result.data?.id}`);
   } catch (error) {
     console.error("Failed to send welcome email:", error);
   }
 }
 
 export async function POST(request: NextRequest) {
+  let webhookEventId: string | null = null;
+
   try {
     const payload = await request.text();
-    const signature = request.headers.get("x-dodo-signature");
 
-    // Verify signature in production
-    if (process.env.NODE_ENV === "production") {
-      const isValid = await verifyWebhookSignature(payload, signature);
-      if (!isValid) {
-        console.error("Invalid webhook signature");
-        return NextResponse.json(
-          { error: "Invalid signature" },
-          { status: 401 }
-        );
-      }
+    // Extract Standard Webhooks headers
+    const webhookHeaders = {
+      "webhook-id": request.headers.get("webhook-id") ?? "",
+      "webhook-signature": request.headers.get("webhook-signature") ?? "",
+      "webhook-timestamp": request.headers.get("webhook-timestamp") ?? "",
+    };
+
+    let event: DodoWebhookPayload;
+
+    // Verify signature using Dodo Payments SDK (follows Standard Webhooks spec)
+    try {
+      // unwrap() verifies the signature and returns the parsed payload
+      const unwrapped = dodo.webhooks.unwrap(payload, { headers: webhookHeaders });
+      event = unwrapped as unknown as DodoWebhookPayload;
+    } catch (verifyError) {
+      console.error("Webhook signature verification failed:", verifyError);
+      return NextResponse.json(
+        { error: "Invalid signature" },
+        { status: 401 }
+      );
     }
 
-    const event = JSON.parse(payload) as DodoWebhookPayload;
+    // Use webhook-id header for idempotency (as per Standard Webhooks spec)
+    // This prevents duplicate processing due to retries
+    const webhookId = webhookHeaders["webhook-id"];
+    const eventId = webhookId || getEventId(event);
 
-    switch (event.event) {
-      case "payment.completed": {
+    // Check if we've already processed this webhook (idempotency)
+    const existingEvent = await db.query.webhookEvents.findFirst({
+      where: eq(webhookEvents.eventId, eventId),
+    });
+
+    if (existingEvent?.processed) {
+      console.log(`Webhook already processed: ${eventId}`);
+      return NextResponse.json({ received: true });
+    }
+
+    // Save webhook event to database
+    const [savedEvent] = await db
+      .insert(webhookEvents)
+      .values({
+        eventId,
+        eventName: event.type,
+        provider: "dodo",
+        payload: event,
+        processed: false,
+      })
+      .onConflictDoNothing() // Handle race condition with duplicate webhook delivery
+      .returning();
+
+    // If no event was inserted (duplicate), return success
+    if (!savedEvent) {
+      console.log(`Duplicate webhook received: ${eventId}`);
+      return NextResponse.json({ received: true });
+    }
+
+    webhookEventId = savedEvent.id;
+
+    switch (event.type) {
+      case "payment.succeeded": {
         const { data } = event;
+
+        if (!data.customer) {
+          console.log("No customer data in payment.succeeded event");
+          break;
+        }
 
         // Find or create customer
         let customer = await db.query.customers.findFirst({
-          where: eq(customers.email, data.customer.email),
+          where: eq(customers.dodoCustomerId, data.customer.customer_id),
         });
+
+        if (!customer) {
+          // Try finding by email
+          customer = await db.query.customers.findFirst({
+            where: eq(customers.email, data.customer.email),
+          });
+        }
 
         if (!customer) {
           const [newCustomer] = await db
@@ -144,19 +204,32 @@ export async function POST(request: NextRequest) {
             })
             .returning();
           customer = newCustomer;
+          console.log(`Customer created: ${data.customer.email}`);
         } else if (!customer.dodoCustomerId) {
           // Update existing customer with DodoPayments ID
           await db
             .update(customers)
             .set({ dodoCustomerId: data.customer.customer_id })
             .where(eq(customers.id, customer.id));
+          console.log(`Customer updated with Dodo ID: ${data.customer.email}`);
+        } else {
+          console.log(`Customer already exists: ${data.customer.email}`);
         }
 
-        // Generate license key
+        // Check if license already exists for this payment (idempotency)
+        const existingLicense = await db.query.licenses.findFirst({
+          where: eq(licenses.dodoPaymentId, data.payment_id || ""),
+        });
+
+        if (existingLicense) {
+          console.log(`License already exists for payment ${data.payment_id}`);
+          break;
+        }
+
+        // Generate license key and create license
         const licenseKey = generateLicenseKey("DPRO");
         const updatesUntil = calculateUpdatesUntil();
 
-        // Create license
         await db.insert(licenses).values({
           customerId: customer.id,
           licenseKey,
@@ -168,22 +241,25 @@ export async function POST(request: NextRequest) {
           updatesUntil,
         });
 
-        // Send welcome email
+        // Send welcome email with license key
         await sendWelcomeEmail(
-          data.customer.email,
-          data.customer.name,
+          customer.email,
+          customer.name || undefined,
           licenseKey,
           updatesUntil
         );
 
-        console.log(
-          `License created for ${data.customer.email}: ${licenseKey}`
-        );
+        console.log(`Payment succeeded for ${data.customer.email}: ${data.payment_id}, license: ${licenseKey}`);
         break;
       }
 
       case "payment.refunded": {
         const { data } = event;
+
+        if (!data.payment_id) {
+          console.log("No payment_id in payment.refunded event");
+          break;
+        }
 
         // Find and revoke the license
         const license = await db.query.licenses.findFirst({
@@ -203,20 +279,52 @@ export async function POST(request: NextRequest) {
 
       case "payment.failed": {
         const { data } = event;
-        console.log(
-          `Payment failed for ${data.customer.email}: ${data.payment_id}`
-        );
+        console.log(`Payment failed: ${data.payment_id}`);
         // Could send a failed payment notification email here
         break;
       }
 
+      case "subscription.active":
+      case "subscription.renewed": {
+        const { data } = event;
+        console.log(`Subscription ${event.type}: ${data.subscription_id}`);
+        // Handle subscription events if needed
+        break;
+      }
+
+      case "subscription.cancelled": {
+        const { data } = event;
+        console.log(`Subscription cancelled: ${data.subscription_id}`);
+        // Could revoke license or mark for expiration
+        break;
+      }
+
       default:
-        console.log(`Unhandled webhook event: ${event.event}`);
+        console.log(`Unhandled webhook event: ${event.type}`);
+    }
+
+    // Mark event as processed
+    if (webhookEventId) {
+      await db
+        .update(webhookEvents)
+        .set({ processed: true, processedAt: new Date() })
+        .where(eq(webhookEvents.id, webhookEventId));
     }
 
     return NextResponse.json({ received: true });
   } catch (error) {
     console.error("Webhook processing error:", error);
+
+    // Update event with error if we have an ID
+    if (webhookEventId) {
+      await db
+        .update(webhookEvents)
+        .set({
+          error: error instanceof Error ? error.message : "Unknown error",
+        })
+        .where(eq(webhookEvents.id, webhookEventId));
+    }
+
     return NextResponse.json(
       { error: "Webhook processing failed" },
       { status: 500 }
