@@ -6,7 +6,8 @@ import type {
   TableDefinition,
   SequenceInfo,
   CustomTypeInfo,
-  StatementResult
+  StatementResult,
+  QueryTelemetry
 } from '@shared/index'
 
 /**
@@ -24,6 +25,20 @@ export interface AdapterQueryResult {
 export interface AdapterMultiQueryResult {
   results: StatementResult[]
   totalDurationMs: number
+  /** Telemetry data when collectTelemetry is true */
+  telemetry?: QueryTelemetry
+}
+
+/**
+ * Options for query execution
+ */
+export interface QueryOptions {
+  /** Unique execution ID for cancellation support */
+  executionId?: string
+  /** Whether to collect detailed telemetry data */
+  collectTelemetry?: boolean
+  /** Query timeout in milliseconds (0 = no timeout) */
+  queryTimeoutMs?: number
 }
 
 /**
@@ -48,7 +63,11 @@ export interface DatabaseAdapter {
   query(config: ConnectionConfig, sql: string): Promise<AdapterQueryResult>
 
   /** Execute multiple SQL statements and return results for each */
-  queryMultiple(config: ConnectionConfig, sql: string): Promise<AdapterMultiQueryResult>
+  queryMultiple(
+    config: ConnectionConfig,
+    sql: string,
+    options?: QueryOptions
+  ): Promise<AdapterMultiQueryResult>
 
   /** Execute a statement (for INSERT/UPDATE/DELETE in transactions) */
   execute(
@@ -83,12 +102,13 @@ export interface DatabaseAdapter {
 import { PostgresAdapter } from './adapters/postgres-adapter'
 import { MySQLAdapter } from './adapters/mysql-adapter'
 import { MSSQLAdapter } from './adapters/mssql-adapter'
+import { SQLiteAdapter } from './adapters/sqlite-adapter'
 
 // Adapter instances (singletons)
 const adapters: Record<DatabaseType, DatabaseAdapter> = {
   postgresql: new PostgresAdapter(),
   mysql: new MySQLAdapter(),
-  sqlite: new PostgresAdapter(), // Placeholder - SQLite not implemented yet
+  sqlite: new SQLiteAdapter(),
   mssql: new MSSQLAdapter()
 }
 
@@ -97,6 +117,7 @@ const adapters: Record<DatabaseType, DatabaseAdapter> = {
  */
 export function getAdapter(config: ConnectionConfig): DatabaseAdapter {
   const dbType = config.dbType || 'postgresql' // Default to postgresql for backward compatibility
+
   const adapter = adapters[dbType]
   if (!adapter) {
     throw new Error(`Unsupported database type: ${dbType}`)

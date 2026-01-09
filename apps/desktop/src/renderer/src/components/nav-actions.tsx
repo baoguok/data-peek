@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   Play,
@@ -8,6 +6,7 @@ import {
   Trash2,
   FileJson,
   FileSpreadsheet,
+  FileCode2,
   MoreHorizontal,
   Loader2,
   BookmarkPlus,
@@ -26,12 +25,15 @@ import {
   SidebarMenuItem
 } from '@/components/ui/sidebar'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useQueryStore, useConnectionStore } from '@/stores'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatSQL } from '@/lib/sql-formatter'
+import { keys } from '@/lib/utils'
+import { useQueryStore, useConnectionStore } from '@/stores'
+import { exportToSQL } from '@/lib/export'
 
 export function NavActions() {
   const [isOpen, setIsOpen] = React.useState(false)
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard()
 
   const activeConnection = useConnectionStore((s) => s.getActiveConnection())
   const { currentQuery, isExecuting, result } = useQueryStore()
@@ -70,9 +72,7 @@ export function NavActions() {
 
   const handleCopyQuery = async () => {
     if (!currentQuery.trim()) return
-    await navigator.clipboard.writeText(currentQuery)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    await copy(currentQuery)
     setIsOpen(false)
   }
 
@@ -121,6 +121,23 @@ export function NavActions() {
     setIsOpen(false)
   }
 
+  const handleExportSQL = () => {
+    if (!result) return
+    const exportData = {
+      columns: result.columns,
+      rows: result.rows
+    }
+    const sql = exportToSQL(exportData, { tableName: 'query_result' })
+    const blob = new Blob([sql], { type: 'text/sql' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `query-results-${Date.now()}.sql`
+    a.click()
+    URL.revokeObjectURL(url)
+    setIsOpen(false)
+  }
+
   const canRun = activeConnection && currentQuery.trim() && !isExecuting
   const hasResults = !!result
 
@@ -142,12 +159,13 @@ export function NavActions() {
             )}
             <span className="hidden sm:inline">Run</span>
             <kbd className="ml-0.5 hidden rounded bg-primary-foreground/20 px-1 py-0.5 text-[9px] font-medium sm:inline">
-              ⌘↵
+              {keys.mod}
+              {keys.enter}
             </kbd>
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          <p>Execute query (⌘+Enter)</p>
+          <p>Execute query ({keys.mod}+Enter)</p>
         </TooltipContent>
       </Tooltip>
 
@@ -165,7 +183,9 @@ export function NavActions() {
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          <p>Format SQL (⌘+Shift+F)</p>
+          <p>
+            Format SQL ({keys.mod}+{keys.shift}+F)
+          </p>
         </TooltipContent>
       </Tooltip>
 
@@ -249,6 +269,16 @@ export function NavActions() {
                       >
                         <FileJson className="size-4" />
                         <span>Export as JSON</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton
+                        onClick={handleExportSQL}
+                        disabled={!hasResults}
+                        className="gap-2.5"
+                      >
+                        <FileCode2 className="size-4" />
+                        <span>Export as SQL</span>
                       </SidebarMenuButton>
                     </SidebarMenuItem>
                   </SidebarMenu>
