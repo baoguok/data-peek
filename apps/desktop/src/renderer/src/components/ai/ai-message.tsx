@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import { User, Sparkles, Copy, Check, AlertTriangle, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -188,6 +186,7 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
               onExecute={() => handleExecuteInline(queryData.sql)}
               onOpenInTab={() => onOpenInTab(queryData.sql)}
               isExecuting={queryExecuting}
+              requiresConfirmation={queryData.requiresConfirmation}
             />
 
             {/* Query Error */}

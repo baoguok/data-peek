@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   X,
@@ -59,8 +57,10 @@ export type AIResponseType = 'message' | 'query' | 'chart' | 'metric' | 'schema'
 export interface AIQueryData {
   type: 'query'
   sql: string
-  explanation: string
+  explanation?: string
   warning?: string
+  /** If true, query should NOT be auto-executed (UPDATE/DELETE operations) */
+  requiresConfirmation?: boolean
 }
 
 export interface AIChartData {
@@ -265,32 +265,41 @@ export function AIChatPanel({
         const data = response.data
 
         // Extract response data based on type
+        // Note: Backend uses flat schema with nullable fields for AI provider compatibility
         let responseData: AIResponseData = null
-        if (data.type === 'query') {
+        if (data.type === 'query' && data.sql) {
           responseData = {
             type: 'query',
             sql: data.sql,
-            explanation: data.explanation,
-            warning: data.warning
+            explanation: data.explanation ?? undefined,
+            warning: data.warning ?? undefined,
+            requiresConfirmation: data.requiresConfirmation ?? undefined
           }
-        } else if (data.type === 'chart') {
+        } else if (
+          data.type === 'chart' &&
+          data.title &&
+          data.chartType &&
+          data.sql &&
+          data.xKey &&
+          data.yKeys
+        ) {
           responseData = {
             type: 'chart',
             title: data.title,
-            description: data.description,
+            description: data.description ?? undefined,
             chartType: data.chartType,
             sql: data.sql,
             xKey: data.xKey,
             yKeys: data.yKeys
           }
-        } else if (data.type === 'metric') {
+        } else if (data.type === 'metric' && data.label && data.sql && data.format) {
           responseData = {
             type: 'metric',
             label: data.label,
             sql: data.sql,
             format: data.format
           }
-        } else if (data.type === 'schema') {
+        } else if (data.type === 'schema' && data.tables) {
           responseData = {
             type: 'schema',
             tables: data.tables
@@ -447,7 +456,7 @@ export function AIChatPanel({
     <>
       {/* Backdrop with gradient */}
       <div
-        className="fixed inset-0 z-40 bg-gradient-to-r from-transparent via-black/20 to-black/40 backdrop-blur-[2px] transition-opacity duration-300"
+        className="fixed inset-0 z-40 bg-gradient-to-r from-transparent via-black/20 to-black/40 transition-opacity duration-300"
         onClick={onClose}
       />
 
