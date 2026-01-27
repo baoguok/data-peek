@@ -5,7 +5,6 @@
  * Uses AI SDK's generateObject for typed JSON output.
  */
 
-import { safeStorage } from 'electron'
 import { createOpenAI } from '@ai-sdk/openai'
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
@@ -19,8 +18,11 @@ import type {
   AIMessage,
   AIStructuredResponse,
   StoredChatMessage,
-  ChatSession
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig
 } from '@shared/index'
+import { DEFAULT_MODELS } from '@shared/index'
 
 // Re-export types for main process consumers
 export type {
@@ -29,78 +31,78 @@ export type {
   AIMessage,
   AIStructuredResponse,
   StoredChatMessage,
-  ChatSession
-}
-
-/**
- * Generate a machine-specific encryption key using Electron's safeStorage.
- * Falls back to a static key if safeStorage is not available.
- */
-function getEncryptionKey(): string {
-  const baseKey = 'data-peek-ai-v1'
-  if (safeStorage.isEncryptionAvailable()) {
-    return safeStorage.encryptString(baseKey).toString('base64')
-  }
-  return baseKey
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig
 }
 
 // Zod schema for structured output
-const responseSchema = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('query'),
-    message: z.string().describe('A brief explanation of what the query does'),
-    sql: z.string().describe('The complete, valid SQL query'),
-    explanation: z.string().describe('Detailed explanation of the query'),
-    warning: z.string().optional().describe('Warning for mutations or potential issues')
-  }),
-  z.object({
-    type: z.literal('chart'),
-    message: z.string().describe('Brief description of the visualization'),
-    title: z.string().describe('Chart title'),
-    description: z.string().optional().describe('Chart description'),
-    chartType: z.enum(['bar', 'line', 'pie', 'area']).describe('Chart type based on data nature'),
-    sql: z.string().describe('SQL query to fetch chart data'),
-    xKey: z.string().describe('Column name for X-axis'),
-    yKeys: z.array(z.string()).describe('Column name(s) for Y-axis values')
-  }),
-  z.object({
-    type: z.literal('metric'),
-    message: z.string().describe('Brief description of the metric'),
-    label: z.string().describe('Metric label'),
-    sql: z.string().describe('SQL query that returns a single value'),
-    format: z.enum(['number', 'currency', 'percent', 'duration']).describe('Value format')
-  }),
-  z.object({
-    type: z.literal('schema'),
-    message: z.string().describe('Explanation of the schema'),
-    tables: z.array(z.string()).describe('Table names to display')
-  }),
-  z.object({
-    type: z.literal('message'),
-    message: z.string().describe('The response message')
-  })
-])
+// Using flat object instead of discriminatedUnion for Anthropic/OpenAI tool compatibility
+// (discriminatedUnion produces anyOf without root type:object which providers reject)
+// Using .nullish() instead of .nullable() to accept undefined when fields are missing
+const responseSchema = z.object({
+  type: z.enum(['query', 'chart', 'metric', 'schema', 'message']).describe('Response type'),
+  message: z.string().describe('Brief explanation or response message'),
+  // Query fields (null/undefined when type is not query)
+  sql: z.string().nullish().describe('SQL query - for query/chart/metric types'),
+  explanation: z.string().nullish().describe('Detailed explanation - for query type'),
+  warning: z.string().nullish().describe('Warning for mutations - for query type'),
+  requiresConfirmation: z
+    .boolean()
+    .nullish()
+    .describe('True for destructive queries - for query type'),
+  // Chart fields (null/undefined when type is not chart)
+  title: z.string().nullish().describe('Chart title - for chart type'),
+  description: z.string().nullish().describe('Chart description - for chart type'),
+  chartType: z
+    .enum(['bar', 'line', 'pie', 'area'])
+    .nullish()
+    .describe('Chart type - for chart type'),
+  xKey: z.string().nullish().describe('X-axis column - for chart type'),
+  yKeys: z.array(z.string()).nullish().describe('Y-axis columns - for chart type'),
+  // Metric fields (null/undefined when type is not metric)
+  label: z.string().nullish().describe('Metric label - for metric type'),
+  format: z
+    .enum(['number', 'currency', 'percent', 'duration'])
+    .nullish()
+    .describe('Value format - for metric type'),
+  // Schema fields (null/undefined when type is not schema)
+  tables: z.array(z.string()).nullish().describe('Table names - for schema type')
+})
 
-import { DpSecureStorage, DpStorage } from './storage'
+import { DpStorage } from './storage'
+import { createLogger } from './lib/logger'
+
+const log = createLogger('ai-service')
 
 // Chat history store structure: map of connectionId -> sessions
 type ChatHistoryStore = Record<string, ChatSession[]>
 
-let aiStore: DpSecureStorage<{ aiConfig: AIConfig | null }> | null = null
+// Store types
+interface AIStoreData {
+  // Legacy single-provider config (for migration)
+  aiConfig?: AIConfig | null
+  // New multi-provider config
+  multiProviderConfig?: AIMultiProviderConfig | null
+}
+
+let aiStore: DpStorage<AIStoreData> | null = null
 let chatStore: DpStorage<{ chatHistory: ChatHistoryStore }> | null = null
 
 /**
  * Initialize the AI config and chat stores
- * Handles migration from old encryption key to new safeStorage-based key
  */
 export async function initAIStore(): Promise<void> {
-  aiStore = await DpSecureStorage.create<{ aiConfig: AIConfig | null }>({
+  aiStore = await DpStorage.create<AIStoreData>({
     name: 'data-peek-ai-config',
-    encryptionKey: getEncryptionKey(),
     defaults: {
-      aiConfig: null
+      aiConfig: null,
+      multiProviderConfig: null
     }
   })
+
+  // Migrate legacy config to multi-provider format
+  migrateLegacyConfig()
 
   chatStore = await DpStorage.create<{ chatHistory: ChatHistoryStore }>({
     name: 'data-peek-ai-chat-history',
@@ -111,19 +113,170 @@ export async function initAIStore(): Promise<void> {
 }
 
 /**
- * Get the current AI configuration
+ * Migrate legacy single-provider config to multi-provider format
  */
-export function getAIConfig(): AIConfig | null {
-  if (!aiStore) return null
-  return aiStore.get('aiConfig', null)
+function migrateLegacyConfig(): void {
+  if (!aiStore) return
+
+  const legacyConfig = aiStore.get('aiConfig', null)
+  const multiConfig = aiStore.get('multiProviderConfig', null)
+
+  // If there's a legacy config but no multi-provider config, migrate it
+  if (legacyConfig && !multiConfig) {
+    const newConfig: AIMultiProviderConfig = {
+      providers: {
+        [legacyConfig.provider]: {
+          apiKey: legacyConfig.apiKey,
+          baseUrl: legacyConfig.baseUrl
+        }
+      },
+      activeProvider: legacyConfig.provider,
+      activeModels: {
+        [legacyConfig.provider]: legacyConfig.model
+      }
+    }
+    aiStore.set('multiProviderConfig', newConfig)
+    // Clear legacy config after migration
+    aiStore.set('aiConfig', null)
+    log.info('Migrated legacy AI config to multi-provider format')
+  }
 }
 
 /**
- * Save AI configuration
+ * Get the multi-provider AI configuration
+ */
+export function getMultiProviderConfig(): AIMultiProviderConfig | null {
+  if (!aiStore) return null
+  return aiStore.get('multiProviderConfig', null) ?? null
+}
+
+/**
+ * Save multi-provider AI configuration
+ */
+export function setMultiProviderConfig(config: AIMultiProviderConfig | null): void {
+  if (!aiStore) return
+  aiStore.set('multiProviderConfig', config)
+}
+
+/**
+ * Get configuration for a specific provider
+ */
+export function getProviderConfig(provider: AIProvider): AIProviderConfig | null {
+  const config = getMultiProviderConfig()
+  if (!config) return null
+  return config.providers[provider] || null
+}
+
+/**
+ * Set configuration for a specific provider
+ */
+export function setProviderConfig(provider: AIProvider, providerConfig: AIProviderConfig): void {
+  const config = getMultiProviderConfig() || {
+    providers: {},
+    activeProvider: provider,
+    activeModels: {}
+  }
+
+  config.providers[provider] = providerConfig
+
+  // If this is the first provider being configured, make it active
+  if (!config.providers[config.activeProvider]?.apiKey && provider !== 'ollama') {
+    config.activeProvider = provider
+  }
+
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Remove configuration for a specific provider
+ */
+export function removeProviderConfig(provider: AIProvider): void {
+  const config = getMultiProviderConfig()
+  if (!config) return
+
+  delete config.providers[provider]
+  delete config.activeModels[provider]
+
+  // If we removed the active provider, switch to another configured one
+  if (config.activeProvider === provider) {
+    const configuredProviders = Object.keys(config.providers) as AIProvider[]
+    config.activeProvider = configuredProviders[0] || 'openai'
+  }
+
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Set the active provider
+ */
+export function setActiveProvider(provider: AIProvider): void {
+  const config = getMultiProviderConfig()
+  if (!config) return
+
+  config.activeProvider = provider
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Set the active model for a provider
+ */
+export function setActiveModel(provider: AIProvider, model: string): void {
+  const config = getMultiProviderConfig()
+  if (!config) return
+
+  config.activeModels[provider] = model
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Get the current AI configuration (legacy format for backward compatibility)
+ * Converts multi-provider config to single AIConfig
+ */
+export function getAIConfig(): AIConfig | null {
+  const multiConfig = getMultiProviderConfig()
+  if (!multiConfig) return null
+
+  const provider = multiConfig.activeProvider
+  const providerConfig = multiConfig.providers[provider]
+
+  // For non-Ollama providers, require an API key
+  if (provider !== 'ollama' && !providerConfig?.apiKey) {
+    return null
+  }
+
+  return {
+    provider,
+    apiKey: providerConfig?.apiKey,
+    model: multiConfig.activeModels[provider] || DEFAULT_MODELS[provider],
+    baseUrl: providerConfig?.baseUrl
+  }
+}
+
+/**
+ * Save AI configuration (legacy format for backward compatibility)
+ * Converts single AIConfig to multi-provider format
  */
 export function setAIConfig(config: AIConfig | null): void {
-  if (!aiStore) return
-  aiStore.set('aiConfig', config)
+  if (!config) {
+    // Don't clear everything when null is passed - use clearAIConfig() for that
+    log.debug('setAIConfig called with null, ignoring. Use clearAIConfig() to clear.')
+    return
+  }
+
+  const multiConfig = getMultiProviderConfig() || {
+    providers: {},
+    activeProvider: config.provider,
+    activeModels: {}
+  }
+
+  multiConfig.providers[config.provider] = {
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl
+  }
+  multiConfig.activeProvider = config.provider
+  multiConfig.activeModels[config.provider] = config.model
+
+  setMultiProviderConfig(multiConfig)
 }
 
 /**
@@ -131,7 +284,7 @@ export function setAIConfig(config: AIConfig | null): void {
  */
 export function clearAIConfig(): void {
   if (!aiStore) return
-  aiStore.set('aiConfig', null)
+  aiStore.set('multiProviderConfig', null)
 }
 
 /**
@@ -217,33 +370,50 @@ function buildSystemPrompt(schemas: SchemaInfo[], dbType: string): string {
 
 ${schemaContext}
 
-## Response Guidelines
+## Response Format
 
-Based on the user's request, respond with ONE of these types:
+Set the "type" field and fill ONLY the relevant fields. **IMPORTANT: All fields must be present in the response.** Set unused fields to null (not undefined). Include every field listed below.
 
-1. **query** - When user asks for data or wants to run a query
-   - Generate valid ${dbType} SQL
-   - Include LIMIT 100 for SELECT queries unless specified
-   - Add warning for mutations (INSERT/UPDATE/DELETE)
+### type: "query"
+Use when user asks for data or wants to run a query.
+- Fill: message, sql, explanation
+- Optional: warning, requiresConfirmation (set true for UPDATE/DELETE/DROP/TRUNCATE)
+- Null: title, description, chartType, xKey, yKeys, label, format, tables
+- Limit results: ${dbType === 'mssql' ? 'Use SELECT TOP 100 for MSSQL' : 'Include LIMIT 100 at the end'} unless user specifies otherwise
 
-2. **chart** - When user asks to visualize, chart, graph, or plot data
-   - Choose appropriate chartType: bar (comparisons), line (time trends), pie (proportions ≤8 items), area (cumulative)
-   - SQL must return columns matching xKey and yKeys
+### type: "chart"
+Use when user asks to visualize, chart, graph, or plot data.
+- Fill: message, sql, title, chartType, xKey, yKeys
+- Optional: description
+- Null: explanation, warning, requiresConfirmation, label, format, tables
+- chartType: bar (comparisons), line (time trends), pie (proportions ≤8 items), area (cumulative)
 
-3. **metric** - When user asks for a single KPI/number (total, count, average)
-   - SQL must return exactly one value
-   - Choose format: number, currency, percent, or duration
+### type: "metric"
+Use when user asks for a single KPI/number (total, count, average).
+- Fill: message, sql, label, format
+- Null: explanation, warning, requiresConfirmation, title, description, chartType, xKey, yKeys, tables
+- format: number, currency, percent, or duration
 
-4. **schema** - When user asks about table structure or columns
-   - List the relevant table names
+### type: "schema"
+Use when user asks about table structure or columns.
+- Fill: message, tables
+- Null: sql, explanation, warning, requiresConfirmation, title, description, chartType, xKey, yKeys, label, format
 
-5. **message** - For general questions, clarifications, or when no SQL is needed
+### type: "message"
+Use for general questions, clarifications, or when no SQL is needed.
+- Fill: message
+- Null: ALL other fields
 
 ## SQL Guidelines
 - Use proper ${dbType} syntax
 - Use table aliases for readability
 - Quote identifiers if they contain special characters
-- Be precise with JOINs based on foreign key relationships`
+- Be precise with JOINs based on foreign key relationships${
+    dbType === 'sqlite'
+      ? `
+- SQLite specifics: Use double-quotes for identifiers, booleans are 0/1 integers, no RIGHT JOIN (reverse tables with LEFT JOIN), use COALESCE instead of IFNULL for portability`
+      : ''
+  }`
 }
 
 /**
@@ -259,7 +429,7 @@ export async function validateAPIKey(
     await generateText({
       model,
       prompt: 'Say "ok"',
-      maxTokens: 5
+      maxOutputTokens: 5
     })
 
     return { valid: true }
@@ -320,13 +490,31 @@ export async function generateChatResponse(
       temperature: 0.1 // Lower temperature for more consistent SQL generation
     })
 
+    // Normalize undefined to null for consistency
+    const normalizedData = {
+      ...result.object,
+      sql: result.object.sql ?? null,
+      explanation: result.object.explanation ?? null,
+      warning: result.object.warning ?? null,
+      requiresConfirmation: result.object.requiresConfirmation ?? null,
+      title: result.object.title ?? null,
+      description: result.object.description ?? null,
+      chartType: result.object.chartType ?? null,
+      xKey: result.object.xKey ?? null,
+      yKeys: result.object.yKeys ?? null,
+      label: result.object.label ?? null,
+      format: result.object.format ?? null,
+      tables: result.object.tables ?? null
+    }
+
     return {
       success: true,
-      data: result.object as AIStructuredResponse
+      data: normalizedData as AIStructuredResponse
     }
-  } catch (error) {
+  } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Unknown error'
-    console.error('[ai-service] generateChatResponse error:', error)
+    log.error('generateChatResponse error:', message)
+
     return { success: false, error: message }
   }
 }

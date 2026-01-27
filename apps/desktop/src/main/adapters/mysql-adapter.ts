@@ -1,4 +1,5 @@
 import mysql from 'mysql2/promise'
+import { readFileSync } from 'fs'
 import type {
   ConnectionConfig,
   SchemaInfo,
@@ -12,14 +13,24 @@ import type {
   IndexDefinition,
   SequenceInfo,
   CustomTypeInfo,
-  StatementResult
+  StatementResult,
+  RoutineInfo,
+  RoutineParameterInfo
 } from '@shared/index'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  ExplainResult,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
+import { closeTunnel, createTunnel, TunnelSession } from '../ssh-tunnel-service'
+import { splitStatements } from '../lib/sql-parser'
+import { telemetryCollector, TELEMETRY_PHASES } from '../telemetry-collector'
+
+/** Split SQL into statements for MySQL */
+const splitMySqlStatements = (sql: string) => splitStatements(sql, 'mysql')
 
 /**
  * MySQL type codes to type name mapping
@@ -65,16 +76,44 @@ function resolveMySQLType(typeCode: number): string {
 
 /**
  * Create MySQL connection config from our ConnectionConfig
+ * Properly handles SSL options for cloud databases like AWS RDS
  */
 function toMySQLConfig(config: ConnectionConfig): mysql.ConnectionOptions {
-  return {
+  const mysqlConfig: mysql.ConnectionOptions = {
     host: config.host,
     port: config.port,
     user: config.user,
     password: config.password,
-    database: config.database,
-    ssl: config.ssl ? {} : undefined
+    database: config.database
   }
+
+  if (config.ssl) {
+    const sslOptions = config.sslOptions || {}
+
+    if (sslOptions.rejectUnauthorized === false) {
+      mysqlConfig.ssl = {
+        rejectUnauthorized: false
+      }
+    } else if (sslOptions.ca) {
+      try {
+        mysqlConfig.ssl = {
+          rejectUnauthorized: true,
+          ca: readFileSync(sslOptions.ca, 'utf-8')
+        }
+      } catch (err) {
+        console.error(`Failed to read CA certificate from ${sslOptions.ca}:`, err)
+        throw new Error(
+          `Failed to read CA certificate file: ${sslOptions.ca}. Please verify the file exists and is readable.`
+        )
+      }
+    } else {
+      mysqlConfig.ssl = {
+        rejectUnauthorized: true
+      }
+    }
+  }
+
+  return mysqlConfig
 }
 
 /**
@@ -87,138 +126,6 @@ function normalizeRow<T extends Record<string, unknown>>(row: Record<string, unk
     normalized[key.toLowerCase()] = value
   }
   return normalized as T
-}
-
-/**
- * Split SQL into individual statements, respecting string literals and comments
- */
-function splitStatements(sql: string): string[] {
-  const statements: string[] = []
-  let current = ''
-  let i = 0
-
-  while (i < sql.length) {
-    const char = sql[i]
-    const nextChar = sql[i + 1]
-
-    // Handle single-quoted strings
-    if (char === "'") {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") {
-          current += "''"
-          i += 2
-        } else if (sql[i] === '\\' && sql[i + 1] === "'") {
-          // MySQL escape sequence
-          current += "\\'"
-          i += 2
-        } else if (sql[i] === "'") {
-          current += "'"
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle double-quoted strings (when ANSI_QUOTES mode)
-    if (char === '"') {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === '"' && sql[i + 1] === '"') {
-          current += '""'
-          i += 2
-        } else if (sql[i] === '"') {
-          current += '"'
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle backtick-quoted identifiers (MySQL-specific)
-    if (char === '`') {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === '`' && sql[i + 1] === '`') {
-          current += '``'
-          i += 2
-        } else if (sql[i] === '`') {
-          current += '`'
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle line comments (-- or #)
-    if ((char === '-' && nextChar === '-') || char === '#') {
-      if (char === '#') {
-        current += '#'
-        i++
-      } else {
-        current += '--'
-        i += 2
-      }
-      while (i < sql.length && sql[i] !== '\n') {
-        current += sql[i]
-        i++
-      }
-      continue
-    }
-
-    // Handle block comments (/* */)
-    if (char === '/' && nextChar === '*') {
-      current += '/*'
-      i += 2
-      while (i < sql.length) {
-        if (sql[i] === '*' && sql[i + 1] === '/') {
-          current += '*/'
-          i += 2
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Statement separator
-    if (char === ';') {
-      const stmt = current.trim()
-      if (stmt) {
-        statements.push(stmt)
-      }
-      current = ''
-      i++
-      continue
-    }
-
-    current += char
-    i++
-  }
-
-  const lastStmt = current.trim()
-  if (lastStmt) {
-    statements.push(lastStmt)
-  }
-
-  return statements
 }
 
 /**
@@ -243,11 +150,20 @@ export class MySQLAdapter implements DatabaseAdapter {
   readonly dbType = 'mysql' as const
 
   async connect(config: ConnectionConfig): Promise<void> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
     await connection.end()
+    closeTunnel(tunnelSession)
   }
 
   async query(config: ConnectionConfig, sql: string): Promise<AdapterQueryResult> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
     try {
@@ -268,24 +184,81 @@ export class MySQLAdapter implements DatabaseAdapter {
       }
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
-  async queryMultiple(config: ConnectionConfig, sql: string): Promise<AdapterMultiQueryResult> {
+  async queryMultiple(
+    config: ConnectionConfig,
+    sql: string,
+    options?: QueryOptions
+  ): Promise<AdapterMultiQueryResult> {
+    const collectTelemetry = options?.collectTelemetry ?? false
+    const executionId = options?.executionId ?? crypto.randomUUID()
+
+    // Start telemetry collection if requested
+    if (collectTelemetry) {
+      telemetryCollector.startQuery(executionId, false)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+    }
+
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
+
+    if (collectTelemetry) {
+      telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.DB_HANDSHAKE)
+    }
+
     const connection = await mysql.createConnection(toMySQLConfig(config))
+
+    if (collectTelemetry) {
+      telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.DB_HANDSHAKE)
+    }
+
+    // Set query timeout if specified (0 = no timeout)
+    // Note: max_execution_time only affects SELECT statements in MySQL 5.7.8+
+    const queryTimeoutMs = options?.queryTimeoutMs
+    if (
+      typeof queryTimeoutMs === 'number' &&
+      Number.isFinite(queryTimeoutMs) &&
+      queryTimeoutMs > 0
+    ) {
+      const safeTimeout = Math.floor(queryTimeoutMs)
+      await connection.query(`SET SESSION max_execution_time = ${safeTimeout}`)
+    }
+
+    // Register for cancellation support
+    if (options?.executionId) {
+      registerQuery(options.executionId, { type: 'mysql', connection })
+    }
 
     const totalStart = Date.now()
     const results: StatementResult[] = []
+    let totalRowCount = 0
 
     try {
-      const statements = splitStatements(sql)
+      const statements = splitMySqlStatements(sql)
 
       for (let i = 0; i < statements.length; i++) {
         const statement = statements[i]
         const stmtStart = Date.now()
 
         try {
+          // Start execution phase timing
+          if (collectTelemetry) {
+            telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+          }
+
           const [rows, fields] = await connection.query(statement)
+
+          if (collectTelemetry) {
+            telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+            telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.PARSE)
+          }
+
           const stmtDuration = Date.now() - stmtStart
 
           const queryFields: QueryField[] =
@@ -306,6 +279,7 @@ export class MySQLAdapter implements DatabaseAdapter {
             const header = rows as mysql.ResultSetHeader
             rowCount = header.affectedRows ?? 0
           }
+          totalRowCount += rowCount
 
           results.push({
             statement,
@@ -316,6 +290,10 @@ export class MySQLAdapter implements DatabaseAdapter {
             durationMs: stmtDuration,
             isDataReturning
           })
+
+          if (collectTelemetry) {
+            telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.PARSE)
+          }
         } catch (error) {
           const stmtDuration = Date.now() - stmtStart
           const errorMessage = error instanceof Error ? error.message : String(error)
@@ -330,18 +308,35 @@ export class MySQLAdapter implements DatabaseAdapter {
             isDataReturning: false
           })
 
+          // Cancel telemetry on error
+          if (collectTelemetry) {
+            telemetryCollector.cancel(executionId)
+          }
+
           throw new Error(
             `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
           )
         }
       }
 
-      return {
+      const result: AdapterMultiQueryResult = {
         results,
         totalDurationMs: Date.now() - totalStart
       }
+
+      // Finalize telemetry
+      if (collectTelemetry) {
+        result.telemetry = telemetryCollector.finalize(executionId, totalRowCount)
+      }
+
+      return result
     } finally {
+      // Unregister from tracker
+      if (options?.executionId) {
+        unregisterQuery(options.executionId)
+      }
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -350,6 +345,10 @@ export class MySQLAdapter implements DatabaseAdapter {
     sql: string,
     params: unknown[]
   ): Promise<{ rowCount: number | null }> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
     try {
@@ -358,6 +357,7 @@ export class MySQLAdapter implements DatabaseAdapter {
       return { rowCount: affectedRows }
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -365,6 +365,10 @@ export class MySQLAdapter implements DatabaseAdapter {
     config: ConnectionConfig,
     statements: Array<{ sql: string; params: unknown[] }>
   ): Promise<{ rowsAffected: number; results: Array<{ rowCount: number | null }> }> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
     try {
@@ -387,10 +391,15 @@ export class MySQLAdapter implements DatabaseAdapter {
       throw error
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
   async getSchemas(config: ConnectionConfig): Promise<SchemaInfo[]> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
     try {
@@ -512,13 +521,100 @@ export class MySQLAdapter implements DatabaseAdapter {
         })
       }
 
+      // Get all routines (stored procedures and functions)
+      const [routinesRows] = await connection.query(`
+        SELECT
+          routine_schema,
+          routine_name,
+          routine_type,
+          data_type as return_type,
+          routine_comment as comment,
+          specific_name
+        FROM information_schema.routines
+        WHERE routine_schema NOT IN ('mysql', 'performance_schema', 'information_schema', 'sys')
+        ORDER BY routine_schema, routine_name
+      `)
+
+      const routinesRaw = routinesRows as Array<Record<string, unknown>>
+      const routines = routinesRaw.map((row) =>
+        normalizeRow<{
+          routine_schema: string
+          routine_name: string
+          routine_type: string
+          return_type: string | null
+          comment: string | null
+          specific_name: string
+        }>(row)
+      )
+
+      // Get routine parameters
+      const [paramsRows] = await connection.query(`
+        SELECT
+          specific_schema,
+          specific_name,
+          parameter_name,
+          data_type,
+          parameter_mode,
+          ordinal_position
+        FROM information_schema.parameters
+        WHERE specific_schema NOT IN ('mysql', 'performance_schema', 'information_schema', 'sys')
+          AND parameter_name IS NOT NULL
+        ORDER BY specific_schema, specific_name, ordinal_position
+      `)
+
+      const paramsRaw = paramsRows as Array<Record<string, unknown>>
+      const params = paramsRaw.map((row) =>
+        normalizeRow<{
+          specific_schema: string
+          specific_name: string
+          parameter_name: string | null
+          data_type: string
+          parameter_mode: string | null
+          ordinal_position: number
+        }>(row)
+      )
+
+      // Build parameters lookup map
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of params) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Build routines lookup map
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routines) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const routineParams = paramsMap.get(paramsKey) || []
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: routineParams,
+          comment: row.comment || undefined
+        })
+      }
+
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
 
       for (const row of schemas) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || []
         })
       }
 
@@ -573,10 +669,15 @@ export class MySQLAdapter implements DatabaseAdapter {
       return Array.from(schemaMap.values())
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
   async explain(config: ConnectionConfig, sql: string, analyze: boolean): Promise<ExplainResult> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
     try {
@@ -608,6 +709,7 @@ export class MySQLAdapter implements DatabaseAdapter {
       }
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -616,6 +718,10 @@ export class MySQLAdapter implements DatabaseAdapter {
     schema: string,
     table: string
   ): Promise<TableDefinition> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
     try {
@@ -860,6 +966,7 @@ export class MySQLAdapter implements DatabaseAdapter {
       }
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 
@@ -871,6 +978,10 @@ export class MySQLAdapter implements DatabaseAdapter {
   }
 
   async getTypes(config: ConnectionConfig): Promise<CustomTypeInfo[]> {
+    let tunnelSession: TunnelSession | null = null
+    if (config.ssh) {
+      tunnelSession = await createTunnel(config)
+    }
     // Get MySQL ENUM types from columns
     const connection = await mysql.createConnection(toMySQLConfig(config))
 
@@ -911,6 +1022,7 @@ export class MySQLAdapter implements DatabaseAdapter {
       return types
     } finally {
       await connection.end()
+      closeTunnel(tunnelSession)
     }
   }
 }

@@ -1,7 +1,38 @@
 import { app, Menu, shell, BrowserWindow } from 'electron'
 import { checkForUpdates } from './updater'
+import { windowManager } from './window-manager'
 
 const isMac = process.platform === 'darwin'
+
+/**
+ * Build the Window submenu with a list of all open windows
+ */
+function buildWindowSubmenu(): Electron.MenuItemConstructorOptions[] {
+  const windows = windowManager.getAllWindows()
+  const focusedWindow = BrowserWindow.getFocusedWindow()
+
+  const windowList: Electron.MenuItemConstructorOptions[] = windows.map((win, index) => {
+    const title = win.getTitle() || `Window ${index + 1}`
+    return {
+      label: title,
+      type: 'checkbox' as const,
+      checked: focusedWindow?.id === win.id,
+      click: (): void => {
+        if (win.isMinimized()) {
+          win.restore()
+        }
+        win.focus()
+      }
+    }
+  })
+
+  return [
+    { role: 'minimize' as const },
+    { role: 'zoom' as const },
+    ...(isMac ? [{ type: 'separator' as const }, { role: 'front' as const }] : []),
+    ...(windowList.length > 0 ? [{ type: 'separator' as const }, ...windowList] : [])
+  ]
+}
 
 export function createMenu(): void {
   const template: Electron.MenuItemConstructorOptions[] = [
@@ -16,6 +47,17 @@ export function createMenu(): void {
                 label: 'Check for Updates...',
                 click: (): void => {
                   checkForUpdates()
+                }
+              },
+              { type: 'separator' as const },
+              {
+                label: 'Settings...',
+                accelerator: 'Cmd+,',
+                click: (): void => {
+                  const focusedWindow = BrowserWindow.getFocusedWindow()
+                  if (focusedWindow) {
+                    focusedWindow.webContents.send('menu:open-settings')
+                  }
                 }
               },
               { type: 'separator' as const },
@@ -36,6 +78,13 @@ export function createMenu(): void {
       label: 'File',
       submenu: [
         {
+          label: 'New Window',
+          accelerator: 'CmdOrCtrl+Shift+N',
+          click: (): void => {
+            windowManager.createWindow()
+          }
+        },
+        {
           label: 'New Tab',
           accelerator: 'CmdOrCtrl+T',
           click: (): void => {
@@ -45,6 +94,7 @@ export function createMenu(): void {
             }
           }
         },
+        { type: 'separator' },
         {
           label: 'Close Tab',
           accelerator: 'CmdOrCtrl+W',
@@ -56,6 +106,22 @@ export function createMenu(): void {
           }
         },
         { type: 'separator' },
+        // Settings for Windows/Linux (macOS has it in app menu)
+        ...(!isMac
+          ? [
+              {
+                label: 'Settings',
+                accelerator: 'Ctrl+,',
+                click: (): void => {
+                  const focusedWindow = BrowserWindow.getFocusedWindow()
+                  if (focusedWindow) {
+                    focusedWindow.webContents.send('menu:open-settings')
+                  }
+                }
+              },
+              { type: 'separator' as const }
+            ]
+          : []),
         isMac ? { role: 'close' } : { role: 'quit' }
       ]
     },
@@ -164,21 +230,48 @@ export function createMenu(): void {
       ]
     },
 
+    // Data menu (table editing operations)
+    {
+      label: 'Data',
+      submenu: [
+        {
+          label: 'Save Changes',
+          accelerator: 'CmdOrCtrl+S',
+          click: (): void => {
+            const focusedWindow = BrowserWindow.getFocusedWindow()
+            if (focusedWindow) {
+              focusedWindow.webContents.send('menu:save-changes')
+            }
+          }
+        },
+        {
+          label: 'Discard Changes',
+          accelerator: 'CmdOrCtrl+Shift+Z',
+          click: (): void => {
+            const focusedWindow = BrowserWindow.getFocusedWindow()
+            if (focusedWindow) {
+              focusedWindow.webContents.send('menu:discard-changes')
+            }
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'Add Row',
+          accelerator: 'CmdOrCtrl+Shift+A',
+          click: (): void => {
+            const focusedWindow = BrowserWindow.getFocusedWindow()
+            if (focusedWindow) {
+              focusedWindow.webContents.send('menu:add-row')
+            }
+          }
+        }
+      ]
+    },
+
     // Window menu
     {
       label: 'Window',
-      submenu: [
-        { role: 'minimize' },
-        { role: 'zoom' },
-        ...(isMac
-          ? [
-              { type: 'separator' as const },
-              { role: 'front' as const },
-              { type: 'separator' as const },
-              { role: 'window' as const }
-            ]
-          : [{ role: 'close' as const }])
-      ]
+      submenu: buildWindowSubmenu()
     },
 
     // Help menu
@@ -215,4 +308,11 @@ export function createMenu(): void {
 
   const menu = Menu.buildFromTemplate(template)
   Menu.setApplicationMenu(menu)
+}
+
+/**
+ * Update the menu (call when windows change)
+ */
+export function updateMenu(): void {
+  createMenu()
 }

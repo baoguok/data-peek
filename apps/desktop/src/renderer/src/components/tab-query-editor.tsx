@@ -1,11 +1,10 @@
-'use client'
-
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Play,
   Download,
   FileJson,
   FileSpreadsheet,
+  FileCode2,
   Loader2,
   AlertCircle,
   Database,
@@ -17,16 +16,30 @@ import {
   DatabaseZap,
   BarChart3,
   Bookmark,
-  Maximize2
+  Maximize2,
+  Square,
+  Timer,
+  ActivitySquare
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { useExecutionPlanResize } from '@/hooks/use-execution-plan-resize'
+import { usePanelCollapse } from '@/hooks/use-panel-collapse'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
-import { useTabStore, useConnectionStore, useQueryStore, useSettingsStore } from '@/stores'
+import {
+  useTabStore,
+  useConnectionStore,
+  useQueryStore,
+  useSettingsStore,
+  useTabTelemetry,
+  useTabPerfIndicator,
+  useSnippetStore,
+  notify
+} from '@/stores'
 import type { Tab, MultiQueryResult } from '@/stores/tab-store'
 import type { StatementResult } from '@data-peek/shared'
 import {
@@ -42,8 +55,9 @@ import {
 import type { EditContext } from '@data-peek/shared'
 import { SQLEditor } from '@/components/sql-editor'
 import { formatSQL } from '@/lib/sql-formatter'
-import { downloadCSV, downloadJSON, generateExportFilename } from '@/lib/export'
-import { buildSelectQuery } from '@/lib/sql-helpers'
+import { keys } from '@/lib/utils'
+import { downloadCSV, downloadJSON, downloadSQL, generateExportFilename } from '@/lib/export'
+import { buildQualifiedTableRef, buildSelectQuery, buildCountQuery } from '@/lib/sql-helpers'
 import type { QueryResult as IpcQueryResult, ForeignKeyInfo, ColumnInfo } from '@data-peek/shared'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { FKPanelStack, type FKPanelItem } from '@/components/fk-panel-stack'
@@ -51,6 +65,10 @@ import { ERDVisualization } from '@/components/erd-visualization'
 import { ExecutionPlanViewer } from '@/components/execution-plan-viewer'
 import { TableDesigner } from '@/components/table-designer'
 import { SaveQueryDialog } from '@/components/save-query-dialog'
+import { TelemetryPanel } from '@/components/telemetry-panel'
+import { BenchmarkButton } from '@/components/benchmark-button'
+import { PerfIndicatorPanel } from '@/components/perf-indicator-panel'
+import { Badge } from '@/components/ui/badge'
 
 interface TabQueryEditorProps {
   tabId: string
@@ -68,12 +86,55 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   const getActiveResultPaginatedRows = useTabStore((s) => s.getActiveResultPaginatedRows)
   const getAllStatementResults = useTabStore((s) => s.getAllStatementResults)
   const getActiveStatementResult = useTabStore((s) => s.getActiveStatementResult)
+  const setTablePreviewTotalCount = useTabStore((s) => s.setTablePreviewTotalCount)
+  const updateTablePreviewPagination = useTabStore((s) => s.updateTablePreviewPagination)
 
   const connections = useConnectionStore((s) => s.connections)
   const schemas = useConnectionStore((s) => s.schemas)
   const getEnumValues = useConnectionStore((s) => s.getEnumValues)
   const addToHistory = useQueryStore((s) => s.addToHistory)
   const hideQueryEditorByDefault = useSettingsStore((s) => s.hideQueryEditorByDefault)
+  const queryTimeoutMs = useSettingsStore((s) => s.queryTimeoutMs)
+  const getAllSnippets = useSnippetStore((s) => s.getAllSnippets)
+  const initializeSnippets = useSnippetStore((s) => s.initializeSnippets)
+  const allSnippets = getAllSnippets()
+
+  // Initialize snippets on mount
+  useEffect(() => {
+    initializeSnippets()
+  }, [initializeSnippets])
+
+  // Telemetry state
+  const {
+    telemetry,
+    benchmark,
+    isRunningBenchmark,
+    showTelemetryPanel,
+    showConnectionOverhead,
+    selectedPercentile,
+    viewMode,
+    setTelemetry,
+    setBenchmark,
+    setShowTelemetryPanel,
+    setShowConnectionOverhead,
+    setSelectedPercentile,
+    setViewMode,
+    setRunningBenchmark
+  } = useTabTelemetry(tabId)
+
+  // Performance indicator state
+  const {
+    analysis: perfAnalysis,
+    isAnalyzing: isPerfAnalyzing,
+    showPerfPanel,
+    showCritical,
+    showWarning,
+    showInfo,
+    setAnalysis: setPerfAnalysis,
+    setShowPerfPanel,
+    setAnalyzing: setPerfAnalyzing,
+    toggleSeverityFilter
+  } = useTabPerfIndicator(tabId)
 
   // Get the connection for this tab
   const tabConnection = tab?.connectionId
@@ -83,12 +144,11 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   // Track if we've already attempted auto-run for this tab
   const hasAutoRun = useRef(false)
 
-  // Collapse state for query editor and results panel
-  // For table-preview tabs, use the hideQueryEditorByDefault setting
-  const [isEditorCollapsed, setIsEditorCollapsed] = useState(
-    tab?.type === 'table-preview' ? hideQueryEditorByDefault : false
-  )
-  const [isResultsCollapsed, setIsResultsCollapsed] = useState(false)
+  // Panel collapse state (extracted to hook)
+  const { isEditorCollapsed, setIsEditorCollapsed, isResultsCollapsed, setIsResultsCollapsed } =
+    usePanelCollapse({
+      initialEditorCollapsed: tab?.type === 'table-preview' ? hideQueryEditorByDefault : false
+    })
 
   // Track client-side filters and sorting for "Apply to Query"
   const [tableFilters, setTableFilters] = useState<DataTableFilter[]>([])
@@ -97,18 +157,13 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   // FK Panel stack state
   const [fkPanels, setFkPanels] = useState<FKPanelItem[]>([])
 
-  // Execution plan state
+  // Execution plan state (resize logic extracted to hook)
   const [executionPlan, setExecutionPlan] = useState<{
     plan: unknown[]
     durationMs: number
   } | null>(null)
   const [isExplaining, setIsExplaining] = useState(false)
-  const [executionPlanWidth, setExecutionPlanWidth] = useState(() => {
-    // Load from localStorage or default to 500
-    const saved = localStorage.getItem('execution-plan-width')
-    return saved ? parseInt(saved, 10) : 500
-  })
-  const isResizing = useRef(false)
+  const { executionPlanWidth, startResizing } = useExecutionPlanResize()
 
   // Save query dialog state
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
@@ -116,53 +171,55 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   // Get the createForeignKeyTab action
   const createForeignKeyTab = useTabStore((s) => s.createForeignKeyTab)
 
-  // Handle execution plan panel resize
-  const handleExecutionPlanResize = useCallback((e: MouseEvent) => {
-    if (!isResizing.current) return
-    const newWidth = Math.max(300, Math.min(800, window.innerWidth - e.clientX))
-    setExecutionPlanWidth(newWidth)
-  }, [])
-
-  const stopResizing = useCallback(() => {
-    isResizing.current = false
-    document.body.style.cursor = ''
-    document.body.style.userSelect = ''
-    // Save to localStorage
-    localStorage.setItem('execution-plan-width', String(executionPlanWidth))
-  }, [executionPlanWidth])
-
-  useEffect(() => {
-    document.addEventListener('mousemove', handleExecutionPlanResize)
-    document.addEventListener('mouseup', stopResizing)
-    return () => {
-      document.removeEventListener('mousemove', handleExecutionPlanResize)
-      document.removeEventListener('mouseup', stopResizing)
-    }
-  }, [handleExecutionPlanResize, stopResizing])
-
   const handleRunQuery = useCallback(async () => {
+    // Read fresh tab state from store to avoid stale closure issues
+    // (important for server-side pagination where query is updated before this runs)
+    const currentTab = useTabStore.getState().getTab(tabId)
+
     if (
-      !tab ||
-      tab.type === 'erd' ||
-      tab.type === 'table-designer' ||
+      !currentTab ||
+      currentTab.type === 'erd' ||
+      currentTab.type === 'table-designer' ||
       !tabConnection ||
-      tab.isExecuting ||
-      !tab.query.trim()
+      currentTab.isExecuting ||
+      !currentTab.query.trim()
     ) {
       return
     }
 
-    updateTabExecuting(tabId, true)
+    // Generate unique execution ID for cancellation support
+    const executionId = crypto.randomUUID()
+    updateTabExecuting(tabId, true, executionId)
+
+    // Clear previous benchmark when running a new query
+    setBenchmark(null)
 
     try {
-      const response = await window.api.db.query(tabConnection, tab.query)
+      // Use telemetry-enabled query API with timeout from settings
+      const response = await window.api.db.queryWithTelemetry(
+        tabConnection,
+        currentTab.query,
+        executionId,
+        queryTimeoutMs
+      )
 
       if (response.success && response.data) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const data = response.data as any
+        const data = response.data as {
+          results: StatementResult[]
+          totalDurationMs: number
+          statementCount: number
+          telemetry?: import('@data-peek/shared').QueryTelemetry
+        } & IpcQueryResult
+
+        // Store telemetry data if available
+        if (data.telemetry) {
+          setTelemetry(data.telemetry)
+        } else {
+          setTelemetry(null)
+        }
 
         // Check if we have multi-statement results
-        if (data.results && Array.isArray(data.results)) {
+        if ('results' in data && Array.isArray(data.results)) {
           // Multi-statement result
           const multiResult: MultiQueryResult = {
             statements: data.results as StatementResult[],
@@ -173,10 +230,34 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
           updateTabMultiResult(tabId, multiResult, null)
           markTabSaved(tabId)
 
+          // For table preview tabs, fetch total count for server-side pagination
+          if (currentTab.type === 'table-preview') {
+            try {
+              const countTableRef = buildQualifiedTableRef(
+                currentTab.schemaName,
+                currentTab.tableName,
+                tabConnection.dbType
+              )
+              const countQuery = buildCountQuery(countTableRef)
+              const countResponse = await window.api.db.query(tabConnection, countQuery)
+              if (countResponse.success && countResponse.data) {
+                const countData = countResponse.data as IpcQueryResult
+                if (countData.rows?.[0]) {
+                  const totalCount = Number((countData.rows[0] as Record<string, unknown>).total)
+                  if (!isNaN(totalCount)) {
+                    setTablePreviewTotalCount(tabId, totalCount)
+                  }
+                }
+              }
+            } catch {
+              // Silently fail count query - pagination will fall back to client-side
+            }
+          }
+
           // Add to global history with total row count
           const totalRows = multiResult.statements.reduce((sum, s) => sum + s.rowCount, 0)
           addToHistory({
-            query: tab.query,
+            query: currentTab.query,
             durationMs: multiResult.totalDurationMs,
             rowCount: totalRows,
             status: 'success',
@@ -184,22 +265,23 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
           })
         } else {
           // Legacy single result (fallback)
+          const singleResult = data as IpcQueryResult
           const result = {
-            columns: data.fields.map((f: { name: string; dataType: string }) => ({
+            columns: singleResult.fields.map((f: { name: string; dataType: string }) => ({
               name: f.name,
               dataType: f.dataType
             })),
-            rows: data.rows,
-            rowCount: data.rowCount ?? data.rows.length,
-            durationMs: data.durationMs
+            rows: singleResult.rows,
+            rowCount: singleResult.rowCount ?? singleResult.rows.length,
+            durationMs: singleResult.durationMs
           }
 
           updateTabResult(tabId, result, null)
           markTabSaved(tabId)
 
           addToHistory({
-            query: tab.query,
-            durationMs: data.durationMs,
+            query: currentTab.query,
+            durationMs: singleResult.durationMs,
             rowCount: result.rowCount,
             status: 'success',
             connectionId: tabConnection.id
@@ -208,9 +290,10 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
       } else {
         const errorMessage = response.error ?? 'Query execution failed'
         updateTabMultiResult(tabId, null, errorMessage)
+        setTelemetry(null)
 
         addToHistory({
-          query: tab.query,
+          query: currentTab.query,
           durationMs: 0,
           rowCount: 0,
           status: 'error',
@@ -221,25 +304,120 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       updateTabMultiResult(tabId, null, errorMessage)
+      setTelemetry(null)
     } finally {
       updateTabExecuting(tabId, false)
     }
   }, [
-    tab,
     tabConnection,
     tabId,
     updateTabExecuting,
     updateTabResult,
     updateTabMultiResult,
     markTabSaved,
-    addToHistory
+    addToHistory,
+    setTelemetry,
+    setBenchmark,
+    queryTimeoutMs,
+    setTablePreviewTotalCount
   ])
+
+  const handleCancelQuery = useCallback(async () => {
+    if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return
+    if (!tab.isExecuting || !tab.executionId) return
+
+    try {
+      const response = await window.api.db.cancelQuery(tab.executionId)
+      if (response.success) {
+        updateTabMultiResult(tabId, null, 'Query cancelled by user')
+        updateTabExecuting(tabId, false, null)
+      }
+    } catch (error) {
+      console.error('Failed to cancel query:', error)
+    }
+  }, [tab, tabId, updateTabMultiResult, updateTabExecuting])
+
+  // Handle server-side pagination for table preview tabs
+  const handleTablePreviewPaginationChange = useCallback(
+    async (page: number, pageSize: number) => {
+      // Read fresh state to check if we can proceed
+      const currentTab = useTabStore.getState().getTab(tabId)
+      if (
+        !currentTab ||
+        currentTab.type !== 'table-preview' ||
+        !tabConnection ||
+        currentTab.isExecuting
+      )
+        return
+
+      // Update pagination state and query in the store
+      updateTablePreviewPagination(tabId, page, pageSize)
+
+      // Re-run the query - handleRunQuery reads fresh state from store
+      handleRunQuery()
+    },
+    [tabConnection, tabId, updateTablePreviewPagination, handleRunQuery]
+  )
 
   const handleFormatQuery = () => {
     if (!tab || tab.type === 'erd' || tab.type === 'table-designer' || !tab.query.trim()) return
     const formatted = formatSQL(tab.query)
     updateTabQuery(tabId, formatted)
   }
+
+  // Handle benchmark execution
+  const handleBenchmark = useCallback(
+    async (runCount: number) => {
+      if (
+        !tab ||
+        tab.type === 'erd' ||
+        tab.type === 'table-designer' ||
+        !tabConnection ||
+        tab.isExecuting ||
+        isRunningBenchmark ||
+        !tab.query.trim()
+      ) {
+        return
+      }
+
+      setRunningBenchmark(true)
+      // Clear previous telemetry and show panel
+      setTelemetry(null)
+      setBenchmark(null)
+      setShowTelemetryPanel(true)
+
+      try {
+        const response = await window.api.db.benchmark(tabConnection, tab.query, runCount)
+
+        if (response.success && response.data) {
+          setBenchmark(response.data)
+          // Also set the first run's telemetry for display
+          if (response.data.telemetryRuns.length > 0) {
+            setTelemetry(response.data.telemetryRuns[0])
+          }
+        } else {
+          // Show error notification to user
+          notify.error('Benchmark failed', response.error || 'An unexpected error occurred')
+        }
+      } catch (error) {
+        notify.error(
+          'Benchmark failed',
+          error instanceof Error ? error.message : 'An unexpected error occurred'
+        )
+      } finally {
+        setRunningBenchmark(false)
+      }
+    },
+    [
+      tab,
+      tabConnection,
+      isRunningBenchmark,
+      setRunningBenchmark,
+      setTelemetry,
+      setBenchmark,
+      setShowTelemetryPanel
+    ]
+  )
 
   const handleExplainQuery = useCallback(async () => {
     if (
@@ -275,6 +453,71 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
       setIsExplaining(false)
     }
   }, [tab, tabConnection, tabId, isExplaining, updateTabResult])
+
+  // Get query history for performance analysis
+  const queryHistory = useQueryStore((s) => s.history)
+
+  const handleAnalyzePerformance = useCallback(async () => {
+    if (
+      !tab ||
+      tab.type === 'erd' ||
+      tab.type === 'table-designer' ||
+      !tabConnection ||
+      isPerfAnalyzing ||
+      !tab.query.trim()
+    ) {
+      return
+    }
+
+    // Only support PostgreSQL for now
+    if (tabConnection.dbType && tabConnection.dbType !== 'postgresql') {
+      notify.info(
+        'Not Supported',
+        'Performance analysis is currently only available for PostgreSQL databases.'
+      )
+      return
+    }
+
+    setPerfAnalyzing(true)
+
+    try {
+      // Convert query history to the format expected by the API
+      const historyForAnalysis = queryHistory
+        .filter((h) => h.connectionId === tabConnection.id)
+        .slice(0, 50)
+        .map((h) => ({
+          query: h.query,
+          timestamp: h.timestamp instanceof Date ? h.timestamp.getTime() : h.timestamp,
+          connectionId: h.connectionId
+        }))
+
+      const response = await window.api.db.analyzePerformance(
+        tabConnection,
+        tab.query,
+        historyForAnalysis
+      )
+
+      if (response.success && response.data) {
+        setPerfAnalysis(response.data)
+        setShowPerfPanel(true)
+      } else {
+        notify.error('Analysis Failed', response.error ?? 'Failed to analyze query performance')
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      notify.error('Analysis Error', errorMessage)
+    } finally {
+      setPerfAnalyzing(false)
+    }
+  }, [
+    tab,
+    tabConnection,
+    isPerfAnalyzing,
+    queryHistory,
+    setPerfAnalyzing,
+    setPerfAnalysis,
+    setShowPerfPanel
+  ])
 
   const handleQueryChange = (value: string) => {
     updateTabQuery(tabId, value)
@@ -346,7 +589,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
         foreignKey: schemaCol?.foreignKey,
         isPrimaryKey: schemaCol?.isPrimaryKey ?? false,
         isNullable: schemaCol?.isNullable ?? true,
-        enumValues: getEnumValues(col.dataType)
+        enumValues: schemaCol?.enumValues ?? getEnumValues(col.dataType)
       }
     })
   }, [tab, schemas, getEnumValues])
@@ -521,10 +764,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
 
     // For table preview tabs, rebuild from scratch
     if (tab.type === 'table-preview') {
-      // Build table reference (handle MSSQL's dbo schema)
-      const defaultSchema = tabConnection?.dbType === 'mssql' ? 'dbo' : 'public'
-      const tableRef =
-        tab.schemaName === defaultSchema ? tab.tableName : `${tab.schemaName}.${tab.tableName}`
+      const tableRef = buildQualifiedTableRef(tab.schemaName, tab.tableName, tabConnection?.dbType)
       const wherePart = generateWhereClause(tableFilters)
       const orderPart = generateOrderByClause(tableSorting)
       return buildSelectQuery(tableRef, tabConnection?.dbType, {
@@ -545,19 +785,33 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
       baseQuery = baseQuery.slice(0, -1)
     }
 
-    // Remove existing LIMIT for re-adding at the end
+    // Remove existing LIMIT (PostgreSQL/MySQL) or TOP (MSSQL) for re-adding
+    // LIMIT is at the end: SELECT * FROM table LIMIT 100
+    // TOP is after SELECT: SELECT TOP 100 * FROM table
     const limitMatch = baseQuery.match(/\s+LIMIT\s+\d+\s*$/i)
+    const topMatch = baseQuery.match(/^(SELECT)\s+(TOP\s+\d+)\s+/i)
     let limitClause = ''
+    let topClause = ''
+
     if (limitMatch) {
       limitClause = limitMatch[0]
       baseQuery = baseQuery.slice(0, -limitMatch[0].length)
+    }
+    if (topMatch) {
+      topClause = topMatch[2] + ' '
+      baseQuery = baseQuery.replace(/^SELECT\s+TOP\s+\d+\s+/i, 'SELECT ')
     }
 
     const wherePart = generateWhereClause(tableFilters)
     const orderPart = generateOrderByClause(tableSorting)
 
-    // Append clauses (simplified - assumes no existing WHERE/ORDER BY)
-    return `${baseQuery} ${wherePart} ${orderPart}${limitClause};`.replace(/\s+/g, ' ').trim()
+    // Re-add TOP after SELECT for MSSQL, or LIMIT at the end for others
+    let result = baseQuery
+    if (topClause) {
+      result = result.replace(/^SELECT\s+/i, `SELECT ${topClause}`)
+    }
+    result = `${result} ${wherePart} ${orderPart}${limitClause};`.replace(/\s+/g, ' ').trim()
+    return result
   }
 
   const handleApplyToQuery = () => {
@@ -643,7 +897,17 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   // At this point, tab is guaranteed to be query or table-preview (not erd or table-designer)
   const activeResultIndex = tab.activeResultIndex ?? 0
 
-  // Use multi-result pagination when available, fallback to legacy
+  // For query tabs, pass all rows and let DataTable handle client-side pagination
+  // For table-preview tabs with server-side pagination, rows are already limited by SQL
+  const getAllRows = (): Record<string, unknown>[] => {
+    if (hasMultipleResults) {
+      const statement = tab.multiResult?.statements?.[tab.activeResultIndex]
+      return (statement?.rows ?? []) as Record<string, unknown>[]
+    }
+    return (tab.result?.rows ?? []) as Record<string, unknown>[]
+  }
+
+  // Only use store pagination for table-preview with server-side pagination (for backward compat display)
   const paginatedRows = hasMultipleResults
     ? getActiveResultPaginatedRows(tabId)
     : getTabPaginatedRows(tabId)
@@ -680,6 +944,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
               height={isResultsCollapsed ? '100%' : 160}
               placeholder="SELECT * FROM your_table LIMIT 100;"
               schemas={schemas}
+              snippets={allSnippets}
             />
           </div>
         )}
@@ -700,22 +965,31 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                 <PanelTopClose className="size-3.5" />
               )}
             </Button>
-            <Button
-              size="sm"
-              className="gap-1.5 h-7"
-              disabled={tab.isExecuting || !tab.query.trim()}
-              onClick={handleRunQuery}
-            >
-              {tab.isExecuting ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
+            {tab.isExecuting ? (
+              <Button
+                size="sm"
+                variant="destructive"
+                className="gap-1.5 h-7"
+                onClick={handleCancelQuery}
+              >
+                <Square className="size-3.5" />
+                Cancel
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                className="gap-1.5 h-7"
+                disabled={!tab.query.trim()}
+                onClick={handleRunQuery}
+              >
                 <Play className="size-3.5" />
-              )}
-              Run
-              <kbd className="ml-1.5 rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground">
-                ⌘↵
-              </kbd>
-            </Button>
+                Run
+                <kbd className="ml-1.5 rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground">
+                  {keys.mod}
+                  {keys.enter}
+                </kbd>
+              </Button>
+            )}
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -739,6 +1013,11 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
+            <BenchmarkButton
+              onBenchmark={handleBenchmark}
+              isRunning={isRunningBenchmark}
+              disabled={tab.isExecuting || !tab.query.trim()}
+            />
             {!isEditorCollapsed && (
               <>
                 <Button
@@ -751,7 +1030,8 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                   <Wand2 className="size-3.5" />
                   Format
                   <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
-                    ⌘⇧F
+                    {keys.mod}
+                    {keys.shift}F
                   </kbd>
                 </Button>
                 <Button
@@ -905,11 +1185,16 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
 
                 {/* Results Table */}
                 <div className="flex-1 overflow-hidden p-3">
-                  {tab.type === 'table-preview' ? (
+                  {tab.type === 'table-preview' && !hasMultipleResults ? (
                     <EditableDataTable
+                      key={`result-${activeResultIndex}`}
                       tabId={tabId}
                       columns={getColumnsForEditing()}
-                      data={paginatedRows as Record<string, unknown>[]}
+                      data={
+                        tab.totalRowCount != null
+                          ? ((tab.result?.rows ?? []) as Record<string, unknown>[])
+                          : (paginatedRows as Record<string, unknown>[])
+                      }
                       pageSize={tab.pageSize}
                       canEdit={true}
                       editContext={getEditContext()}
@@ -919,9 +1204,13 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                       onForeignKeyClick={handleFKClick}
                       onForeignKeyOpenTab={handleFKOpenTab}
                       onChangesCommitted={handleRunQuery}
+                      serverCurrentPage={tab.currentPage}
+                      serverTotalRowCount={tab.totalRowCount}
+                      onServerPaginationChange={handleTablePreviewPaginationChange}
                     />
                   ) : (
                     <DataTable
+                      key={`result-${activeResultIndex}`}
                       columns={
                         hasMultipleResults
                           ? getActiveResultColumns().map((col) => ({
@@ -930,7 +1219,7 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                             }))
                           : getColumnsWithFKInfo()
                       }
-                      data={paginatedRows as Record<string, unknown>[]}
+                      data={getAllRows()}
                       pageSize={tab.pageSize}
                       onFiltersChange={setTableFilters}
                       onSortingChange={setTableSorting}
@@ -977,6 +1266,82 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
+                    {/* Telemetry toggle button */}
+                    {(telemetry || benchmark) && (
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant={showTelemetryPanel ? 'secondary' : 'ghost'}
+                              size="sm"
+                              className="gap-1.5 h-7"
+                              onClick={() => setShowTelemetryPanel(!showTelemetryPanel)}
+                            >
+                              <Timer className="size-3.5" />
+                              Telemetry
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            <p className="text-xs">
+                              {showTelemetryPanel ? 'Hide' : 'Show'} query performance breakdown
+                            </p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    )}
+                    {/* Performance Analysis button - PostgreSQL only */}
+                    {tab.result &&
+                      (!tabConnection?.dbType || tabConnection.dbType === 'postgresql') && (
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant={showPerfPanel ? 'secondary' : 'ghost'}
+                                size="sm"
+                                className="gap-1.5 h-7"
+                                onClick={
+                                  perfAnalysis
+                                    ? () => setShowPerfPanel(!showPerfPanel)
+                                    : handleAnalyzePerformance
+                                }
+                                disabled={isPerfAnalyzing}
+                              >
+                                {isPerfAnalyzing ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <ActivitySquare className="size-3.5" />
+                                )}
+                                {perfAnalysis &&
+                                  perfAnalysis.issueCount.critical +
+                                    perfAnalysis.issueCount.warning >
+                                    0 && (
+                                    <Badge
+                                      variant="secondary"
+                                      className={`h-4 px-1.5 text-[10px] ${
+                                        perfAnalysis.issueCount.critical > 0
+                                          ? 'bg-red-500/20 text-red-500'
+                                          : 'bg-yellow-500/20 text-yellow-500'
+                                      }`}
+                                    >
+                                      {perfAnalysis.issueCount.critical +
+                                        perfAnalysis.issueCount.warning}
+                                    </Badge>
+                                  )}
+                                Analyze
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              <p className="text-xs">
+                                {perfAnalysis
+                                  ? showPerfPanel
+                                    ? 'Hide performance analysis'
+                                    : 'Show performance analysis'
+                                  : 'Analyze query for performance issues'}
+                              </p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      )}
                     {hasActiveFiltersOrSorting && (
                       <TooltipProvider>
                         <Tooltip>
@@ -1032,16 +1397,63 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
                           <FileJson className="size-4 text-muted-foreground" />
                           Export as JSON
                         </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => {
+                            if (!tab.result) return
+                            const filename = generateExportFilename(
+                              tab.type === 'table-preview' ? tab.tableName : undefined
+                            )
+                            downloadSQL(tab.result, filename, {
+                              tableName:
+                                tab.type === 'table-preview' ? tab.tableName! : 'query_result',
+                              schemaName: tab.type === 'table-preview' ? tab.schemaName : undefined
+                            })
+                          }}
+                        >
+                          <FileCode2 className="size-4 text-muted-foreground" />
+                          Export as SQL
+                        </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>
                 </div>
+
+                {/* Telemetry Panel */}
+                {showTelemetryPanel && (telemetry || benchmark) && (
+                  <TelemetryPanel
+                    telemetry={telemetry}
+                    benchmark={benchmark}
+                    showConnectionOverhead={showConnectionOverhead}
+                    onToggleConnectionOverhead={setShowConnectionOverhead}
+                    selectedPercentile={selectedPercentile}
+                    onSelectPercentile={setSelectedPercentile}
+                    viewMode={viewMode}
+                    onViewModeChange={setViewMode}
+                    onClose={() => setShowTelemetryPanel(false)}
+                  />
+                )}
+
+                {/* Performance Indicator Panel */}
+                {showPerfPanel && perfAnalysis && (
+                  <PerfIndicatorPanel
+                    analysis={perfAnalysis}
+                    onClose={() => setShowPerfPanel(false)}
+                    onReanalyze={handleAnalyzePerformance}
+                    isAnalyzing={isPerfAnalyzing}
+                    showCritical={showCritical}
+                    showWarning={showWarning}
+                    showInfo={showInfo}
+                    onToggleSeverity={toggleSeverityFilter}
+                  />
+                )}
               </>
             ) : (
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-center space-y-2">
                   <p className="text-muted-foreground">Run a query to see results</p>
-                  <p className="text-xs text-muted-foreground/70">Press ⌘+Enter to execute</p>
+                  <p className="text-xs text-muted-foreground/70">
+                    Press {keys.mod}+Enter to execute
+                  </p>
                 </div>
               </div>
             )}
@@ -1061,26 +1473,28 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
 
       {/* Execution Plan Panel */}
       {executionPlan && (
-        <div
-          className="fixed inset-y-0 right-0 z-50 shadow-xl"
-          style={{ width: executionPlanWidth }}
-        >
-          {/* Resize handle */}
+        <>
+          {/* Backdrop overlay */}
+          <div className="fixed inset-0 z-40 bg-black/30" onClick={() => setExecutionPlan(null)} />
           <div
-            className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-primary/50 transition-colors z-10"
-            onMouseDown={(e) => {
-              e.preventDefault()
-              isResizing.current = true
-              document.body.style.cursor = 'ew-resize'
-              document.body.style.userSelect = 'none'
-            }}
-          />
-          <ExecutionPlanViewer
-            plan={executionPlan.plan as Parameters<typeof ExecutionPlanViewer>[0]['plan']}
-            durationMs={executionPlan.durationMs}
-            onClose={() => setExecutionPlan(null)}
-          />
-        </div>
+            className="fixed top-0 bottom-0 right-0 z-50 shadow-xl bg-background"
+            style={{ width: executionPlanWidth }}
+          >
+            {/* Resize handle */}
+            <div
+              className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-primary/50 transition-colors z-10"
+              onMouseDown={(e) => {
+                e.preventDefault()
+                startResizing()
+              }}
+            />
+            <ExecutionPlanViewer
+              plan={executionPlan.plan as Parameters<typeof ExecutionPlanViewer>[0]['plan']}
+              durationMs={executionPlan.durationMs}
+              onClose={() => setExecutionPlan(null)}
+            />
+          </div>
+        </>
       )}
 
       {/* Save Query Dialog */}

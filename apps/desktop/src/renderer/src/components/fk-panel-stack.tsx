@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import { X, Link2, ChevronRight, Loader2, AlertCircle, Copy, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -74,9 +72,6 @@ function FKPanel({
             {panel.foreignKey.referencedSchema}
           </Badge>
         </div>
-        <Button variant="ghost" size="icon" className="size-7" onClick={onClose}>
-          <X className="size-4" />
-        </Button>
       </div>
 
       {/* Breadcrumb trail */}
@@ -172,10 +167,14 @@ function FKPanel({
       </div>
 
       {/* Footer */}
-      <div className="px-4 py-2 border-t border-border text-xs text-muted-foreground bg-muted/20">
-        <span>
+      <div className="px-4 py-2 border-t border-border bg-muted/20 flex items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">
           {panel.foreignKey.referencedColumn} = {String(panel.value)}
         </span>
+        <Button variant="outline" size="sm" className="h-7 gap-1.5" onClick={onClose}>
+          <X className="size-3" />
+          Close
+        </Button>
       </div>
     </div>
   )

@@ -249,6 +249,11 @@
     background: oklch(0.6 0 0 / 0.5);
   }
 
+  /* Scrollbar corner */
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
   /* Selection colors */
   ::selection {
     background: oklch(0.45 0.15 250 / 0.3);
@@ -314,4 +319,16 @@
     -webkit-user-drag: none;
     user-drag: none;
   }
+}
+
+/* to remove input number arrows  */
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
 }

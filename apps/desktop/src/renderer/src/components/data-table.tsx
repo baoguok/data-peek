@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   flexRender,
@@ -12,19 +10,8 @@ import {
   type ColumnFiltersState,
   type SortingState
 } from '@tanstack/react-table'
-import {
-  ArrowUpDown,
-  ArrowUp,
-  ArrowDown,
-  ChevronLeft,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
-  Filter,
-  X,
-  Link2,
-  Copy
-} from 'lucide-react'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { ArrowUpDown, ArrowUp, ArrowDown, Filter, X, Link2, Copy } from 'lucide-react'
 import type { ForeignKeyInfo } from '@data-peek/shared'
 import { Input } from '@/components/ui/input'
 
@@ -34,6 +21,13 @@ import { FKCellValue } from '@/components/fk-cell-value'
 import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Badge } from '@/components/ui/badge'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { getTypeColor } from '@/lib/type-colors'
+import { PaginationControls } from '@/components/pagination-controls'
+import { useSettingsStore } from '@/stores/settings-store'
+
+const VIRTUALIZATION_THRESHOLD = 50
+const ROW_HEIGHT = 37
 
 // Export types for parent components
 export interface DataTableFilter {
@@ -58,31 +52,14 @@ interface DataTableProps<TData> {
   pageSize?: number
   onFiltersChange?: (filters: DataTableFilter[]) => void
   onSortingChange?: (sorting: DataTableSort[]) => void
+  onPageSizeChange?: (size: number) => void
   /** Called when user clicks a FK cell (opens panel) */
   onForeignKeyClick?: (foreignKey: ForeignKeyInfo, value: unknown) => void
   /** Called when user Cmd+clicks a FK cell (opens new tab) */
   onForeignKeyOpenTab?: (foreignKey: ForeignKeyInfo, value: unknown) => void
 }
 
-function getTypeColor(type: string): string {
-  const lower = type.toLowerCase()
-  if (lower.includes('uuid')) return 'text-purple-400'
-  if (lower.includes('varchar') || lower.includes('text') || lower.includes('char'))
-    return 'text-green-400'
-  if (
-    lower.includes('int') ||
-    lower.includes('numeric') ||
-    lower.includes('decimal') ||
-    lower.includes('bigint')
-  )
-    return 'text-blue-400'
-  if (lower.includes('timestamp') || lower.includes('date') || lower.includes('time'))
-    return 'text-orange-400'
-  if (lower.includes('bool')) return 'text-yellow-400'
-  return 'text-muted-foreground'
-}
-
-function CellValue({
+const CellValue = React.memo(function CellValue({
   value,
   dataType,
   columnName,
@@ -97,7 +74,7 @@ function CellValue({
   onForeignKeyClick?: (foreignKey: ForeignKeyInfo, value: unknown) => void
   onForeignKeyOpenTab?: (foreignKey: ForeignKeyInfo, value: unknown) => void
 }) {
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard({ resetDelay: 1500 })
   const lowerType = dataType.toLowerCase()
 
   // Handle JSON/JSONB types specially
@@ -117,12 +94,6 @@ function CellValue({
     )
   }
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(String(value ?? ''))
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
-  }
-
   if (value === null || value === undefined) {
     return <span className="text-muted-foreground/50 italic">NULL</span>
   }
@@ -136,7 +107,7 @@ function CellValue({
       <Tooltip>
         <TooltipTrigger asChild>
           <button
-            onClick={handleCopy}
+            onClick={() => copy(stringValue)}
             className={`text-left truncate max-w-[300px] hover:bg-accent/50 px-1 -mx-1 rounded transition-colors ${isMono ? 'font-mono text-xs' : ''}`}
           >
             {isLong ? stringValue.substring(0, 50) + '...' : stringValue}
@@ -145,7 +116,12 @@ function CellValue({
         <TooltipContent side="bottom" className="max-w-md">
           <div className="flex items-start gap-2">
             <pre className="text-xs whitespace-pre-wrap break-all flex-1">{stringValue}</pre>
-            <Button variant="ghost" size="icon" className="size-6 shrink-0" onClick={handleCopy}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 shrink-0"
+              onClick={() => copy(stringValue)}
+            >
               <Copy className="size-3" />
             </Button>
           </div>
@@ -154,17 +130,20 @@ function CellValue({
       </Tooltip>
     </TooltipProvider>
   )
-}
+})
 
 export function DataTable<TData extends Record<string, unknown>>({
   columns: columnDefs,
   data,
-  pageSize = 50,
+  pageSize: propPageSize,
   onFiltersChange,
   onSortingChange,
+  onPageSizeChange,
   onForeignKeyClick,
   onForeignKeyOpenTab
 }: DataTableProps<TData>) {
+  const { defaultPageSize } = useSettingsStore()
+  const pageSize = propPageSize ?? defaultPageSize
   const [sorting, setSorting] = React.useState<SortingState>([])
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>([])
   const [showFilters, setShowFilters] = React.useState(false)
@@ -196,7 +175,11 @@ export function DataTable<TData extends Record<string, unknown>>({
   // Generate TanStack Table columns from column definitions
   const columns = React.useMemo<ColumnDef<TData>[]>(
     () =>
-      columnDefs.map((col) => {
+      columnDefs.map((col, index) => {
+        // Generate a stable id for columns - MSSQL can return empty names for aggregates like COUNT(*)
+        const columnId = col.name || `_col_${index}`
+        const displayName = col.name || `(column ${index + 1})`
+
         const lowerType = col.dataType.toLowerCase()
         const isNumeric =
           lowerType.includes('int') ||
@@ -208,6 +191,7 @@ export function DataTable<TData extends Record<string, unknown>>({
           lowerType.includes('money')
 
         return {
+          id: columnId,
           accessorKey: col.name,
           header: ({ column }) => {
             const isSorted = column.getIsSorted()
@@ -218,7 +202,7 @@ export function DataTable<TData extends Record<string, unknown>>({
                   className="h-auto py-1 px-2 -mx-2 font-medium hover:bg-accent/50"
                   onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
                 >
-                  <span>{col.name}</span>
+                  <span>{displayName}</span>
                   {col.foreignKey && <Link2 className="ml-1 size-3 text-blue-400" />}
                   <Badge
                     variant="outline"
@@ -325,6 +309,50 @@ export function DataTable<TData extends Record<string, unknown>>({
     setColumnFilters([])
   }
 
+  const tableContainerRef = React.useRef<HTMLDivElement>(null)
+  const headerRef = React.useRef<HTMLTableRowElement>(null)
+  const [columnWidths, setColumnWidths] = React.useState<number[]>([])
+
+  const rows = table.getRowModel().rows
+  const shouldVirtualize = rows.length > VIRTUALIZATION_THRESHOLD
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => tableContainerRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 10
+  })
+
+  const columnKey = columnDefs.map((c) => c.name).join(',')
+
+  React.useEffect(() => {
+    setColumnWidths([])
+  }, [columnKey])
+
+  React.useEffect(() => {
+    if (!shouldVirtualize || !headerRef.current) return
+
+    const measureWidths = () => {
+      const headerCells = headerRef.current?.querySelectorAll('th')
+      if (headerCells) {
+        const widths = Array.from(headerCells).map((cell) => cell.offsetWidth)
+        setColumnWidths(widths)
+      }
+    }
+
+    const timeoutId = setTimeout(measureWidths, 0)
+
+    const resizeObserver = new ResizeObserver(measureWidths)
+    if (headerRef.current) {
+      resizeObserver.observe(headerRef.current)
+    }
+
+    return () => {
+      clearTimeout(timeoutId)
+      resizeObserver.disconnect()
+    }
+  }, [shouldVirtualize, columnKey])
+
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Filter Toggle Bar */}
@@ -363,12 +391,12 @@ export function DataTable<TData extends Record<string, unknown>>({
 
       {/* Table with single scroll container */}
       <div className="flex-1 min-h-0 border rounded-lg border-border/50 relative">
-        <div className="absolute inset-0 overflow-auto">
+        <div ref={tableContainerRef} className="absolute inset-0 overflow-auto">
           <table className="w-full min-w-max caption-bottom text-sm">
             <TableHeader className="sticky top-0 bg-muted/95 backdrop-blur-sm z-10">
               {table.getHeaderGroups().map((headerGroup) => (
                 <React.Fragment key={headerGroup.id}>
-                  <TableRow className="hover:bg-transparent border-border/50">
+                  <TableRow ref={headerRef} className="hover:bg-transparent border-border/50">
                     {headerGroup.headers.map((header) => (
                       <TableHead
                         key={header.id}
@@ -404,19 +432,68 @@ export function DataTable<TData extends Record<string, unknown>>({
               ))}
             </TableHeader>
             <TableBody>
-              {table.getRowModel().rows?.length ? (
-                table.getRowModel().rows.map((row) => (
-                  <TableRow
-                    key={row.id}
-                    className="hover:bg-accent/30 border-border/30 transition-colors"
-                  >
-                    {row.getVisibleCells().map((cell) => (
-                      <TableCell key={cell.id} className="py-2 text-sm whitespace-nowrap">
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))
+              {rows.length ? (
+                shouldVirtualize && columnWidths.length > 0 ? (
+                  <tr>
+                    <td colSpan={columns.length} style={{ padding: 0 }}>
+                      <div
+                        role="rowgroup"
+                        aria-rowcount={rows.length}
+                        style={{
+                          height: virtualizer.getTotalSize(),
+                          position: 'relative'
+                        }}
+                      >
+                        {virtualizer.getVirtualItems().map((virtualRow) => {
+                          const row = rows[virtualRow.index]
+                          return (
+                            <div
+                              key={row.id}
+                              role="row"
+                              aria-rowindex={row.index + 1}
+                              data-index={virtualRow.index}
+                              className="hover:bg-accent/30 border-b border-border/30 transition-colors flex items-center"
+                              style={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                height: `${virtualRow.size}px`,
+                                transform: `translateY(${virtualRow.start}px)`
+                              }}
+                            >
+                              {row.getVisibleCells().map((cell, cellIndex) => (
+                                <div
+                                  key={cell.id}
+                                  role="cell"
+                                  className="py-2 px-4 text-sm whitespace-nowrap overflow-hidden"
+                                  style={{
+                                    width: columnWidths[cellIndex] || 'auto',
+                                    flexShrink: 0
+                                  }}
+                                >
+                                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                </div>
+                              ))}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  rows.map((row) => (
+                    <TableRow
+                      key={row.id}
+                      className="hover:bg-accent/30 border-border/30 transition-colors"
+                    >
+                      {row.getVisibleCells().map((cell) => (
+                        <TableCell key={cell.id} className="py-2 text-sm whitespace-nowrap">
+                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  ))
+                )
               ) : (
                 <TableRow>
                   <TableCell colSpan={columns.length} className="h-24 text-center">
@@ -430,54 +507,20 @@ export function DataTable<TData extends Record<string, unknown>>({
       </div>
 
       {/* Pagination */}
-      <div className="flex items-center justify-between py-2 shrink-0">
-        <div className="text-xs text-muted-foreground">
-          {table.getFilteredRowModel().rows.length} row(s) total
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="text-xs text-muted-foreground">
-            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
-          </div>
-          <div className="flex items-center gap-1">
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.setPageIndex(0)}
-              disabled={!table.getCanPreviousPage()}
-            >
-              <ChevronsLeft className="size-3.5" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.previousPage()}
-              disabled={!table.getCanPreviousPage()}
-            >
-              <ChevronLeft className="size-3.5" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.nextPage()}
-              disabled={!table.getCanNextPage()}
-            >
-              <ChevronRight className="size-3.5" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.setPageIndex(table.getPageCount() - 1)}
-              disabled={!table.getCanNextPage()}
-            >
-              <ChevronsRight className="size-3.5" />
-            </Button>
-          </div>
-        </div>
-      </div>
+      <PaginationControls
+        currentPage={table.getState().pagination.pageIndex + 1}
+        totalPages={table.getPageCount()}
+        pageSize={table.getState().pagination.pageSize}
+        totalRows={data.length}
+        filteredRows={table.getFilteredRowModel().rows.length}
+        onPageChange={(page) => table.setPageIndex(page - 1)}
+        onPageSizeChange={(size) => {
+          table.setPageSize(size)
+          onPageSizeChange?.(size)
+        }}
+        canPreviousPage={table.getCanPreviousPage()}
+        canNextPage={table.getCanNextPage()}
+      />
     </div>
   )
 }

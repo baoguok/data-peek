@@ -6,8 +6,22 @@ import {
   ColumnInfo,
   DatabaseType,
   CustomTypeInfo,
-  MSSQLConnectionOptions
+  MSSQLConnectionOptions,
+  SSHConfig,
+  SQLiteConnectionOptions,
+  SSLConnectionOptions
 } from '@shared/index'
+import { notify } from './notification-store'
+
+// Helper to format timestamp as relative time
+function formatRelativeTime(timestamp: number): string {
+  const seconds = Math.floor((Date.now() - timestamp) / 1000)
+
+  if (seconds < 60) return 'just now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`
+  return `${Math.floor(seconds / 86400)} days ago`
+}
 
 export interface Connection {
   id: string
@@ -18,9 +32,14 @@ export interface Connection {
   user?: string // Optional for MSSQL with Azure AD authentication
   password?: string
   ssl?: boolean
+  ssh?: boolean
+  dstPort: number
+  sshConfig?: SSHConfig
   group?: string
   dbType: DatabaseType
+  sslOptions?: SSLConnectionOptions
   mssqlOptions?: MSSQLConnectionOptions
+  sqliteOptions?: SQLiteConnectionOptions
 }
 
 export interface ConnectionWithStatus extends Connection {
@@ -45,6 +64,9 @@ interface ConnectionState {
   customTypes: CustomTypeInfo[]
   isLoadingSchema: boolean
   schemaError: string | null
+  schemaFromCache: boolean
+  schemaFetchedAt: number | null
+  isRefreshingSchema: boolean // Background refresh in progress
 
   // Actions
   initializeConnections: () => Promise<void>
@@ -61,7 +83,12 @@ interface ConnectionState {
 
   setSchemas: (schemas: Schema[]) => void
   setLoadingSchema: (loading: boolean) => void
-  fetchSchemas: (connectionId?: string) => Promise<void>
+  fetchSchemas: (connectionId?: string, forceRefresh?: boolean) => Promise<void>
+  refreshSchemasInBackground: (connectionId?: string) => Promise<void>
+
+  // Multi-window sync
+  refreshConnections: () => Promise<void>
+  setupConnectionSync: () => () => void
 
   // Computed
   getActiveConnection: () => ConnectionWithStatus | null
@@ -73,6 +100,8 @@ const toConnectionWithStatus = (config: ConnectionConfig): ConnectionWithStatus 
   ...config,
   // Default to postgresql for backward compatibility with existing connections
   dbType: config.dbType || 'postgresql',
+  // Ensure dstPort is set (defaults to port if not specified)
+  dstPort: config.dstPort || config.port,
   isConnected: false,
   isConnecting: false
 })
@@ -86,6 +115,9 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   customTypes: [],
   isLoadingSchema: false,
   schemaError: null,
+  schemaFromCache: false,
+  schemaFetchedAt: null,
+  isRefreshingSchema: false,
 
   // Actions
   initializeConnections: async () => {
@@ -114,7 +146,12 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
     set((state) => ({
       connections: [
         ...state.connections,
-        { ...connection, isConnected: false, isConnecting: false }
+        {
+          ...connection,
+          dstPort: connection.dstPort || connection.port,
+          isConnected: false,
+          isConnecting: false
+        }
       ]
     })),
 
@@ -160,33 +197,64 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
     if (id) {
       get().fetchSchemas(id)
     } else {
-      set({ schemas: [], customTypes: [], schemaError: null })
+      set({
+        schemas: [],
+        customTypes: [],
+        schemaError: null,
+        schemaFromCache: false,
+        schemaFetchedAt: null
+      })
     }
   },
 
-  fetchSchemas: async (connectionId?: string) => {
+  fetchSchemas: async (connectionId?: string, forceRefresh?: boolean) => {
     const id = connectionId ?? get().activeConnectionId
     if (!id) return
 
     const connection = get().connections.find((c) => c.id === id)
     if (!connection) return
 
-    set({ isLoadingSchema: true, schemas: [], customTypes: [], schemaError: null })
+    set({
+      isLoadingSchema: true,
+      schemas: [],
+      customTypes: [],
+      schemaError: null,
+      schemaFromCache: false,
+      schemaFetchedAt: null
+    })
 
     try {
-      // Fetch schemas and types in parallel
-      const [schemasResult, typesResult] = await Promise.all([
-        window.api.db.schemas(connection),
-        window.api.ddl.getTypes(connection)
-      ])
+      // Fetch schemas (with optional force refresh)
+      const schemasResult = await window.api.db.schemas(connection, forceRefresh)
 
       if (schemasResult.success && schemasResult.data) {
+        const { schemas, customTypes, fetchedAt, fromCache, stale, refreshError } =
+          schemasResult.data
+
         set({
-          schemas: schemasResult.data.schemas,
-          customTypes: typesResult.success && typesResult.data ? typesResult.data : [],
+          schemas,
+          customTypes: customTypes ?? [],
           isLoadingSchema: false,
-          schemaError: null
+          schemaError: null,
+          schemaFromCache: fromCache ?? false,
+          schemaFetchedAt: fetchedAt
         })
+
+        // If loaded from cache, trigger background refresh
+        if (fromCache && !stale) {
+          // Small delay to let UI render first
+          setTimeout(() => {
+            get().refreshSchemasInBackground(id)
+          }, 100)
+        }
+
+        // Show notification if stale cache was used due to error
+        if (stale && refreshError) {
+          notify.warning(
+            'Using cached schema',
+            `Could not refresh: ${refreshError}. Using cached data from ${formatRelativeTime(fetchedAt)}.`
+          )
+        }
       } else {
         set({
           schemas: [],
@@ -203,6 +271,60 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
         isLoadingSchema: false,
         schemaError: error instanceof Error ? error.message : 'Unknown error'
       })
+    }
+  },
+
+  refreshSchemasInBackground: async (connectionId?: string) => {
+    const id = connectionId ?? get().activeConnectionId
+    if (!id) return
+
+    const connection = get().connections.find((c) => c.id === id)
+    if (!connection) return
+
+    // Don't refresh if already refreshing or if this isn't the active connection anymore
+    if (get().isRefreshingSchema || get().activeConnectionId !== id) return
+
+    set({ isRefreshingSchema: true })
+
+    try {
+      const schemasResult = await window.api.db.schemas(connection, true) // Force refresh
+
+      // Only update if this is still the active connection
+      if (get().activeConnectionId !== id) {
+        set({ isRefreshingSchema: false })
+        return
+      }
+
+      if (schemasResult.success && schemasResult.data) {
+        const { schemas, customTypes, fetchedAt } = schemasResult.data
+        const currentSchemas = get().schemas
+
+        // Check if schemas actually changed
+        const schemasChanged = JSON.stringify(schemas) !== JSON.stringify(currentSchemas)
+
+        if (schemasChanged) {
+          set({
+            schemas,
+            customTypes: customTypes ?? [],
+            schemaFromCache: false,
+            schemaFetchedAt: fetchedAt,
+            isRefreshingSchema: false
+          })
+
+          notify.info('Schema updated', 'Database schema has been refreshed with latest changes.')
+        } else {
+          set({
+            schemaFromCache: false,
+            schemaFetchedAt: fetchedAt,
+            isRefreshingSchema: false
+          })
+        }
+      } else {
+        set({ isRefreshingSchema: false })
+      }
+    } catch (error) {
+      console.error('Failed to refresh schemas in background:', error)
+      set({ isRefreshingSchema: false })
     }
   },
 
@@ -226,5 +348,36 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
       (t) => t.type === 'enum' && (t.name === dataType || `${t.schema}.${t.name}` === dataType)
     )
     return enumType?.values
+  },
+
+  // Multi-window sync: refresh connections from main process
+  refreshConnections: async () => {
+    try {
+      const result = await window.api.connections.list()
+      if (result.success && result.data) {
+        const currentConnections = get().connections
+        const newConnections = result.data.map((config) => {
+          // Preserve connection status from existing connections
+          const existing = currentConnections.find((c) => c.id === config.id)
+          return {
+            ...toConnectionWithStatus(config),
+            isConnected: existing?.isConnected ?? false,
+            isConnecting: existing?.isConnecting ?? false,
+            error: existing?.error
+          }
+        })
+        set({ connections: newConnections })
+      }
+    } catch (error) {
+      console.error('Failed to refresh connections:', error)
+    }
+  },
+
+  // Set up listener for connection updates from other windows
+  setupConnectionSync: () => {
+    const cleanup = window.api.connections.onConnectionsUpdated(() => {
+      get().refreshConnections()
+    })
+    return cleanup
   }
 }))

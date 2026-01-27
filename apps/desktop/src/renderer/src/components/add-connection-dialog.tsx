@@ -1,7 +1,16 @@
-'use client'
-
-import { useState, useEffect } from 'react'
-import { Loader2, Database, CheckCircle2, XCircle, Link, Settings2 } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import {
+  Loader2,
+  Database,
+  CheckCircle2,
+  XCircle,
+  Link,
+  Settings2,
+  FolderOpen,
+  ChevronDown,
+  Eye,
+  EyeOff
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -13,7 +22,11 @@ import {
   SheetTitle
 } from '@/components/ui/sheet'
 import { useConnectionStore, type Connection } from '@/stores'
-import { PostgreSQLIcon, MySQLIcon, MSSQLIcon } from './database-icons'
+import { DB_DEFAULTS, parseConnectionString } from '@/lib/connection-string-parser'
+import { PostgreSQLIcon, MySQLIcon, MSSQLIcon, SQLiteIcon } from './database-icons'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { SSHConfigSection } from './ssh-config-section'
+import type { SSHConfig, SSLConnectionOptions } from '@shared/index'
 import type { DatabaseType } from '@shared/index'
 
 interface AddConnectionDialogProps {
@@ -24,231 +37,6 @@ interface AddConnectionDialogProps {
 
 type InputMode = 'manual' | 'connection-string'
 
-const DB_DEFAULTS: Record<DatabaseType, { port: string; user: string; database: string }> = {
-  postgresql: { port: '5432', user: 'postgres', database: 'postgres' },
-  mysql: { port: '3306', user: 'root', database: '' },
-  sqlite: { port: '', user: '', database: '' },
-  mssql: { port: '1433', user: 'sa', database: '' }
-}
-
-const DB_PROTOCOLS: Record<DatabaseType, string[]> = {
-  postgresql: ['postgres', 'postgresql'],
-  mysql: ['mysql'],
-  sqlite: [],
-  mssql: ['mssql', 'sqlserver']
-}
-
-/**
- * Parse MSSQL connection string with semicolon-separated parameters
- * Format: sqlserver://host:port;database=name;authentication=...;encrypt=...;trustServerCertificate=...
- */
-function parseMSSQLConnectionString(connectionString: string): {
-  host: string
-  port: string
-  database: string
-  user: string
-  password: string
-  ssl: boolean
-  mssqlOptions?: import('@shared/index').MSSQLConnectionOptions
-} | null {
-  try {
-    // Split protocol/authority from parameters
-    const parts = connectionString.split(';')
-    const urlPart = parts[0]
-    const paramsPart = parts.slice(1).join(';')
-
-    // Parse URL part (protocol://host:port)
-    const url = new URL(urlPart)
-    const protocol = url.protocol.replace(':', '').toLowerCase()
-
-    // Validate protocol
-    if (!protocol.startsWith('mssql') && !protocol.startsWith('sqlserver')) {
-      return null
-    }
-
-    const defaults = DB_DEFAULTS.mssql
-    const host = url.hostname || 'localhost'
-    const port = url.port || defaults.port
-
-    // Parse semicolon-separated parameters
-    const params: Record<string, string> = {}
-    const paramPairs = paramsPart.split(';').filter((p) => p.trim())
-    for (const pair of paramPairs) {
-      const [key, ...valueParts] = pair.split('=')
-      if (key && valueParts.length > 0) {
-        // Normalize key: remove spaces and convert to lowercase for consistent lookup
-        const normalizedKey = key.trim().replace(/\s+/g, '').toLowerCase()
-        params[normalizedKey] = valueParts.join('=').trim()
-      }
-    }
-
-    // Helper to lookup parameter with multiple possible keys
-    const getParam = (...keys: string[]): string | undefined => {
-      for (const key of keys) {
-        const normalized = key.replace(/\s+/g, '').toLowerCase()
-        if (params[normalized]) return params[normalized]
-      }
-      return undefined
-    }
-
-    // Extract values from parameters (support both spaced and compact keys)
-    const database = getParam('database', 'initial catalog', 'initialcatalog') || defaults.database
-
-    // Check authentication method first
-    const authentication = getParam('authentication')?.toLowerCase()
-    const isActiveDirectoryIntegrated = authentication === 'activedirectoryintegrated'
-
-    // For ActiveDirectoryIntegrated, user/password are not needed
-    const user = isActiveDirectoryIntegrated
-      ? ''
-      : getParam('user', 'user id', 'userid', 'uid') || defaults.user
-    const password = isActiveDirectoryIntegrated ? '' : getParam('password', 'pwd') || ''
-
-    // Parse encryption/SSL settings
-    const encrypt = getParam('encrypt')?.toLowerCase()
-    let ssl = false
-    let encryptValue: boolean | undefined
-    if (encrypt === 'true' || encrypt === 'yes' || encrypt === '1') {
-      ssl = true
-      encryptValue = true
-    } else if (encrypt === 'false' || encrypt === 'no' || encrypt === '0') {
-      ssl = false
-      encryptValue = false
-    } else {
-      // Default to true for Azure SQL (encrypt is usually required)
-      ssl = host.includes('.database.windows.net')
-      encryptValue = ssl
-    }
-
-    // Parse trustServerCertificate (support spaced variants)
-    const trustServerCert = getParam(
-      'trustservercertificate',
-      'trust server certificate',
-      'trustservercert'
-    )?.toLowerCase()
-    const trustServerCertificate =
-      trustServerCert === 'true' || trustServerCert === 'yes' || trustServerCert === '1'
-        ? true
-        : trustServerCert === 'false' || trustServerCert === 'no' || trustServerCert === '0'
-          ? false
-          : undefined
-
-    // Parse authentication method (already checked above, but need the original value)
-    const authenticationParam = getParam('authentication')
-    let authMethod:
-      | 'SQL Server Authentication'
-      | 'ActiveDirectoryIntegrated'
-      | 'ActiveDirectoryPassword'
-      | 'ActiveDirectoryServicePrincipal'
-      | 'ActiveDirectoryDeviceCodeFlow'
-      | undefined
-
-    if (authenticationParam) {
-      const authLower = authenticationParam.toLowerCase()
-      if (authLower === 'activedirectoryintegrated') {
-        authMethod = 'ActiveDirectoryIntegrated'
-      } else if (authLower === 'activedirectorypassword') {
-        authMethod = 'ActiveDirectoryPassword'
-      } else if (authLower === 'activedirectoryserviceprincipal') {
-        authMethod = 'ActiveDirectoryServicePrincipal'
-      } else if (authLower === 'activedirectorydevicecodeflow') {
-        authMethod = 'ActiveDirectoryDeviceCodeFlow'
-      } else if (authLower === 'sql server authentication' || authLower === 'sqlserver') {
-        authMethod = 'SQL Server Authentication'
-      }
-    }
-
-    // Parse connection timeout (support spaced variants)
-    const connectionTimeoutStr = getParam(
-      'connectiontimeout',
-      'connection timeout',
-      'connecttimeout',
-      'connect timeout'
-    )
-    const connectionTimeout = connectionTimeoutStr ? parseInt(connectionTimeoutStr, 10) : undefined
-
-    // Parse request timeout (support spaced variants)
-    const requestTimeoutStr = getParam('requesttimeout', 'request timeout')
-    const requestTimeout = requestTimeoutStr ? parseInt(requestTimeoutStr, 10) : undefined
-
-    // Build MSSQL options
-    const mssqlOptions: import('@shared/index').MSSQLConnectionOptions = {}
-    if (authMethod) mssqlOptions.authentication = authMethod
-    if (encryptValue !== undefined) mssqlOptions.encrypt = encryptValue
-    if (trustServerCertificate !== undefined)
-      mssqlOptions.trustServerCertificate = trustServerCertificate
-    if (connectionTimeout !== undefined && !isNaN(connectionTimeout))
-      mssqlOptions.connectionTimeout = connectionTimeout
-    if (requestTimeout !== undefined && !isNaN(requestTimeout))
-      mssqlOptions.requestTimeout = requestTimeout
-
-    // Only include mssqlOptions if it has at least one property
-    const hasOptions = Object.keys(mssqlOptions).length > 0
-
-    return {
-      host,
-      port,
-      database,
-      user,
-      password,
-      ssl,
-      ...(hasOptions && { mssqlOptions })
-    }
-  } catch {
-    return null
-  }
-}
-
-function parseConnectionString(
-  connectionString: string,
-  dbType: DatabaseType
-): {
-  host: string
-  port: string
-  database: string
-  user: string
-  password: string
-  ssl: boolean
-  mssqlOptions?: import('@shared/index').MSSQLConnectionOptions
-} | null {
-  // MSSQL has special connection string format with semicolons
-  if (dbType === 'mssql') {
-    // Check if it's the semicolon-separated format
-    if (connectionString.includes(';') && connectionString.match(/^(mssql|sqlserver):\/\//i)) {
-      return parseMSSQLConnectionString(connectionString)
-    }
-  }
-
-  try {
-    const url = new URL(connectionString)
-    const protocol = url.protocol.replace(':', '').toLowerCase()
-
-    // Validate protocol matches db type (case-insensitive)
-    const validProtocols = DB_PROTOCOLS[dbType]
-    if (
-      validProtocols.length > 0 &&
-      !validProtocols.some((p) => protocol.startsWith(p.toLowerCase()))
-    ) {
-      return null
-    }
-
-    const defaults = DB_DEFAULTS[dbType]
-    const host = url.hostname || 'localhost'
-    const port = url.port || defaults.port
-    const database = url.pathname.replace(/^\//, '') || defaults.database
-    const user = url.username || defaults.user
-    const password = decodeURIComponent(url.password || '')
-
-    // Check for SSL in query params
-    const sslParam = url.searchParams.get('sslmode') || url.searchParams.get('ssl')
-    const ssl = sslParam ? !['disable', 'false', '0'].includes(sslParam.toLowerCase()) : false
-
-    return { host, port, database, user, password, ssl }
-  } catch {
-    return null
-  }
-}
-
 export function AddConnectionDialog({
   open,
   onOpenChange,
@@ -256,6 +44,8 @@ export function AddConnectionDialog({
 }: AddConnectionDialogProps) {
   const addConnection = useConnectionStore((s) => s.addConnection)
   const updateConnection = useConnectionStore((s) => s.updateConnection)
+  const setActiveConnection = useConnectionStore((s) => s.setActiveConnection)
+  const setConnectionStatus = useConnectionStore((s) => s.setConnectionStatus)
   const isEditMode = !!editConnection
 
   const [dbType, setDbType] = useState<DatabaseType>('postgresql')
@@ -270,14 +60,37 @@ export function AddConnectionDialog({
   const [user, setUser] = useState('postgres')
   const [password, setPassword] = useState('')
   const [ssl, setSsl] = useState(false)
+  const [ssh, setSsh] = useState(false)
+  const [showDatabasePassword, setShowDatabasePassword] = useState(false)
+
+  const handleDatabasePasswordToggle = () => {
+    setShowDatabasePassword(!showDatabasePassword)
+  }
+
+  const [sshConfig, setSshConfig] = useState<SSHConfig>({
+    host: '',
+    port: 22,
+    user: '',
+    authMethod: 'Password',
+    password: '',
+    privateKeyPath: '',
+    passphrase: ''
+  })
+
+  const [sslOptions, setSslOptions] = useState<SSLConnectionOptions>({
+    rejectUnauthorized: true
+  })
+
   const [mssqlOptions, setMssqlOptions] = useState<
     import('@shared/index').MSSQLConnectionOptions | undefined
   >(undefined)
+  const [mssqlAdvancedOpen, setMssqlAdvancedOpen] = useState(false)
 
   const [isTesting, setIsTesting] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [testResult, setTestResult] = useState<'success' | 'error' | null>(null)
   const [testError, setTestError] = useState<string | null>(null)
+  const testResultRef = useRef<HTMLDivElement>(null)
 
   // Populate form when editing
   useEffect(() => {
@@ -290,7 +103,34 @@ export function AddConnectionDialog({
       setUser(editConnection.user || '')
       setPassword(editConnection.password || '')
       setSsl(editConnection.ssl || false)
+      setSslOptions(editConnection.sslOptions || { rejectUnauthorized: true })
+      setSsh(editConnection.ssh || false)
       setMssqlOptions(editConnection.mssqlOptions)
+
+      if (editConnection.ssh && editConnection.sshConfig) {
+        setSshConfig({
+          host: editConnection.sshConfig.host || '',
+          port: editConnection.sshConfig.port || 22,
+          user: editConnection.sshConfig.user || '',
+          authMethod:
+            editConnection.sshConfig.authMethod ||
+            (editConnection.sshConfig.privateKeyPath ? 'Public Key' : 'Password'),
+          password: editConnection.sshConfig.password || '',
+          privateKeyPath: editConnection.sshConfig.privateKeyPath || '',
+          passphrase: editConnection.sshConfig.passphrase || ''
+        })
+      } else {
+        setSshConfig({
+          host: '',
+          port: 22,
+          user: '',
+          authMethod: 'Password',
+          password: '',
+          privateKeyPath: '',
+          passphrase: ''
+        })
+      }
+
       setInputMode('manual')
       setConnectionString('')
       setParseError(null)
@@ -315,6 +155,13 @@ export function AddConnectionDialog({
     // Clear MSSQL options when switching away from MSSQL
     if (newType !== 'mssql') {
       setMssqlOptions(undefined)
+    }
+    // SQLite doesn't support SSH/SSL, and doesn't use connection strings
+    if (newType === 'sqlite') {
+      setSsh(false)
+      setSsl(false)
+      setInputMode('manual')
+      setHost('')
     }
     // Clear connection string when switching types
     setConnectionString('')
@@ -370,6 +217,17 @@ export function AddConnectionDialog({
     setUser('postgres')
     setPassword('')
     setSsl(false)
+    setSslOptions({ rejectUnauthorized: true })
+    setSsh(false)
+    setSshConfig({
+      host: '',
+      port: 22,
+      user: '',
+      authMethod: 'Password',
+      password: '',
+      privateKeyPath: '',
+      passphrase: ''
+    })
     setMssqlOptions(undefined)
     setTestResult(null)
     setTestError(null)
@@ -385,16 +243,32 @@ export function AddConnectionDialog({
     const isActiveDirectoryIntegrated =
       dbType === 'mssql' && mssqlOptions?.authentication === 'ActiveDirectoryIntegrated'
 
+    const sshConfigForConnection = ssh
+      ? {
+          host: sshConfig.host,
+          port: sshConfig.port,
+          user: sshConfig.user,
+          authMethod: sshConfig.authMethod,
+          password: sshConfig.password,
+          privateKeyPath: sshConfig.privateKeyPath,
+          passphrase: sshConfig.passphrase
+        }
+      : undefined
+
     return {
       id: editConnection?.id || crypto.randomUUID(),
-      name: name || `${host}/${database}`,
+      name: name || (dbType === 'sqlite' ? database : `${host}/${database}`),
       host,
-      port: parseInt(port, 10),
+      port: parseInt(port, 10) || 0,
       database,
       user: isActiveDirectoryIntegrated ? undefined : user,
       password: isActiveDirectoryIntegrated ? undefined : password || undefined,
       ssl,
       dbType,
+      ssh,
+      dstPort: parseInt(port, 10) || 0,
+      sshConfig: sshConfigForConnection,
+      ...(ssl && { sslOptions }),
       ...(dbType === 'mssql' && mssqlOptions && { mssqlOptions })
     }
   }
@@ -414,9 +288,16 @@ export function AddConnectionDialog({
         setTestResult('error')
         setTestError(result.error || 'Connection failed')
       }
+      setTimeout(() => {
+        testResultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      }, 100)
     } catch (error) {
       setTestResult('error')
       setTestError(error instanceof Error ? error.message : 'Unknown error')
+
+      setTimeout(() => {
+        testResultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      }, 100)
     } finally {
       setIsTesting(false)
     }
@@ -439,6 +320,15 @@ export function AddConnectionDialog({
         if (result.success && result.data) {
           // Add to local store
           addConnection(result.data)
+
+          // Auto-switch to the new connection
+          const newConnectionId = result.data.id
+          setConnectionStatus(newConnectionId, { isConnecting: true, error: undefined })
+          setTimeout(() => {
+            setConnectionStatus(newConnectionId, { isConnecting: false, isConnected: true })
+            setActiveConnection(newConnectionId)
+          }, 500)
+
           handleClose()
         } else {
           setTestResult('error')
@@ -448,6 +338,10 @@ export function AddConnectionDialog({
     } catch (error) {
       setTestResult('error')
       setTestError(error instanceof Error ? error.message : 'Unknown error')
+
+      setTimeout(() => {
+        testResultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      }, 100)
     } finally {
       setIsSaving(false)
     }
@@ -457,19 +351,40 @@ export function AddConnectionDialog({
   const isUserRequired =
     dbType !== 'mssql' || mssqlOptions?.authentication !== 'ActiveDirectoryIntegrated'
 
+  const isSSHValid = () => {
+    if (!ssh) return true
+
+    const hasBasicSSH = sshConfig.host && sshConfig.port && sshConfig.user
+    if (!hasBasicSSH) return false
+
+    if (sshConfig.authMethod === 'Password') {
+      return !!sshConfig.password
+    } else {
+      return !!sshConfig.privateKeyPath
+    }
+  }
+
+  const isSqliteValid = () => {
+    // Local SQLite only needs the database path
+    return !!database
+  }
+
   const isValid =
-    inputMode === 'connection-string'
-      ? connectionString &&
-        !parseError &&
-        host &&
-        port &&
-        database &&
-        (isUserRequired ? user : true)
-      : host && port && database && (isUserRequired ? user : true)
+    dbType === 'sqlite'
+      ? isSqliteValid()
+      : inputMode === 'connection-string'
+        ? connectionString &&
+          !parseError &&
+          host &&
+          port &&
+          database &&
+          (isUserRequired ? user : true) &&
+          isSSHValid()
+        : host && port && database && (isUserRequired ? user : true) && isSSHValid()
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="sm:max-w-md flex flex-col">
+      <SheetContent className="sm:max-w-lg flex flex-col">
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2">
             <Database className="size-5" />
@@ -486,11 +401,11 @@ export function AddConnectionDialog({
           {/* Database Type Selector */}
           <div className="flex flex-col gap-2">
             <label className="text-sm font-medium">Database Type</label>
-            <div className="flex rounded-lg border bg-muted p-1">
+            <div className="grid grid-cols-4 rounded-lg border bg-muted p-1">
               <button
                 type="button"
                 onClick={() => handleDbTypeChange('postgresql')}
-                className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
                   dbType === 'postgresql'
                     ? 'bg-background text-foreground shadow-sm'
                     : 'text-muted-foreground hover:text-foreground'
@@ -502,7 +417,7 @@ export function AddConnectionDialog({
               <button
                 type="button"
                 onClick={() => handleDbTypeChange('mysql')}
-                className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
                   dbType === 'mysql'
                     ? 'bg-background text-foreground shadow-sm'
                     : 'text-muted-foreground hover:text-foreground'
@@ -513,8 +428,20 @@ export function AddConnectionDialog({
               </button>
               <button
                 type="button"
+                onClick={() => handleDbTypeChange('sqlite')}
+                className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
+                  dbType === 'sqlite'
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <SQLiteIcon className="size-4" />
+                SQLite
+              </button>
+              <button
+                type="button"
                 onClick={() => handleDbTypeChange('mssql')}
-                className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
                   dbType === 'mssql'
                     ? 'bg-background text-foreground shadow-sm'
                     : 'text-muted-foreground hover:text-foreground'
@@ -526,33 +453,35 @@ export function AddConnectionDialog({
             </div>
           </div>
 
-          {/* Input Mode Toggle */}
-          <div className="flex rounded-lg border bg-muted p-1">
-            <button
-              type="button"
-              onClick={() => setInputMode('manual')}
-              className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
-                inputMode === 'manual'
-                  ? 'bg-background text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              <Settings2 className="size-4" />
-              Manual
-            </button>
-            <button
-              type="button"
-              onClick={() => setInputMode('connection-string')}
-              className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
-                inputMode === 'connection-string'
-                  ? 'bg-background text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              <Link className="size-4" />
-              Connection String
-            </button>
-          </div>
+          {/* Input Mode Toggle - hidden for SQLite */}
+          {dbType !== 'sqlite' && (
+            <div className="flex rounded-lg border bg-muted p-1">
+              <button
+                type="button"
+                onClick={() => setInputMode('manual')}
+                className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                  inputMode === 'manual'
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <Settings2 className="size-4" />
+                Manual
+              </button>
+              <button
+                type="button"
+                onClick={() => setInputMode('connection-string')}
+                className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                  inputMode === 'connection-string'
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <Link className="size-4" />
+                Connection String
+              </button>
+            </div>
+          )}
 
           <div className="flex flex-col gap-2">
             <label htmlFor="name" className="text-sm font-medium">
@@ -569,7 +498,51 @@ export function AddConnectionDialog({
             </p>
           </div>
 
-          {inputMode === 'connection-string' ? (
+          {/* SQLite-specific form */}
+          {dbType === 'sqlite' ? (
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-2">
+                <label htmlFor="database" className="text-sm font-medium">
+                  Database File Path
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    id="database"
+                    placeholder="/path/to/database.db or :memory:"
+                    value={database}
+                    onChange={(e) => setDatabase(e.target.value)}
+                    className="font-mono text-sm flex-1"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    onClick={async () => {
+                      const filePath = await window.api.files.openFilePicker()
+                      if (filePath) {
+                        setDatabase(filePath)
+                      }
+                    }}
+                    title="Browse for SQLite database file"
+                  >
+                    <FolderOpen className="size-4" />
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Enter the path to your SQLite database file, or use :memory: for an in-memory
+                  database.
+                </p>
+              </div>
+              <div className="rounded-md bg-muted/50 border border-border/50 px-3 py-2">
+                <p className="text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground">
+                    Turso / libSQL support coming soon.
+                  </span>{' '}
+                  We&apos;re working on resolving some native module issues.
+                </p>
+              </div>
+            </div>
+          ) : inputMode === 'connection-string' ? (
             <div className="flex flex-col gap-2">
               <label htmlFor="connection-string" className="text-sm font-medium">
                 Connection String
@@ -684,32 +657,173 @@ export function AddConnectionDialog({
                 <label htmlFor="password" className="text-sm font-medium">
                   Password
                 </label>
-                <Input
-                  id="password"
-                  type="password"
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="password"
+                    type={showDatabasePassword ? 'text' : 'password'}
+                    placeholder="••••••••"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleDatabasePasswordToggle}
+                    className="px-3"
+                    title={showDatabasePassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showDatabasePassword ? <EyeOff /> : <Eye />}
+                  </Button>
+                </div>
               </div>
 
-              <div className="flex items-center gap-2">
-                <input
-                  id="ssl"
-                  type="checkbox"
-                  checked={ssl}
-                  onChange={(e) => setSsl(e.target.checked)}
-                  className="size-4 rounded border-input"
-                />
-                <label htmlFor="ssl" className="text-sm font-medium">
-                  Use SSL
-                </label>
+              <div className="flex flex-col gap-3">
+                <div className="flex space-x-4">
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="ssl"
+                      type="checkbox"
+                      checked={ssl}
+                      onChange={(e) => setSsl(e.target.checked)}
+                      className="size-4 rounded border-input"
+                    />
+                    <label htmlFor="ssl" className="text-sm font-medium">
+                      Use SSL
+                    </label>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="ssh"
+                      type="checkbox"
+                      checked={ssh}
+                      onChange={() => setSsh(!ssh)}
+                      className="size-4 rounded border-input"
+                    />
+                    <label htmlFor="ssh" className="text-sm font-medium">
+                      Use SSH
+                    </label>
+                  </div>
+                </div>
+
+                {ssl && dbType !== 'mssql' && (
+                  <div className="ml-6 flex flex-col gap-3 rounded-md border bg-muted/30 p-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          id="sslRejectUnauthorized"
+                          type="checkbox"
+                          checked={sslOptions.rejectUnauthorized !== false}
+                          onChange={(e) =>
+                            setSslOptions((prev) => ({
+                              ...prev,
+                              rejectUnauthorized: e.target.checked
+                            }))
+                          }
+                          className="size-4 rounded border-input"
+                        />
+                        <label htmlFor="sslRejectUnauthorized" className="text-sm font-medium">
+                          Verify server certificate
+                        </label>
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Disable this for AWS RDS, Azure, or other cloud databases where certificate
+                        verification fails.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label htmlFor="sslCaPath" className="text-sm font-medium">
+                        CA Certificate Path (optional)
+                      </label>
+                      <Input
+                        id="sslCaPath"
+                        type="text"
+                        value={sslOptions.ca || ''}
+                        onChange={(e) =>
+                          setSslOptions((prev) => ({
+                            ...prev,
+                            ca: e.target.value || undefined
+                          }))
+                        }
+                        placeholder="/path/to/ca-certificate.pem"
+                        className="mt-1"
+                      />
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Path to a CA certificate file for servers with private CA certificates.
+                      </p>
+                    </div>
+                  </div>
+                )}
               </div>
+
+              {/* MSSQL Advanced Options */}
+              {dbType === 'mssql' && (
+                <Collapsible open={mssqlAdvancedOpen} onOpenChange={setMssqlAdvancedOpen}>
+                  <CollapsibleTrigger asChild>
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm font-medium hover:bg-muted transition-colors"
+                    >
+                      <span>Advanced Options</span>
+                      <ChevronDown
+                        className={`size-4 transition-transform ${mssqlAdvancedOpen ? 'rotate-180' : ''}`}
+                      />
+                    </button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-3 space-y-4">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="encrypt"
+                        type="checkbox"
+                        checked={mssqlOptions?.encrypt ?? false}
+                        onChange={(e) =>
+                          setMssqlOptions((prev) => ({
+                            ...prev,
+                            encrypt: e.target.checked
+                          }))
+                        }
+                        className="size-4 rounded border-input"
+                      />
+                      <label htmlFor="encrypt" className="text-sm font-medium">
+                        Encrypt Connection
+                      </label>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="trustServerCertificate"
+                        type="checkbox"
+                        checked={mssqlOptions?.trustServerCertificate ?? true}
+                        onChange={(e) =>
+                          setMssqlOptions((prev) => ({
+                            ...prev,
+                            trustServerCertificate: e.target.checked
+                          }))
+                        }
+                        className="size-4 rounded border-input"
+                      />
+                      <label htmlFor="trustServerCertificate" className="text-sm font-medium">
+                        Trust Server Certificate
+                      </label>
+                    </div>
+
+                    <p className="text-xs text-muted-foreground">
+                      Query timeout can be configured in Settings → Database.
+                    </p>
+                  </CollapsibleContent>
+                </Collapsible>
+              )}
             </>
+          )}
+
+          {ssh && dbType !== 'sqlite' && (
+            <SSHConfigSection config={sshConfig} onConfigChange={setSshConfig} />
           )}
 
           {testResult && (
             <div
+              ref={testResultRef}
               className={`flex items-center gap-2 rounded-md p-3 text-sm ${
                 testResult === 'success'
                   ? 'bg-green-500/10 text-green-500'

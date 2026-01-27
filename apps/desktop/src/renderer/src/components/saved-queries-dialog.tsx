@@ -1,5 +1,3 @@
-'use client'
-
 import { useState, useMemo, useEffect, useCallback } from 'react'
 import {
   Bookmark,
@@ -119,8 +117,8 @@ export function SavedQueriesDialog({ open, onOpenChange, onEditQuery }: SavedQue
   }, [open, isInitialized, initializeSavedQueries])
 
   // Get available folders and tags
-  const folders = useMemo(() => getFolders(), [getFolders, savedQueries])
-  const tags = useMemo(() => getTags(), [getTags, savedQueries])
+  const folders = useMemo(() => getFolders(), [getFolders])
+  const tags = useMemo(() => getTags(), [getTags])
 
   // Filter and sort queries
   const filteredQueries = useMemo(() => {

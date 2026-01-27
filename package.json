@@ -1,6 +1,6 @@
 {
   "name": "data-peek",
-  "version": "0.3.0",
+  "version": "0.14.0",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -37,12 +37,14 @@
   "packageManager": "pnpm@10.22.0",
   "pnpm": {
     "onlyBuiltDependencies": [
-      "electron",
+      "@clerk/shared",
       "better-sqlite3",
+      "core-js",
+      "cpu-features",
+      "electron",
       "esbuild",
       "sharp",
-      "@clerk/shared",
-      "core-js",
+      "ssh2",
       "unrs-resolver"
     ]
   }

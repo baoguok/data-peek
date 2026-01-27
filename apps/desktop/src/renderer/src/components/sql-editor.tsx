@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import Editor, { loader, type Monaco, type OnMount } from '@monaco-editor/react'
 import * as monaco from 'monaco-editor'
@@ -7,7 +5,8 @@ import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
 import { formatSQL } from '@/lib/sql-formatter'
 import { cn } from '@/lib/utils'
 import { useTheme } from '@/components/theme-provider'
-import type { SchemaInfo } from '@data-peek/shared'
+import type { SchemaInfo, Snippet, TableInfo } from '@data-peek/shared'
+import { SQL_KEYWORDS } from '@/constants/sql-keywords'
 
 // Configure Monaco workers for Vite + Electron (avoids CSP issues)
 self.MonacoEnvironment = {
@@ -20,99 +19,6 @@ self.MonacoEnvironment = {
 loader.config({ monaco })
 
 type EditorType = monaco.editor.IStandaloneCodeEditor
-
-// SQL Keywords for autocomplete
-const SQL_KEYWORDS = [
-  'SELECT',
-  'FROM',
-  'WHERE',
-  'AND',
-  'OR',
-  'NOT',
-  'IN',
-  'LIKE',
-  'BETWEEN',
-  'IS',
-  'NULL',
-  'TRUE',
-  'FALSE',
-  'AS',
-  'ON',
-  'JOIN',
-  'LEFT',
-  'RIGHT',
-  'INNER',
-  'OUTER',
-  'FULL',
-  'CROSS',
-  'NATURAL',
-  'USING',
-  'ORDER',
-  'BY',
-  'ASC',
-  'DESC',
-  'NULLS',
-  'FIRST',
-  'LAST',
-  'GROUP',
-  'HAVING',
-  'LIMIT',
-  'OFFSET',
-  'UNION',
-  'ALL',
-  'INTERSECT',
-  'EXCEPT',
-  'DISTINCT',
-  'CASE',
-  'WHEN',
-  'THEN',
-  'ELSE',
-  'END',
-  'CAST',
-  'INSERT',
-  'INTO',
-  'VALUES',
-  'UPDATE',
-  'SET',
-  'DELETE',
-  'CREATE',
-  'TABLE',
-  'INDEX',
-  'VIEW',
-  'DROP',
-  'ALTER',
-  'ADD',
-  'COLUMN',
-  'PRIMARY',
-  'KEY',
-  'FOREIGN',
-  'REFERENCES',
-  'CONSTRAINT',
-  'UNIQUE',
-  'CHECK',
-  'DEFAULT',
-  'CASCADE',
-  'RESTRICT',
-  'TRUNCATE',
-  'EXISTS',
-  'WITH',
-  'RECURSIVE',
-  'RETURNING',
-  'EXPLAIN',
-  'ANALYZE',
-  'VACUUM',
-  'BEGIN',
-  'COMMIT',
-  'ROLLBACK',
-  'TRANSACTION',
-  'SAVEPOINT',
-  'RELEASE',
-  'TEMPORARY',
-  'TEMP',
-  'IF',
-  'REPLACE',
-  'IGNORE'
-]
 
 // SQL Functions for autocomplete
 const SQL_FUNCTIONS = [
@@ -216,12 +122,118 @@ const SQL_TYPES = [
   'UUID'
 ]
 
-// Register SQL completion provider - returns disposable for cleanup
-const registerSQLCompletionProvider = (
-  monacoInstance: Monaco,
-  schemas: SchemaInfo[] = []
-): monaco.IDisposable => {
-  return monacoInstance.languages.registerCompletionItemProvider('sql', {
+// Singleton state for the completion provider
+// This prevents duplicate suggestions when multiple editor instances exist
+let globalCompletionProvider: monaco.IDisposable | null = null
+let currentSchemas: SchemaInfo[] = []
+let currentSnippets: Snippet[] = []
+
+// Update schemas for the global completion provider
+const updateCompletionSchemas = (schemas: SchemaInfo[]) => {
+  currentSchemas = schemas
+}
+
+// Update snippets for the global completion provider
+const updateCompletionSnippets = (snippets: Snippet[]) => {
+  currentSnippets = snippets
+}
+
+// SQL reserved keywords that should not be treated as table aliases
+const SQL_RESERVED_KEYWORDS = new Set([
+  'on',
+  'where',
+  'and',
+  'or',
+  'not',
+  'in',
+  'is',
+  'null',
+  'like',
+  'between',
+  'exists',
+  'case',
+  'when',
+  'then',
+  'else',
+  'end',
+  'left',
+  'right',
+  'inner',
+  'outer',
+  'full',
+  'cross',
+  'join',
+  'natural',
+  'using',
+  'order',
+  'group',
+  'by',
+  'having',
+  'limit',
+  'offset',
+  'union',
+  'intersect',
+  'except',
+  'all',
+  'distinct',
+  'as',
+  'set',
+  'values',
+  'into',
+  'returning',
+  'with',
+  'recursive'
+])
+
+/**
+ * Extract table aliases from SQL query text
+ * Parses FROM and JOIN clauses to build a map of alias -> table name
+ * Note: Does not support quoted identifiers (e.g., "schema"."table")
+ * @param queryText - The full SQL query text
+ * @returns Map of alias (lowercase) to table name (with schema if present)
+ */
+const extractTableAliases = (queryText: string): Map<string, string> => {
+  const aliases = new Map<string, string>()
+
+  // Normalize whitespace for matching
+  const normalized = queryText.replace(/\s+/g, ' ').trim()
+
+  // Pattern to match: FROM/JOIN [schema.]table [AS] alias
+  // Handles:
+  // - FROM table_name alias
+  // - FROM table_name AS alias
+  // - FROM schema.table_name alias
+  // - FROM schema.table_name AS alias
+  // - JOIN table_name alias
+  // - JOIN table_name AS alias
+  // - JOIN schema.table_name alias
+  // - JOIN schema.table_name AS alias
+  // Also handles LEFT/RIGHT/INNER/OUTER/FULL/CROSS JOIN variants
+  const fromJoinPattern =
+    /\b(?:FROM|JOIN|LEFT\s+(?:OUTER\s+)?JOIN|RIGHT\s+(?:OUTER\s+)?JOIN|INNER\s+JOIN|FULL\s+(?:OUTER\s+)?JOIN|CROSS\s+JOIN)\s+([\w.]+)\s+(?:AS\s+)?(\w+)\b/gi
+
+  let match: string[] | null
+  while ((match = fromJoinPattern.exec(normalized)) !== null) {
+    const tableRef = match[1]
+    const alias = match[2].toLowerCase()
+
+    // Only add if alias is a valid identifier and not a SQL keyword
+    if (alias && /^[a-zA-Z_]\w*$/.test(alias) && !SQL_RESERVED_KEYWORDS.has(alias)) {
+      aliases.set(alias, tableRef)
+    }
+  }
+
+  return aliases
+}
+
+// Register SQL completion provider once globally
+const ensureCompletionProvider = (monacoInstance: Monaco): void => {
+  // Only register once
+  if (globalCompletionProvider) {
+    return
+  }
+
+  globalCompletionProvider = monacoInstance.languages.registerCompletionItemProvider('sql', {
     triggerCharacters: [' ', '.', '(', ','],
     provideCompletionItems: (model, position) => {
       const word = model.getWordUntilPosition(position)
@@ -244,7 +256,9 @@ const registerSQLCompletionProvider = (
         const tableOrSchemaName = dotMatch[1].toLowerCase()
 
         // Check if it's a schema name - suggest tables
-        const matchingSchema = schemas.find((s) => s.name.toLowerCase() === tableOrSchemaName)
+        const matchingSchema = currentSchemas.find(
+          (s) => s.name.toLowerCase() === tableOrSchemaName
+        )
         if (matchingSchema) {
           matchingSchema.tables.forEach((table) => {
             suggestions.push({
@@ -264,7 +278,7 @@ const registerSQLCompletionProvider = (
         }
 
         // Check if it's a table name - suggest columns
-        for (const schema of schemas) {
+        for (const schema of currentSchemas) {
           const matchingTable = schema.tables.find(
             (t) => t.name.toLowerCase() === tableOrSchemaName
           )
@@ -282,6 +296,54 @@ const registerSQLCompletionProvider = (
               })
             })
             return { suggestions }
+          }
+        }
+
+        // Check if it's a table alias - extract aliases from the full query
+        const fullQueryText = model.getValue()
+        const aliases = extractTableAliases(fullQueryText)
+
+        if (aliases.has(tableOrSchemaName)) {
+          const tableRef = aliases.get(tableOrSchemaName)!
+          // Extract table name (remove schema prefix if present)
+          const tableNameParts = tableRef.split('.')
+          const tableName = tableNameParts[tableNameParts.length - 1].toLowerCase()
+          const schemaName = tableNameParts.length > 1 ? tableNameParts[0].toLowerCase() : null
+
+          // Helper to build column suggestions for a matched table
+          const buildColumnSuggestions = (
+            table: TableInfo,
+            displayPath: string
+          ): monaco.languages.CompletionItem[] => {
+            return table.columns.map((column) => {
+              const pkIndicator = column.isPrimaryKey ? ' 🔑' : ''
+              return {
+                label: column.name,
+                kind: monacoInstance.languages.CompletionItemKind.Field,
+                insertText: column.name,
+                range,
+                detail: `${column.dataType}${column.isNullable ? '' : ' NOT NULL'}${pkIndicator}`,
+                documentation: `Column in ${displayPath} (via alias ${tableOrSchemaName})\nType: ${column.dataType}\nNullable: ${column.isNullable}\nPrimary Key: ${column.isPrimaryKey}`,
+                sortText: String(column.ordinalPosition).padStart(3, '0')
+              }
+            })
+          }
+
+          // Search for the table - prioritize schema-qualified match if schema was specified
+          for (const schema of currentSchemas) {
+            // If schema was specified in the alias reference, only match that schema
+            if (schemaName && schema.name.toLowerCase() !== schemaName) {
+              continue
+            }
+
+            const matchingTable = schema.tables.find((t) => t.name.toLowerCase() === tableName)
+            if (matchingTable) {
+              const displayPath = schemaName
+                ? `${schema.name}.${matchingTable.name}`
+                : matchingTable.name
+              suggestions.push(...buildColumnSuggestions(matchingTable, displayPath))
+              return { suggestions }
+            }
           }
         }
       }
@@ -324,8 +386,28 @@ const registerSQLCompletionProvider = (
         })
       })
 
+      // Add snippets
+      currentSnippets.forEach((snippet) => {
+        const label = snippet.triggerPrefix
+          ? `${snippet.triggerPrefix} - ${snippet.name}`
+          : snippet.name
+        suggestions.push({
+          label,
+          kind: monacoInstance.languages.CompletionItemKind.Snippet,
+          insertText: snippet.template,
+          insertTextRules: monacoInstance.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+          detail: `Snippet: ${snippet.category}`,
+          documentation: snippet.description,
+          sortText: '4' + (snippet.triggerPrefix || snippet.name),
+          filterText: snippet.triggerPrefix
+            ? `${snippet.triggerPrefix} ${snippet.name}`
+            : snippet.name
+        })
+      })
+
       // Add schema names
-      schemas.forEach((schema) => {
+      currentSchemas.forEach((schema) => {
         suggestions.push({
           label: schema.name,
           kind: monacoInstance.languages.CompletionItemKind.Module,
@@ -337,7 +419,7 @@ const registerSQLCompletionProvider = (
       })
 
       // Add table names (with schema prefix for non-public)
-      schemas.forEach((schema) => {
+      currentSchemas.forEach((schema) => {
         schema.tables.forEach((table) => {
           const isPublic = schema.name === 'public'
           const insertText = isPublic ? table.name : `${schema.name}.${table.name}`
@@ -381,6 +463,8 @@ export interface SQLEditorProps {
   compact?: boolean
   /** Database schemas for autocomplete (tables, columns) */
   schemas?: SchemaInfo[]
+  /** SQL snippets for autocomplete */
+  snippets?: Snippet[]
 }
 
 // Custom dark theme inspired by the app's aesthetic
@@ -471,12 +555,16 @@ export function SQLEditor({
   className,
   placeholder = 'SELECT * FROM your_table LIMIT 100;',
   compact = false,
-  schemas = []
+  schemas = [],
+  snippets = []
 }: SQLEditorProps) {
   const { theme } = useTheme()
   const editorRef = React.useRef<EditorType | null>(null)
   const monacoRef = React.useRef<Monaco | null>(null)
-  const completionProviderRef = React.useRef<monaco.IDisposable | null>(null)
+
+  // Use refs to always hold the latest callbacks to avoid stale closures
+  const onRunRef = React.useRef(onRun)
+  const onFormatRef = React.useRef(onFormat)
 
   // Resolve system theme
   const resolvedTheme = React.useMemo(() => {
@@ -486,6 +574,15 @@ export function SQLEditor({
     return theme
   }, [theme])
 
+  // Keep refs updated when callbacks change
+  React.useEffect(() => {
+    onRunRef.current = onRun
+  }, [onRun])
+
+  React.useEffect(() => {
+    onFormatRef.current = onFormat
+  }, [onFormat])
+
   const handleEditorDidMount: OnMount = (editor, monaco) => {
     editorRef.current = editor
     monacoRef.current = monaco
@@ -493,21 +590,24 @@ export function SQLEditor({
     // Define custom themes
     defineCustomTheme(monaco)
 
-    // Register SQL autocomplete provider with initial schemas
-    completionProviderRef.current = registerSQLCompletionProvider(monaco, schemas)
+    // Register SQL autocomplete provider (singleton - only registers once globally)
+    updateCompletionSchemas(schemas)
+    updateCompletionSnippets(snippets)
+    ensureCompletionProvider(monaco)
 
     // Set the theme based on current app theme
     const editorTheme = resolvedTheme === 'dark' ? 'data-peek-dark' : 'data-peek-light'
     monaco.editor.setTheme(editorTheme)
 
     // Add keyboard shortcuts
+    // Use refs to avoid stale closures - callbacks may change but Monaco commands are registered once
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-      onRun?.()
+      onRunRef.current?.()
     })
 
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyF, () => {
-      if (onFormat) {
-        onFormat()
+      if (onFormatRef.current) {
+        onFormatRef.current()
       } else {
         // Format in place
         const currentValue = editor.getValue()
@@ -554,7 +654,7 @@ export function SQLEditor({
       suggestOnTriggerCharacters: true,
       acceptSuggestionOnEnter: 'on',
       tabCompletion: 'on',
-      wordBasedSuggestions: 'currentDocument',
+      wordBasedSuggestions: 'off',
       bracketPairColorization: {
         enabled: true
       }
@@ -574,24 +674,15 @@ export function SQLEditor({
     }
   }, [resolvedTheme])
 
-  // Re-register completion provider when schemas change
+  // Update completion schemas when they change
   React.useEffect(() => {
-    if (monacoRef.current) {
-      // Dispose previous provider
-      if (completionProviderRef.current) {
-        completionProviderRef.current.dispose()
-      }
-      // Register new provider with updated schemas
-      completionProviderRef.current = registerSQLCompletionProvider(monacoRef.current, schemas)
-    }
-
-    // Cleanup on unmount
-    return () => {
-      if (completionProviderRef.current) {
-        completionProviderRef.current.dispose()
-      }
-    }
+    updateCompletionSchemas(schemas)
   }, [schemas])
+
+  // Update completion snippets when they change
+  React.useEffect(() => {
+    updateCompletionSnippets(snippets)
+  }, [snippets])
 
   const handleChange = (newValue: string | undefined) => {
     onChange?.(newValue ?? '')
