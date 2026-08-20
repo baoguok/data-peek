@@ -27,7 +27,32 @@ export default defineConfig(
       ...eslintPluginReactHooks.configs.recommended.rules,
       ...eslintPluginReactRefresh.configs.vite.rules,
       '@typescript-eslint/explicit-function-return-type': 'off',
-      'react-refresh/only-export-components': 'off'
+      'react-refresh/only-export-components': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+          destructuredArrayIgnorePattern: '^_'
+        }
+      ]
+    }
+  },
+  {
+    // Playwright fixtures use `async ({}, use) => {}` — the empty destructure
+    // and the `use` callback are framework idioms, not React hooks.
+    files: ['tests/e2e/**/*.{ts,tsx}', 'tests/capture/**/*.{ts,tsx}'],
+    rules: {
+      'react-hooks/rules-of-hooks': 'off',
+      'no-empty-pattern': 'off'
+    }
+  },
+  {
+    // Ambient declaration files legitimately use triple-slash references.
+    files: ['**/*.d.ts'],
+    rules: {
+      '@typescript-eslint/triple-slash-reference': 'off'
     }
   },
   eslintConfigPrettier

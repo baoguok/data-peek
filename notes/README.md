@@ -1,13 +1,48 @@
-# data-peek Notes
+# data-peek Notes & Blog Posts
 
-Technical notes and implementation details that could become blog posts.
+This folder is the single source of truth for technical notes and blog posts. Files with `published: true` in frontmatter are automatically served on the website's blog.
 
-## Contents
+## Published Posts
 
-| File | Topic | Blog-Ready |
-|------|-------|------------|
-| [ai-implementation.md](./ai-implementation.md) | Building the AI SQL Assistant | Yes |
-| [ai-deep-dive.md](./ai-deep-dive.md) | Technical deep dive into components | Yes |
+| File                                                                                             | Topic                                                               |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| [building-ai-sql-assistant.mdx](./building-ai-sql-assistant.mdx)                                 | Building the AI SQL Assistant                                       |
+| [ai-assistant-deep-dive.mdx](./ai-assistant-deep-dive.mdx)                                       | Technical deep dive into AI components                              |
+| [query-performance-analyzer.mdx](./query-performance-analyzer.mdx)                               | Query Performance Analyzer with EXPLAIN                             |
+| [connection-health-monitor-in-a-sql-client.mdx](./connection-health-monitor-in-a-sql-client.mdx) | pg_stat_activity dashboard with one-click kill                      |
+| [blurring-pii-in-your-sql-client.mdx](./blurring-pii-in-your-sql-client.mdx)                     | Data masking toolbar for screen-shares and demos                    |
+| [listen-notify-without-tears.mdx](./listen-notify-without-tears.mdx)                             | Postgres LISTEN/NOTIFY debugger with SQLite history                 |
+| [benchmark-mode-p50-p90-p99.mdx](./benchmark-mode-p50-p90-p99.mdx)                               | Benchmark mode with p90/p95/p99 percentiles                         |
+| [fk-aware-fake-data-generator.mdx](./fk-aware-fake-data-generator.mdx)                           | FK-aware fake data generator with Faker.js                          |
+| [smart-sort-bar.mdx](./smart-sort-bar.mdx)                                                       | Multi-column chip-based sorting with type-aware modes               |
+| [multi-statement-step-through.mdx](./multi-statement-step-through.mdx)                           | Step-through debugging for multi-statement SQL scripts              |
+| [schema-intel-diagnostics.mdx](./schema-intel-diagnostics.mdx)                                   | One-click schema diagnostics for Postgres / MySQL / MSSQL           |
+| [ssl-defaults-for-cloud-dbs.mdx](./ssl-defaults-for-cloud-dbs.mdx)                               | v0.21.3 — opt-in strict cert verification for cloud DBs             |
+| [end-to-end-testing-an-electron-sql-client.mdx](./end-to-end-testing-an-electron-sql-client.mdx) | From 4 to 25 e2e tests with Playwright + Electron                   |
+| [v0.22.0-hardened-edges.mdx](./v0.22.0-hardened-edges.mdx)                                       | v0.22.0 release notes — silent-corruption hunt, lifecycle hardening |
+
+## Creating a New Post
+
+1. Create a new `.mdx` file in this folder
+2. Add frontmatter at the top:
+
+```yaml
+---
+title: "Your Post Title"
+description: "Brief description for SEO and previews"
+date: "YYYY-MM-DD"
+author: "Rohith Gilla"
+tags: ["Tag1", "Tag2"]
+published: true # Set to false to keep as draft
+---
+```
+
+3. Write your content in MDX (Markdown + JSX)
+4. The post will appear on `/blog` when `published: true`
+
+## Draft Posts
+
+Set `published: false` in frontmatter to keep a post as a draft. It won't appear on the blog until you change it to `true`.
 
 ## Future Topics
 
@@ -16,11 +51,3 @@ Technical notes and implementation details that could become blog posts.
 - [ ] Building a table designer with DDL generation
 - [ ] Monaco editor integration tips
 - [ ] ERD visualization with React Flow
-
-## Publishing
-
-These notes are written in a style that can be published as blog posts with minimal editing. Each file:
-- Has a compelling hook/intro
-- Includes code examples
-- Explains the "why" not just the "how"
-- Ends with lessons learned or next steps

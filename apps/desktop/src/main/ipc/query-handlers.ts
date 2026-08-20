@@ -1,0 +1,690 @@
+import { ipcMain } from 'electron'
+import type {
+  ConnectionConfig,
+  EditBatch,
+  EditResult,
+  QueryTelemetry,
+  BenchmarkResult,
+  PerformanceAnalysisConfig,
+  QueryHistoryItemForAnalysis
+} from '@shared/index'
+import { getAdapter } from '../db-adapter'
+import { cancelQuery } from '../query-tracker'
+import { buildQuery, validateOperation, buildPreviewSql } from '../sql-builder'
+import {
+  getCachedSchema,
+  isCacheValid,
+  getOrFetchCachedSchema,
+  invalidateSchemaCache,
+  type CachedSchema
+} from '../schema-cache'
+import { createLogger } from '../lib/logger'
+import { annotateSslError } from '../lib/ssl-error'
+import { telemetryCollector } from '../telemetry-collector'
+import { analyzeQueryPerformance } from '../performance-analyzer'
+import { recordAudit } from '../audit-service'
+
+const log = createLogger('query-handlers')
+
+// Record a manual-transaction boundary (BEGIN/COMMIT/ROLLBACK) in the audit log.
+// Without this a rolled-back write is indistinguishable in the trail from a
+// committed one — the per-statement entries look identical either way, so the
+// outcome events are what make the tamper-evident log forensically complete.
+function recordTxBoundary(
+  config: ConnectionConfig,
+  boundary: 'BEGIN' | 'COMMIT' | 'ROLLBACK',
+  success: boolean,
+  error?: string
+): void {
+  recordAudit({
+    source: 'editor',
+    connectionId: config.id ?? 'unsaved',
+    connectionName: config.name ?? config.database,
+    dbType: config.dbType || 'postgresql',
+    sql: boundary,
+    rowCount: null,
+    success,
+    ...(error ? { error } : {})
+  })
+}
+
+/**
+ * Register database query and schema handlers
+ */
+export function registerQueryHandlers(): void {
+  // Connect to database (test connection)
+  ipcMain.handle('db:connect', async (_, config: ConnectionConfig) => {
+    try {
+      const adapter = getAdapter(config)
+      await adapter.connect(config)
+      return { success: true }
+    } catch (error: unknown) {
+      const errorMessage = annotateSslError(error).message
+      return { success: false, error: errorMessage }
+    }
+  })
+
+  // Execute a query
+  ipcMain.handle(
+    'db:query',
+    async (
+      _,
+      {
+        config,
+        query,
+        executionId,
+        queryTimeoutMs,
+        sessionId
+      }: {
+        config: ConnectionConfig
+        query: string
+        executionId?: string
+        queryTimeoutMs?: number
+        sessionId?: string
+      }
+    ) => {
+      log.debug('Received query request', { ...config, password: '***' })
+      log.debug('Query:', query)
+      log.debug('Execution ID:', executionId)
+      log.debug('Query timeout:', queryTimeoutMs)
+      log.debug('Session ID:', sessionId)
+
+      try {
+        const adapter = getAdapter(config)
+        log.debug('Connecting...')
+
+        // Use queryMultiple to support multiple statements
+        // Pass executionId for cancellation support, queryTimeoutMs for timeout, and sessionId for transactions
+        const multiResult = await adapter.queryMultiple(config, query, {
+          executionId,
+          queryTimeoutMs,
+          sessionId
+        })
+
+        log.debug('Query completed in', multiResult.totalDurationMs, 'ms')
+        log.debug('Statement count:', multiResult.results.length)
+
+        const legacyRowCount =
+          multiResult.results.find((r) => r.isDataReturning)?.rowCount ??
+          multiResult.results[0]?.rowCount ??
+          0
+
+        recordAudit({
+          source: 'editor',
+          connectionId: config.id ?? 'unsaved',
+          connectionName: config.name ?? config.database,
+          dbType: config.dbType || 'postgresql',
+          sql: query,
+          rowCount: legacyRowCount,
+          success: true,
+          durationMs: multiResult.totalDurationMs
+        })
+
+        return {
+          success: true,
+          data: {
+            // Return multi-statement results
+            results: multiResult.results,
+            totalDurationMs: multiResult.totalDurationMs,
+            statementCount: multiResult.results.length,
+            // Also include legacy single-result format for backward compatibility
+            // (uses first data-returning result or first result if none)
+            rows:
+              multiResult.results.find((r) => r.isDataReturning)?.rows ||
+              multiResult.results[0]?.rows ||
+              [],
+            fields:
+              multiResult.results.find((r) => r.isDataReturning)?.fields ||
+              multiResult.results[0]?.fields ||
+              [],
+            rowCount: legacyRowCount,
+            durationMs: multiResult.totalDurationMs
+          }
+        }
+      } catch (error: unknown) {
+        log.error('Query error:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        recordAudit({
+          source: 'editor',
+          connectionId: config.id ?? 'unsaved',
+          connectionName: config.name ?? config.database,
+          dbType: config.dbType || 'postgresql',
+          sql: query,
+          rowCount: null,
+          success: false,
+          error: errorMessage
+        })
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  // Cancel a running query by execution ID
+  ipcMain.handle('db:cancel-query', async (_, executionId: string) => {
+    log.debug('Cancelling query:', executionId)
+
+    try {
+      const result = await cancelQuery(executionId)
+      if (result.cancelled) {
+        log.debug('Query cancelled successfully')
+        return { success: true, data: { cancelled: true } }
+      } else {
+        log.debug('Query not found:', result.error)
+        return { success: false, error: result.error }
+      }
+    } catch (error: unknown) {
+      log.error('Cancel query error:', error)
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      return { success: false, error: errorMessage }
+    }
+  })
+
+  // Invalidate schema cache for a connection
+  ipcMain.handle('db:invalidate-schema-cache', (_, config: ConnectionConfig) => {
+    invalidateSchemaCache(config)
+    return { success: true }
+  })
+
+  // Fetch database schemas, tables, and columns (with caching)
+  ipcMain.handle(
+    'db:schemas',
+    async (_, args: ConnectionConfig | { config: ConnectionConfig; forceRefresh?: boolean }) => {
+      // Support both old (config only) and new (with forceRefresh) API
+      const config = 'config' in args ? args.config : args
+      const forceRefresh = 'forceRefresh' in args ? args.forceRefresh : false
+
+      try {
+        // Check memory cache first (unless force refresh)
+        if (!forceRefresh) {
+          const cached = getCachedSchema(config)
+          if (cached && isCacheValid(cached)) {
+            log.debug('Cache hit')
+            return {
+              success: true,
+              data: {
+                schemas: cached.schemas,
+                customTypes: cached.customTypes,
+                fetchedAt: cached.timestamp,
+                fromCache: true
+              }
+            }
+          }
+        }
+
+        // Fetch fresh data — coalesce concurrent calls so two tabs opening at the
+        // same time don't each trigger a full pg_catalog scan.
+        if (forceRefresh) {
+          log.debug('Force refresh, fetching from database...')
+        } else {
+          log.debug('Cache miss, fetching from database...')
+        }
+        const adapter = getAdapter(config)
+
+        const cacheEntry = await getOrFetchCachedSchema(config, async () => {
+          const schemas = await adapter.getSchemas(config)
+          let customTypes: CachedSchema['customTypes'] = []
+          try {
+            customTypes = await adapter.getTypes(config)
+          } catch {
+            // Types are optional, ignore errors
+          }
+          return { schemas, customTypes, timestamp: Date.now() }
+        })
+
+        return {
+          success: true,
+          data: {
+            schemas: cacheEntry.schemas,
+            customTypes: cacheEntry.customTypes,
+            fetchedAt: cacheEntry.timestamp,
+            fromCache: false
+          }
+        }
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+
+        // On error, try to return stale cache if available
+        const staleCache = getCachedSchema(config)
+        if (staleCache) {
+          log.warn('Returning stale cache due to error')
+          return {
+            success: true,
+            data: {
+              schemas: staleCache.schemas,
+              customTypes: staleCache.customTypes,
+              fetchedAt: staleCache.timestamp,
+              fromCache: true,
+              stale: true,
+              refreshError: errorMessage
+            }
+          }
+        }
+
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  // Execute edit operations (INSERT, UPDATE, DELETE)
+  ipcMain.handle(
+    'db:execute',
+    async (_, { config, batch }: { config: ConnectionConfig; batch: EditBatch }) => {
+      log.debug('Received edit batch', batch.context)
+      log.debug('Operations count:', batch.operations.length)
+
+      const adapter = getAdapter(config)
+      const dbType = config.dbType || 'postgresql'
+      const result: EditResult = {
+        success: true,
+        rowsAffected: 0,
+        executedSql: [],
+        errors: []
+      }
+
+      // Validate operations first
+      const validOperations: Array<{
+        sql: string
+        params: unknown[]
+        preview: string
+        opId: string
+      }> = []
+      for (const operation of batch.operations) {
+        const validation = validateOperation(operation)
+        if (!validation.valid) {
+          result.errors!.push({
+            operationId: operation.id,
+            message: validation.error!
+          })
+          continue
+        }
+
+        const query = buildQuery(operation, batch.context, dbType)
+        const previewSql = buildPreviewSql(operation, batch.context, dbType)
+        validOperations.push({
+          sql: query.sql,
+          params: query.params,
+          preview: previewSql,
+          opId: operation.id
+        })
+      }
+
+      // If all operations have validation errors, return early
+      if (validOperations.length === 0 && result.errors!.length > 0) {
+        result.success = false
+        return { success: true, data: result }
+      }
+
+      try {
+        if (batch.sessionId && adapter.queryInTransaction) {
+          for (const op of validOperations) {
+            try {
+              const res = await adapter.queryInTransaction(
+                config,
+                batch.sessionId,
+                op.sql,
+                op.params
+              )
+              result.rowsAffected += res.rowCount ?? 0
+              result.executedSql.push(op.preview)
+              recordAudit({
+                source: 'inline-edit',
+                connectionId: config.id ?? 'unsaved',
+                connectionName: config.name ?? config.database,
+                dbType,
+                sql: op.sql,
+                rowCount: res.rowCount ?? 0,
+                success: true
+              })
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error)
+              result.errors!.push({
+                operationId: op.opId,
+                message: errorMessage
+              })
+              recordAudit({
+                source: 'inline-edit',
+                connectionId: config.id ?? 'unsaved',
+                connectionName: config.name ?? config.database,
+                dbType,
+                sql: op.sql,
+                rowCount: null,
+                success: false,
+                error: errorMessage
+              })
+              break // Stop executing further ops in this transaction
+            }
+          }
+          result.success = result.errors!.length === 0
+          return { success: true, data: result }
+        }
+
+        const statements = validOperations.map((op) => ({ sql: op.sql, params: op.params }))
+        const txResult = await adapter.executeTransaction(config, statements)
+
+        result.rowsAffected = txResult.rowsAffected
+        result.executedSql = validOperations.map((op) => op.preview)
+
+        for (const op of validOperations) {
+          recordAudit({
+            source: 'inline-edit',
+            connectionId: config.id ?? 'unsaved',
+            connectionName: config.name ?? config.database,
+            dbType,
+            sql: op.sql,
+            rowCount: null,
+            success: true
+          })
+        }
+
+        return { success: true, data: result }
+      } catch (error: unknown) {
+        log.error('Execute batch error:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        // Mark all valid operations as failed
+        for (const op of validOperations) {
+          result.errors!.push({
+            operationId: op.opId,
+            message: errorMessage
+          })
+          recordAudit({
+            source: 'inline-edit',
+            connectionId: config.id ?? 'unsaved',
+            connectionName: config.name ?? config.database,
+            dbType,
+            sql: op.sql,
+            rowCount: null,
+            success: false,
+            error: errorMessage
+          })
+        }
+        result.success = false
+        return { success: true, data: result }
+      }
+    }
+  )
+
+  // Preview SQL for edit operations (without executing)
+  ipcMain.handle(
+    'db:preview-sql',
+    (_, { batch, dbType }: { batch: EditBatch; dbType?: string }) => {
+      try {
+        const targetDbType = (dbType || 'postgresql') as 'postgresql' | 'mysql' | 'sqlite' | 'mssql'
+        const previews = batch.operations.map((op) => ({
+          operationId: op.id,
+          sql: buildPreviewSql(op, batch.context, targetDbType)
+        }))
+        return { success: true, data: previews }
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  // Execute EXPLAIN ANALYZE for query plan analysis
+  ipcMain.handle(
+    'db:explain',
+    async (
+      _,
+      { config, query, analyze }: { config: ConnectionConfig; query: string; analyze: boolean }
+    ) => {
+      log.debug('Received explain request, analyze:', analyze)
+      log.debug('Query:', query)
+
+      try {
+        const adapter = getAdapter(config)
+        const result = await adapter.explain(config, query, analyze)
+
+        return {
+          success: true,
+          data: result
+        }
+      } catch (error: unknown) {
+        log.error('Explain error:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  // Execute a query with telemetry collection
+  ipcMain.handle(
+    'db:query-with-telemetry',
+    async (
+      _,
+      {
+        config,
+        query,
+        executionId,
+        queryTimeoutMs,
+        sessionId
+      }: {
+        config: ConnectionConfig
+        query: string
+        executionId?: string
+        queryTimeoutMs?: number
+        sessionId?: string
+      }
+    ) => {
+      log.debug('Received query with telemetry request', { ...config, password: '***' })
+      log.debug('Query:', query)
+      log.debug('Execution ID:', executionId)
+      log.debug('Query timeout:', queryTimeoutMs)
+
+      try {
+        const adapter = getAdapter(config)
+        log.debug('Connecting with telemetry...')
+
+        // Use queryMultiple with telemetry enabled
+        const multiResult = await adapter.queryMultiple(config, query, {
+          executionId,
+          collectTelemetry: true,
+          queryTimeoutMs,
+          sessionId
+        })
+
+        log.debug('Query completed in', multiResult.totalDurationMs, 'ms')
+        log.debug('Statement count:', multiResult.results.length)
+        log.debug('Telemetry collected:', !!multiResult.telemetry)
+
+        return {
+          success: true,
+          data: {
+            results: multiResult.results,
+            totalDurationMs: multiResult.totalDurationMs,
+            statementCount: multiResult.results.length,
+            telemetry: multiResult.telemetry,
+            // Legacy format for backward compatibility
+            rows:
+              multiResult.results.find((r) => r.isDataReturning)?.rows ||
+              multiResult.results[0]?.rows ||
+              [],
+            fields:
+              multiResult.results.find((r) => r.isDataReturning)?.fields ||
+              multiResult.results[0]?.fields ||
+              [],
+            rowCount:
+              multiResult.results.find((r) => r.isDataReturning)?.rowCount ??
+              multiResult.results[0]?.rowCount ??
+              0,
+            durationMs: multiResult.totalDurationMs
+          }
+        }
+      } catch (error: unknown) {
+        log.error('Query with telemetry error:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  // Run a query multiple times and collect benchmark statistics
+  ipcMain.handle(
+    'db:benchmark',
+    async (
+      _,
+      { config, query, runCount }: { config: ConnectionConfig; query: string; runCount: number }
+    ) => {
+      log.debug('Received benchmark request', { ...config, password: '***' })
+      log.debug('Query:', query)
+      log.debug('Run count:', runCount)
+
+      // Validate run count
+      if (runCount < 1 || runCount > 1000) {
+        return { success: false, error: 'Run count must be between 1 and 1000' }
+      }
+
+      try {
+        const adapter = getAdapter(config)
+        const telemetryRuns: QueryTelemetry[] = []
+
+        log.debug('Starting benchmark runs...')
+
+        for (let i = 0; i < runCount; i++) {
+          const executionId = `benchmark-${Date.now()}-${i}`
+
+          try {
+            const result = await adapter.queryMultiple(config, query, {
+              executionId,
+              collectTelemetry: true
+            })
+
+            if (result.telemetry) {
+              telemetryRuns.push(result.telemetry)
+            }
+
+            // Small delay between runs to avoid overwhelming the database
+            if (i < runCount - 1) {
+              await new Promise((resolve) => setTimeout(resolve, 10))
+            }
+          } catch (runError) {
+            // If a run fails, log it but continue
+            log.warn(`Benchmark run ${i + 1} failed:`, runError)
+          }
+        }
+
+        log.debug('Benchmark completed, successful runs:', telemetryRuns.length)
+
+        if (telemetryRuns.length === 0) {
+          return { success: false, error: 'All benchmark runs failed' }
+        }
+
+        // Aggregate the results
+        const benchmarkResult: BenchmarkResult =
+          telemetryCollector.aggregateBenchmark(telemetryRuns)
+
+        return {
+          success: true,
+          data: benchmarkResult
+        }
+      } catch (error: unknown) {
+        log.error('Benchmark error:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  // Analyze query performance (on-demand)
+  ipcMain.handle(
+    'db:analyze-performance',
+    async (
+      _,
+      {
+        config,
+        query,
+        queryHistory,
+        analysisConfig
+      }: {
+        config: ConnectionConfig
+        query: string
+        queryHistory: QueryHistoryItemForAnalysis[]
+        analysisConfig?: Partial<PerformanceAnalysisConfig>
+      }
+    ) => {
+      log.debug('Received performance analysis request')
+      log.debug('Query:', query)
+      log.debug('History items:', queryHistory.length)
+
+      // Only support PostgreSQL for now
+      if (config.dbType && config.dbType !== 'postgresql') {
+        return {
+          success: false,
+          error: 'Performance analysis is currently only supported for PostgreSQL'
+        }
+      }
+
+      try {
+        const result = await analyzeQueryPerformance(config, query, queryHistory, analysisConfig)
+
+        log.debug('Analysis completed in', result.durationMs.toFixed(2), 'ms')
+        log.debug('Issues found:', result.issues.length)
+        log.debug('N+1 patterns:', result.nplusOnePatterns.length)
+
+        return { success: true, data: result }
+      } catch (error: unknown) {
+        log.error('Performance analysis error:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'db:begin-transaction',
+    async (_, { config, sessionId }: { config: ConnectionConfig; sessionId: string }) => {
+      try {
+        const adapter = getAdapter(config)
+        if (adapter.beginTransaction) {
+          await adapter.beginTransaction(config, sessionId)
+          recordTxBoundary(config, 'BEGIN', true)
+          return { success: true }
+        } else {
+          return { success: false, error: 'Transactions not supported for this database type.' }
+        }
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        recordTxBoundary(config, 'BEGIN', false, errorMessage)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'db:commit-transaction',
+    async (_, { config, sessionId }: { config: ConnectionConfig; sessionId: string }) => {
+      try {
+        const adapter = getAdapter(config)
+        if (adapter.commitTransaction) {
+          await adapter.commitTransaction(config, sessionId)
+          recordTxBoundary(config, 'COMMIT', true)
+          return { success: true }
+        }
+        return { success: false, error: 'Transactions not supported.' }
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        recordTxBoundary(config, 'COMMIT', false, errorMessage)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'db:rollback-transaction',
+    async (_, { config, sessionId }: { config: ConnectionConfig; sessionId: string }) => {
+      try {
+        const adapter = getAdapter(config)
+        if (adapter.rollbackTransaction) {
+          await adapter.rollbackTransaction(config, sessionId)
+          recordTxBoundary(config, 'ROLLBACK', true)
+          return { success: true }
+        }
+        return { success: false, error: 'Transactions not supported.' }
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        recordTxBoundary(config, 'ROLLBACK', false, errorMessage)
+        return { success: false, error: errorMessage }
+      }
+    }
+  )
+}

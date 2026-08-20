@@ -1,9 +1,6 @@
-'use client'
-
 import * as React from 'react'
 import { X, Link2, ChevronRight, Loader2, AlertCircle, Copy, Check } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
+import { Button, Badge } from '@data-peek/ui'
 import type { ForeignKeyInfo, ConnectionConfig, ColumnInfo } from '@data-peek/shared'
 
 // Panel item in the stack
@@ -74,9 +71,6 @@ function FKPanel({
             {panel.foreignKey.referencedSchema}
           </Badge>
         </div>
-        <Button variant="ghost" size="icon" className="size-7" onClick={onClose}>
-          <X className="size-4" />
-        </Button>
       </div>
 
       {/* Breadcrumb trail */}
@@ -128,6 +122,7 @@ function FKPanel({
                         <span className="text-sm text-muted-foreground/50 italic">NULL</span>
                       ) : hasFK ? (
                         <button
+                          type="button"
                           onClick={(e) => {
                             if (e.metaKey || e.ctrlKey) {
                               onOpenInTab(columnInfo!.foreignKey!, value)
@@ -172,10 +167,14 @@ function FKPanel({
       </div>
 
       {/* Footer */}
-      <div className="px-4 py-2 border-t border-border text-xs text-muted-foreground bg-muted/20">
-        <span>
+      <div className="px-4 py-2 border-t border-border bg-muted/20 flex items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">
           {panel.foreignKey.referencedColumn} = {String(panel.value)}
         </span>
+        <Button variant="outline" size="sm" className="h-7 gap-1.5" onClick={onClose}>
+          <X className="size-3" />
+          Close
+        </Button>
       </div>
     </div>
   )
@@ -198,7 +197,11 @@ export function FKPanelStack({
   return (
     <>
       {/* Backdrop */}
-      <div className="fixed inset-0 bg-black/30 z-40 transition-opacity" onClick={onCloseAll} />
+      <div
+        role="presentation"
+        className="fixed inset-0 bg-black/30 z-40 transition-opacity"
+        onClick={onCloseAll}
+      />
 
       {/* All Panels stacked */}
       {panels.map((panel, index) => (

@@ -1,29 +1,33 @@
-'use client'
-
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   Play,
   Download,
   FileJson,
   FileSpreadsheet,
+  FileCode2,
   Loader2,
   AlertCircle,
   Database,
   Wand2,
   Bookmark
 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 import {
+  Button,
+  keys,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
-import { useQueryStore, useConnectionStore } from '@/stores'
+} from '@data-peek/ui'
+
+import { useQueryStore, useConnectionStore, useSnippetStore } from '@/stores'
 import { DataTable } from '@/components/data-table'
 import { SQLEditor } from '@/components/sql-editor'
 import { formatSQL } from '@/lib/sql-formatter'
 import { SaveQueryDialog } from '@/components/save-query-dialog'
+import { createLogger } from '@/lib/logger'
+
+const log = createLogger('query-editor')
 
 export function QueryEditor() {
   const activeConnection = useConnectionStore((s) => s.getActiveConnection())
@@ -31,20 +35,48 @@ export function QueryEditor() {
   const { currentQuery, isExecuting, result, error } = useQueryStore()
   const setCurrentQuery = useQueryStore((s) => s.setCurrentQuery)
   const executeQuery = useQueryStore((s) => s.executeQuery)
+  const getAllSnippets = useSnippetStore((s) => s.getAllSnippets)
+  const initializeSnippets = useSnippetStore((s) => s.initializeSnippets)
+  const allSnippets = getAllSnippets()
 
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
+  const [flashClass, setFlashClass] = useState('')
+  const resultKeyRef = useRef(0)
+
+  useEffect(() => {
+    initializeSnippets()
+  }, [initializeSnippets])
+
+  // Flash results area on success/error
+  useEffect(() => {
+    if (result) {
+      resultKeyRef.current += 1
+      setFlashClass('animate-flash-success')
+      const timer = setTimeout(() => setFlashClass(''), 400)
+      return () => clearTimeout(timer)
+    }
+    return undefined
+  }, [result])
+
+  useEffect(() => {
+    if (error) {
+      setFlashClass('animate-flash-error')
+      const timer = setTimeout(() => setFlashClass(''), 400)
+      return () => clearTimeout(timer)
+    }
+    return undefined
+  }, [error])
 
   const handleRunQuery = () => {
-    console.log('[QueryEditor] handleRunQuery called')
-    console.log('[QueryEditor] activeConnection:', activeConnection)
-    console.log('[QueryEditor] isExecuting:', isExecuting)
-    console.log('[QueryEditor] currentQuery:', currentQuery)
+    log.debug('handleRunQuery called', {
+      hasConnection: !!activeConnection,
+      isExecuting,
+      hasQuery: !!currentQuery.trim()
+    })
 
     if (!activeConnection || isExecuting || !currentQuery.trim()) {
-      console.log('[QueryEditor] Skipping - conditions not met')
       return
     }
-    console.log('[QueryEditor] Calling executeQuery...')
     executeQuery(activeConnection)
   }
 
@@ -86,6 +118,7 @@ export function QueryEditor() {
             height={160}
             placeholder="SELECT * FROM your_table LIMIT 100;"
             schemas={schemas}
+            snippets={allSnippets}
           />
         </div>
 
@@ -104,7 +137,10 @@ export function QueryEditor() {
                 <Play className="size-3.5" />
               )}
               Run
-              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">⌘↵</kbd>
+              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                {keys.mod}
+                {keys.enter}
+              </kbd>
             </Button>
             <Button
               variant="ghost"
@@ -115,7 +151,10 @@ export function QueryEditor() {
             >
               <Wand2 className="size-3.5" />
               Format
-              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">⌘⇧F</kbd>
+              <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                {keys.mod}
+                {keys.shift}F
+              </kbd>
             </Button>
             <Button
               variant="ghost"
@@ -131,7 +170,7 @@ export function QueryEditor() {
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <span
-                className={`size-1.5 rounded-full ${activeConnection.isConnected ? 'bg-green-500' : 'bg-yellow-500'}`}
+                className={`size-1.5 rounded-full ${activeConnection.isConnected ? 'bg-green-500' : 'bg-yellow-500'} ${isExecuting ? 'animate-pulse' : ''}`}
               />
               {activeConnection.name}
             </span>
@@ -140,7 +179,7 @@ export function QueryEditor() {
       </div>
 
       {/* Results Section */}
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className={`flex flex-1 flex-col overflow-hidden ${flashClass}`}>
         {error ? (
           <div className="flex-1 flex items-center justify-center p-4">
             <div className="max-w-md text-center space-y-2">
@@ -152,7 +191,10 @@ export function QueryEditor() {
         ) : result ? (
           <>
             {/* Results Table */}
-            <div className="flex-1 overflow-hidden p-3">
+            <div
+              key={resultKeyRef.current}
+              className="flex-1 overflow-hidden p-3 animate-fade-in-up"
+            >
               <DataTable
                 columns={result.columns}
                 data={result.rows as Record<string, unknown>[]}
@@ -161,7 +203,10 @@ export function QueryEditor() {
             </div>
 
             {/* Results Footer */}
-            <div className="flex items-center justify-between border-t border-border/40 bg-muted/20 px-3 py-1.5 shrink-0">
+            <div
+              key={`footer-${resultKeyRef.current}`}
+              className="flex items-center justify-between border-t border-border/40 bg-muted/20 px-3 py-1.5 shrink-0 animate-fade-in-up"
+            >
               <div className="flex items-center gap-4 text-xs text-muted-foreground">
                 <span className="flex items-center gap-1.5">
                   <span className="size-1.5 rounded-full bg-green-500" />
@@ -185,6 +230,10 @@ export function QueryEditor() {
                     <DropdownMenuItem>
                       <FileJson className="size-4 text-muted-foreground" />
                       Export as JSON
+                    </DropdownMenuItem>
+                    <DropdownMenuItem>
+                      <FileCode2 className="size-4 text-muted-foreground" />
+                      Export as SQL
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>

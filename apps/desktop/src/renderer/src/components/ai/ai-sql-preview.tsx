@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   Play,
@@ -11,8 +9,8 @@ import {
   Code2,
   Loader2
 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
+import { Button, cn } from '@data-peek/ui'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 
 interface AISQLPreviewProps {
   sql: string
@@ -20,6 +18,8 @@ interface AISQLPreviewProps {
   onExecute: () => void
   onOpenInTab: () => void
   isExecuting?: boolean
+  /** If true, the Run Query button is hidden - user must open in tab to execute */
+  requiresConfirmation?: boolean
 }
 
 // Simple SQL syntax highlighting
@@ -101,16 +101,11 @@ export function AISQLPreview({
   explanation,
   onExecute,
   onOpenInTab,
-  isExecuting = false
+  isExecuting = false,
+  requiresConfirmation = false
 }: AISQLPreviewProps) {
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard({ resetDelay: 1500 })
   const [isExpanded, setIsExpanded] = React.useState(true)
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(sql)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
-  }
 
   const lines = sql.split('\n')
 
@@ -130,6 +125,7 @@ export function AISQLPreview({
           <span className="text-[11px] font-medium text-zinc-400">Generated SQL</span>
           {lines.length > 3 && (
             <button
+              type="button"
               onClick={() => setIsExpanded(!isExpanded)}
               className="flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
             >
@@ -149,7 +145,8 @@ export function AISQLPreview({
         </div>
 
         <button
-          onClick={handleCopy}
+          type="button"
+          onClick={() => copy(sql)}
           className="flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
         >
           {copied ? (
@@ -192,39 +189,46 @@ export function AISQLPreview({
 
       {/* Actions */}
       <div className="flex items-center gap-2 px-3 py-2 border-t border-zinc-800/50 bg-zinc-900/30">
-        <Button
-          size="sm"
-          className={cn(
-            'h-7 gap-1.5 text-xs font-medium',
-            'bg-gradient-to-r from-blue-500 to-blue-600',
-            'hover:from-blue-600 hover:to-blue-700',
-            'shadow-md shadow-blue-500/20',
-            'transition-all duration-200'
-          )}
-          onClick={onExecute}
-          disabled={isExecuting}
-        >
-          {isExecuting ? (
-            <>
-              <Loader2 className="size-3 animate-spin" />
-              Running...
-            </>
-          ) : (
-            <>
-              <Play className="size-3" />
-              Run Query
-            </>
-          )}
-        </Button>
+        {!requiresConfirmation && (
+          <Button
+            size="sm"
+            className={cn(
+              'h-7 gap-1.5 text-xs font-medium',
+              'bg-gradient-to-r from-blue-500 to-blue-600',
+              'hover:from-blue-600 hover:to-blue-700',
+              'shadow-md shadow-blue-500/20',
+              'transition-all duration-200'
+            )}
+            onClick={onExecute}
+            disabled={isExecuting}
+          >
+            {isExecuting ? (
+              <>
+                <Loader2 className="size-3 animate-spin" />
+                Running...
+              </>
+            ) : (
+              <>
+                <Play className="size-3" />
+                Run Query
+              </>
+            )}
+          </Button>
+        )}
 
         <Button
           size="sm"
-          variant="ghost"
-          className="h-7 gap-1.5 text-xs text-zinc-400 hover:text-zinc-200"
+          variant={requiresConfirmation ? 'default' : 'ghost'}
+          className={cn(
+            'h-7 gap-1.5 text-xs',
+            requiresConfirmation
+              ? 'bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-medium'
+              : 'text-zinc-400 hover:text-zinc-200'
+          )}
           onClick={onOpenInTab}
         >
           <ExternalLink className="size-3" />
-          Open in Tab
+          {requiresConfirmation ? 'Review in Tab' : 'Open in Tab'}
         </Button>
       </div>
     </div>

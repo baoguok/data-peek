@@ -1,18 +1,17 @@
-'use client'
-
 import { useEffect, useState } from 'react'
-import { ChevronDown, Plus, Settings, Loader2, Pencil, Trash2 } from 'lucide-react'
+import { ChevronDown, Plus, Settings, Loader2, Pencil, Trash2, Copy } from 'lucide-react'
 
 import {
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuShortcut,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
-import {
+  DropdownMenuTrigger,
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -21,12 +20,32 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle
-} from '@/components/ui/alert-dialog'
-import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from '@/components/ui/sidebar'
+} from '@data-peek/ui'
 import { useConnectionStore, type Connection } from '@/stores'
 import { useNavigate } from '@tanstack/react-router'
 import { AddConnectionDialog } from './add-connection-dialog'
 import { DatabaseIcon } from './database-icons'
+import { resolveEnvironment } from '@/lib/environment'
+import type { ConnectionEnvironment } from '@shared/index'
+
+function EnvironmentBadge({ environment }: { environment?: ConnectionEnvironment }) {
+  const resolved = resolveEnvironment(environment)
+  if (!resolved) return null
+  return (
+    <span
+      className="shrink-0 rounded px-1.5 py-px text-[0.625rem] font-semibold uppercase tracking-wide font-mono leading-none"
+      style={{
+        backgroundColor: `color-mix(in oklch, ${resolved.color} 15%, transparent)`,
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: `color-mix(in oklch, ${resolved.color} 30%, transparent)`,
+        color: resolved.color
+      }}
+    >
+      {resolved.label}
+    </span>
+  )
+}
 
 export function ConnectionSwitcher() {
   const navigate = useNavigate()
@@ -36,7 +55,9 @@ export function ConnectionSwitcher() {
   const setConnectionStatus = useConnectionStore((s) => s.setConnectionStatus)
   const initializeConnections = useConnectionStore((s) => s.initializeConnections)
   const removeConnection = useConnectionStore((s) => s.removeConnection)
+  const addConnection = useConnectionStore((s) => s.addConnection)
   const isInitialized = useConnectionStore((s) => s.isInitialized)
+  const setupConnectionSync = useConnectionStore((s) => s.setupConnectionSync)
 
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [editingConnection, setEditingConnection] = useState<Connection | null>(null)
@@ -47,7 +68,14 @@ export function ConnectionSwitcher() {
     initializeConnections()
   }, [initializeConnections])
 
+  // Set up listener for connection updates from other windows
+  useEffect(() => {
+    const cleanup = setupConnectionSync()
+    return cleanup
+  }, [setupConnectionSync])
+
   const activeConnection = connections.find((c) => c.id === activeConnectionId)
+  const activeEnv = resolveEnvironment(activeConnection?.environment)
 
   const handleSelectConnection = async (connectionId: string) => {
     // Set connecting status
@@ -72,6 +100,28 @@ export function ConnectionSwitcher() {
   const handleDeleteConnection = (e: React.MouseEvent, connection: Connection) => {
     e.stopPropagation()
     setDeletingConnection(connection)
+  }
+
+  const handleDuplicateConnection = async (e: React.MouseEvent, connection: Connection) => {
+    e.stopPropagation()
+    try {
+      const duplicatedConnection = {
+        ...connection,
+        id: crypto.randomUUID(),
+        name: `${connection.name} (copy)`,
+        isConnected: false,
+        isConnecting: false
+      }
+
+      const result = await window.api.connections.add(duplicatedConnection)
+      if (result.success && result.data) {
+        addConnection(result.data)
+      } else {
+        console.error('Failed to duplicate connection:', result.error)
+      }
+    } catch (error) {
+      console.error('Error duplicating connection:', error)
+    }
   }
 
   const confirmDelete = async () => {
@@ -117,7 +167,13 @@ export function ConnectionSwitcher() {
 
   return (
     <SidebarMenu>
-      <SidebarMenuItem>
+      <SidebarMenuItem className="relative">
+        {activeEnv && (
+          <div
+            className="absolute top-0 left-0 right-0 h-0.5 transition-colors duration-150"
+            style={{ backgroundColor: activeEnv.color }}
+          />
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <SidebarMenuButton className="w-fit px-1.5">
@@ -136,6 +192,7 @@ export function ConnectionSwitcher() {
               <span className="truncate font-medium">
                 {activeConnection?.name || 'Select connection'}
               </span>
+              <EnvironmentBadge environment={activeConnection?.environment} />
               <ChevronDown className="opacity-50" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>
@@ -168,6 +225,7 @@ export function ConnectionSwitcher() {
                 <div className="flex flex-1 min-w-0 flex-col gap-0.5">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <span className="font-medium truncate">{connection.name}</span>
+                    <EnvironmentBadge environment={connection.environment} />
                   </div>
                   <span className="text-xs text-muted-foreground truncate">
                     {connection.host}:{connection.port}/{connection.database}
@@ -175,6 +233,15 @@ export function ConnectionSwitcher() {
                 </div>
                 <div className="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                   <button
+                    type="button"
+                    onClick={(e) => handleDuplicateConnection(e, connection)}
+                    className="p-1 hover:bg-muted rounded"
+                    title="Duplicate connection"
+                  >
+                    <Copy className="size-3.5" />
+                  </button>
+                  <button
+                    type="button"
                     onClick={(e) => handleEditConnection(e, connection)}
                     className="p-1 hover:bg-muted rounded"
                     title="Edit connection"
@@ -182,6 +249,7 @@ export function ConnectionSwitcher() {
                     <Pencil className="size-3.5" />
                   </button>
                   <button
+                    type="button"
                     onClick={(e) => handleDeleteConnection(e, connection)}
                     className="p-1 hover:bg-destructive/10 hover:text-destructive rounded"
                     title="Delete connection"

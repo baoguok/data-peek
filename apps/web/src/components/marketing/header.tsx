@@ -1,135 +1,129 @@
-'use client'
+"use client";
 
-import Link from 'next/link'
-import { useState, useEffect } from 'react'
-import { Button } from '@/components/ui/button'
-import { Database, Menu, X, Github, Star } from 'lucide-react'
+import Link from "next/link";
+import { useEffect, useState } from "react";
 
-const navLinks = [
-  { href: '#features', label: 'Features' },
-  { href: '#pricing', label: 'Pricing' },
-  { href: '#faq', label: 'FAQ' },
-]
+const nav = [
+  { href: "/#features", label: "Features" },
+  { href: "/#pricing", label: "Pricing" },
+  { href: "/#faq", label: "FAQ" },
+  { href: "/blog", label: "Changelog" },
+  { href: "https://docs.datapeek.dev/docs", label: "Docs", external: true },
+];
 
 export function Header() {
-  const [isScrolled, setIsScrolled] = useState(false)
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
+  const [scrolled, setScrolled] = useState(false);
+  const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    const handleScroll = () => {
-      setIsScrolled(window.scrollY > 20)
-    }
-    window.addEventListener('scroll', handleScroll)
-    return () => window.removeEventListener('scroll', handleScroll)
-  }, [])
+    const on = () => setScrolled(window.scrollY > 8);
+    on();
+    window.addEventListener("scroll", on, { passive: true });
+    return () => window.removeEventListener("scroll", on);
+  }, []);
 
   return (
     <header
-      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${
-        isScrolled
-          ? 'bg-[--color-background]/80 backdrop-blur-xl border-b border-[--color-border]'
-          : 'bg-transparent'
+      className={`neat sticky top-0 z-50 transition-colors duration-200 ${
+        scrolled ? "bg-[var(--n-bg)]/90 backdrop-blur-md" : "bg-transparent"
       }`}
+      style={{
+        borderBottom: scrolled
+          ? "1px solid var(--n-line-soft)"
+          : "1px solid transparent",
+      }}
     >
-      <div className="max-w-7xl mx-auto px-6">
-        <nav className="flex items-center justify-between h-16 md:h-20">
-          {/* Logo */}
+      <div className="mx-auto flex h-14 max-w-[1240px] items-center justify-between px-5 sm:px-8">
+        <div className="flex items-center gap-10">
           <Link
             href="/"
-            className="flex items-center gap-2 group"
+            className="flex items-center gap-2 text-[13px] tracking-tight"
           >
-            <div className="w-8 h-8 rounded-lg bg-[--color-accent] flex items-center justify-center group-hover:scale-110 transition-transform">
-              <Database className="w-4 h-4 text-[--color-background]" />
-            </div>
             <span
-              className="text-lg font-semibold tracking-tight"
-              style={{ fontFamily: 'var(--font-display)' }}
-            >
-              data-peek
-            </span>
+              aria-hidden
+              className="inline-block h-[10px] w-[10px]"
+              style={{ background: "var(--n-accent)" }}
+            />
+            <span className="font-medium text-[var(--n-fg)]">data-peek</span>
+            <span className="text-[11px] text-[var(--n-fg-faint)]">v0.21</span>
           </Link>
 
-          {/* Desktop Nav */}
-          <div className="hidden md:flex items-center gap-8">
-            {navLinks.map((link) => (
+          <nav className="hidden md:flex items-center gap-7">
+            {nav.map((l) => (
               <Link
-                key={link.href}
-                href={link.href}
-                className="text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] transition-colors"
-                style={{ fontFamily: 'var(--font-body)' }}
+                key={l.label}
+                href={l.href}
+                {...(l.external
+                  ? { target: "_blank", rel: "noopener noreferrer" }
+                  : {})}
+                className="text-[12.5px] text-[var(--n-fg-muted)] hover:text-[var(--n-fg)] transition-colors"
               >
-                {link.label}
+                {l.label}
+              </Link>
+            ))}
+          </nav>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link
+            href="https://github.com/Rohithgilla12/data-peek"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hidden sm:inline-flex h-8 items-center gap-2 px-3 text-[12px] text-[var(--n-fg-muted)] hover:text-[var(--n-fg)] transition-colors"
+            style={{ border: "1px solid var(--n-line-soft)" }}
+          >
+            <span aria-hidden>★</span>
+            <span>Star</span>
+          </Link>
+          <Link
+            href="/download"
+            className="hidden sm:inline-flex h-8 items-center px-3 text-[12px] text-[var(--n-fg-muted)] hover:text-[var(--n-fg)] transition-colors"
+          >
+            Download
+          </Link>
+          <Link
+            href="/#pricing"
+            className="inline-flex h-8 items-center px-3.5 text-[12px] font-medium"
+            style={{
+              background: "var(--n-accent)",
+              color: "var(--n-accent-ink)",
+            }}
+          >
+            Get Pro
+          </Link>
+          <button
+            className="md:hidden ml-1 h-8 w-8 grid place-items-center text-[var(--n-fg-muted)]"
+            style={{ border: "1px solid var(--n-line-soft)" }}
+            aria-label="Menu"
+            onClick={() => setOpen((v) => !v)}
+          >
+            <span aria-hidden>{open ? "×" : "≡"}</span>
+          </button>
+        </div>
+      </div>
+
+      {open && (
+        <div
+          className="md:hidden"
+          style={{
+            borderTop: "1px solid var(--n-line-soft)",
+            background: "var(--n-bg)",
+          }}
+        >
+          <div className="mx-auto max-w-[1240px] px-5 sm:px-8 py-4 flex flex-col gap-3">
+            {nav.map((l) => (
+              <Link
+                key={l.label}
+                href={l.href}
+                onClick={() => setOpen(false)}
+                className="text-[13px] text-[var(--n-fg-muted)] hover:text-[var(--n-fg)]"
+              >
+                {l.label}
               </Link>
             ))}
           </div>
-
-          {/* CTA Buttons */}
-          <div className="hidden md:flex items-center gap-3">
-            <Link
-              href="https://github.com/Rohithgilla12/data-peek"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] hover:bg-[--color-surface] transition-colors"
-              style={{ fontFamily: 'var(--font-body)' }}
-            >
-              <Github className="w-4 h-4" />
-              <Star className="w-3 h-3" />
-              <span className="hidden lg:inline">Star</span>
-            </Link>
-            <Button variant="ghost" size="sm" asChild>
-              <Link href="/download">Download</Link>
-            </Button>
-            <Button size="sm" asChild>
-              <Link href="#pricing">Get Pro — $29</Link>
-            </Button>
-          </div>
-
-          {/* Mobile Menu Toggle */}
-          <button
-            className="md:hidden p-2 text-[--color-text-secondary] hover:text-[--color-text-primary]"
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-          >
-            {isMobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-          </button>
-        </nav>
-
-        {/* Mobile Menu */}
-        {isMobileMenuOpen && (
-          <div className="md:hidden py-4 border-t border-[--color-border]">
-            <div className="flex flex-col gap-4">
-              {navLinks.map((link) => (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  className="text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] transition-colors py-2"
-                  onClick={() => setIsMobileMenuOpen(false)}
-                >
-                  {link.label}
-                </Link>
-              ))}
-              <Link
-                href="https://github.com/Rohithgilla12/data-peek"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] transition-colors py-2"
-                onClick={() => setIsMobileMenuOpen(false)}
-              >
-                <Github className="w-4 h-4" />
-                <Star className="w-3 h-3" />
-                Star on GitHub
-              </Link>
-              <div className="flex flex-col gap-2 pt-4 border-t border-[--color-border]">
-                <Button variant="secondary" size="sm" asChild>
-                  <Link href="/download">Download</Link>
-                </Button>
-                <Button size="sm" asChild>
-                  <Link href="#pricing">Get Pro — $29</Link>
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
+        </div>
+      )}
     </header>
-  )
+  );
 }

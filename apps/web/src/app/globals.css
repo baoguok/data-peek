@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-@theme inline {
+@theme {
   /* Terminal-inspired color palette */
   --color-background: #0a0a0b;
   --color-surface: #111113;
@@ -12,10 +12,28 @@
   --color-text-secondary: #a1a1aa;
   --color-text-muted: #71717a;
 
-  /* Accent - Electric Cyan */
-  --color-accent: #22d3ee;
-  --color-accent-dim: #0891b2;
-  --color-accent-glow: rgba(34, 211, 238, 0.15);
+  /* Accent - Blue */
+  --color-accent: #6b8cf5;
+  --color-accent-dim: #3b52c4;
+  --color-accent-glow: rgba(107, 140, 245, 0.15);
+
+  /* ------------------------------------------------------------------
+   * Neat layer — aligned with the desktop app's OKLCH blue (hue 250°).
+   * Used by *-neat components on the landing page. Coexists with the
+   * legacy tokens above so other routes (blog, compare, download) keep
+   * rendering unchanged.
+   * ----------------------------------------------------------------*/
+  --n-bg: oklch(0.16 0.005 260);
+  --n-bg-raised: oklch(0.19 0.006 260);
+  --n-bg-sunken: oklch(0.13 0.005 260);
+  --n-line: oklch(0.26 0.006 260);
+  --n-line-soft: oklch(0.22 0.006 260);
+  --n-fg: oklch(0.96 0.003 260);
+  --n-fg-muted: oklch(0.7 0.008 260);
+  --n-fg-faint: oklch(0.5 0.008 260);
+  --n-accent: oklch(0.72 0.13 250);
+  --n-accent-ink: oklch(0.16 0.02 250);
+  --n-accent-soft: oklch(0.72 0.13 250 / 0.12);
 
   /* Success/Warning/Error */
   --color-success: #4ade80;
@@ -26,32 +44,53 @@
   --font-display: "Geist Mono", monospace;
   --font-body: "Geist Mono", monospace;
   --font-mono: "Geist Mono", monospace;
+
+  /* Glassmorphism constants */
+  --glass-bg: rgba(17, 17, 19, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+}
+
+@property --gradient-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@property --card-glow-opacity {
+  syntax: "<number>";
+  initial-value: 0;
+  inherits: false;
 }
 
 @font-face {
   font-family: "Geist Mono";
-  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Regular.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Regular.woff2")
+    format("woff2");
   font-weight: 400;
   font-display: swap;
 }
 
 @font-face {
   font-family: "Geist Mono";
-  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Medium.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Medium.woff2")
+    format("woff2");
   font-weight: 500;
   font-display: swap;
 }
 
 @font-face {
   font-family: "Geist Mono";
-  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-SemiBold.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-SemiBold.woff2")
+    format("woff2");
   font-weight: 600;
   font-display: swap;
 }
 
 @font-face {
   font-family: "Geist Mono";
-  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Bold.woff2") format("woff2");
+  src: url("https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Bold.woff2")
+    format("woff2");
   font-weight: 700;
   font-display: swap;
 }
@@ -100,8 +139,14 @@ body {
 
 /* Terminal cursor blink */
 @keyframes cursor-blink {
-  0%, 50% { opacity: 1; }
-  51%, 100% { opacity: 0; }
+  0%,
+  50% {
+    opacity: 1;
+  }
+  51%,
+  100% {
+    opacity: 0;
+  }
 }
 
 .terminal-cursor {
@@ -126,12 +171,24 @@ body {
 }
 
 /* Stagger delays */
-.delay-100 { animation-delay: 100ms; }
-.delay-200 { animation-delay: 200ms; }
-.delay-300 { animation-delay: 300ms; }
-.delay-400 { animation-delay: 400ms; }
-.delay-500 { animation-delay: 500ms; }
-.delay-600 { animation-delay: 600ms; }
+.delay-100 {
+  animation-delay: 100ms;
+}
+.delay-200 {
+  animation-delay: 200ms;
+}
+.delay-300 {
+  animation-delay: 300ms;
+}
+.delay-400 {
+  animation-delay: 400ms;
+}
+.delay-500 {
+  animation-delay: 500ms;
+}
+.delay-600 {
+  animation-delay: 600ms;
+}
 
 /* Scale in animation */
 @keyframes scale-in {
@@ -152,8 +209,13 @@ body {
 
 /* Float animation */
 @keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
 }
 
 .animate-float {
@@ -162,7 +224,11 @@ body {
 
 /* Gradient text */
 .gradient-text {
-  background: linear-gradient(135deg, var(--color-text-primary) 0%, var(--color-accent) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--color-text-primary) 0%,
+    var(--color-accent) 100%
+  );
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -170,7 +236,11 @@ body {
 
 /* Screenshot placeholder */
 .screenshot-placeholder {
-  background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-surface-elevated) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--color-surface) 0%,
+    var(--color-surface-elevated) 100%
+  );
   border: 1px solid var(--color-border);
   border-radius: 16px;
   aspect-ratio: 16/10;
@@ -188,14 +258,22 @@ body {
   content: "";
   position: absolute;
   inset: 0;
-  background:
-    linear-gradient(90deg, transparent 0%, rgba(34, 211, 238, 0.03) 50%, transparent 100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(107, 140, 245, 0.03) 50%,
+    transparent 100%
+  );
   animation: shimmer 3s ease-in-out infinite;
 }
 
 @keyframes shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
 }
 
 /* Custom scrollbar */
@@ -217,8 +295,391 @@ body {
   background: var(--color-text-muted);
 }
 
+/* Glassmorphism */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Border Flow Animation */
+.border-flow {
+  position: relative;
+  background: var(--color-surface);
+  border-radius: inherit;
+}
+
+.border-flow::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  background: conic-gradient(
+    from var(--gradient-angle),
+    transparent 0deg,
+    var(--color-accent) 90deg,
+    transparent 180deg
+  );
+  border-radius: inherit;
+  z-index: -1;
+  animation: rotate-gradient 4s linear infinite;
+  opacity: var(--card-glow-opacity);
+  transition: opacity 0.3s ease;
+}
+
+.border-flow:hover {
+  --card-glow-opacity: 1;
+}
+
+@keyframes rotate-gradient {
+  0% {
+    --gradient-angle: 0deg;
+  }
+  100% {
+    --gradient-angle: 360deg;
+  }
+}
+
+/* Scroll Progress Bar */
+.scroll-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--color-accent);
+  transform-origin: 0%;
+  z-index: 100;
+}
+
 /* Selection */
 ::selection {
   background: var(--color-accent);
   color: var(--color-background);
 }
+
+/* Button press effect */
+button:active,
+a[role="button"]:active {
+  transform: translateY(1px);
+}
+
+/* Screenshot hover lift */
+.screenshot-hover {
+  transition:
+    transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.3s ease;
+}
+
+.screenshot-hover:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 12px 40px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* Data substrate - parallax background for features */
+@media (prefers-reduced-motion: no-preference) {
+  .data-substrate-parallax {
+    transform: translateY(calc(var(--scroll-y, 0) * -0.15px));
+    will-change: transform;
+  }
+
+  .data-flash {
+    animation: data-flash 30s ease-in-out infinite;
+  }
+
+  @keyframes data-flash {
+    0%,
+    98%,
+    100% {
+      opacity: 1;
+      color: inherit;
+    }
+    99% {
+      opacity: 1;
+      color: var(--color-accent);
+    }
+  }
+}
+
+/* Feature card micro-interactions */
+@media (prefers-reduced-motion: no-preference) {
+  /* Flash - Lightning Fast */
+  .group:hover .effect-flash {
+    animation: icon-flash 0.4s ease-out;
+  }
+
+  @keyframes icon-flash {
+    0% {
+      filter: brightness(1);
+      box-shadow: none;
+    }
+    30% {
+      filter: brightness(2.5);
+      box-shadow: 0 0 20px var(--feature-color, #fbbf24);
+    }
+    100% {
+      filter: brightness(1);
+      box-shadow: none;
+    }
+  }
+
+  /* Orbit - AI Assistant */
+  .group:hover .effect-orbit {
+    animation: icon-orbit 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes icon-orbit {
+    0% {
+      transform: scale(1.1) rotate(0deg) translateX(0);
+    }
+    25% {
+      transform: scale(1.1) rotate(0deg) translateX(3px) translateY(-3px);
+    }
+    50% {
+      transform: scale(1.1) rotate(0deg) translateX(0) translateY(0);
+    }
+    75% {
+      transform: scale(1.1) rotate(0deg) translateX(-3px) translateY(3px);
+    }
+    100% {
+      transform: scale(1.1) rotate(0deg) translateX(0);
+    }
+  }
+
+  /* Rotate - Query History */
+  .group:hover .effect-rotate .effect-icon {
+    transition: transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+    transform: rotate(360deg);
+  }
+
+  /* Wiggle - Inline Editing */
+  .group:hover .effect-wiggle {
+    animation: icon-wiggle 0.5s ease-in-out;
+  }
+
+  @keyframes icon-wiggle {
+    0%,
+    100% {
+      transform: scale(1.1) translateX(0);
+    }
+    20% {
+      transform: scale(1.1) translateX(3px);
+    }
+    40% {
+      transform: scale(1.1) translateX(-2px);
+    }
+    60% {
+      transform: scale(1.1) translateX(2px);
+    }
+    80% {
+      transform: scale(1.1) translateX(-1px);
+    }
+  }
+
+  /* Color cycle - Multi-Database */
+  .group:hover .effect-color-cycle .effect-color-cycle-icon {
+    animation: icon-color-cycle 1.2s steps(1) forwards;
+  }
+
+  @keyframes icon-color-cycle {
+    0% {
+      color: #fb923c;
+    }
+    25% {
+      color: #6b8cf5;
+    }
+    50% {
+      color: #3b82f6;
+    }
+    75% {
+      color: #8b5cf6;
+    }
+    100% {
+      color: #fb923c;
+    }
+  }
+
+  /* Slide swap - Export Anywhere */
+  .group:hover .effect-slide-swap .effect-icon {
+    animation: icon-slide-out-in 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes icon-slide-out-in {
+    0% {
+      transform: translateX(0);
+      opacity: 1;
+    }
+    40% {
+      transform: translateX(8px);
+      opacity: 0;
+    }
+    41% {
+      transform: translateX(-8px);
+      opacity: 0;
+    }
+    100% {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+
+  /* Key press - Command Palette */
+  .effect-key-cap {
+    transition:
+      transform 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+
+  .group:hover .effect-key-cap {
+    animation: key-press 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .group:hover .effect-key-cap-delayed {
+    animation-delay: 0.08s;
+  }
+
+  @keyframes key-press {
+    0% {
+      transform: translateY(0);
+      box-shadow: 0 2px 0 var(--color-border);
+    }
+    40% {
+      transform: translateY(2px);
+      box-shadow: 0 0 0 var(--color-border);
+    }
+    100% {
+      transform: translateY(0);
+      box-shadow: 0 2px 0 var(--color-border);
+    }
+  }
+
+  /* Default border color shift for cards with hover effects */
+  #features .group:hover {
+    border-color: color-mix(
+      in srgb,
+      var(--feature-color, var(--color-border)) 30%,
+      var(--color-border)
+    );
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Neat landing page — scoped utilities.
+ * ----------------------------------------------------------------*/
+.neat {
+  background: var(--n-bg);
+  color: var(--n-fg);
+  font-family: var(--font-mono);
+  font-feature-settings: "ss01", "ss02", "zero", "cv11";
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+}
+
+.neat a,
+.neat button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.neat ::selection {
+  background: var(--n-accent);
+  color: var(--n-accent-ink);
+}
+
+.neat-rule {
+  border-top: 1px solid var(--n-line-soft);
+}
+
+.neat-grid-bg {
+  background-image:
+    linear-gradient(
+      to right,
+      oklch(0.26 0.006 260 / 0.35) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      oklch(0.26 0.006 260 / 0.35) 1px,
+      transparent 1px
+    );
+  background-size: 88px 88px;
+  mask-image: radial-gradient(
+    ellipse 70% 60% at 50% 40%,
+    #000 0%,
+    transparent 85%
+  );
+  -webkit-mask-image: radial-gradient(
+    ellipse 70% 60% at 50% 40%,
+    #000 0%,
+    transparent 85%
+  );
+}
+
+.neat-sql .k {
+  color: var(--n-accent);
+  font-weight: 500;
+}
+.neat-sql .s {
+  color: oklch(0.8 0.09 120);
+}
+.neat-sql .n {
+  color: oklch(0.78 0.09 35);
+}
+.neat-sql .c {
+  color: var(--n-fg-faint);
+  font-style: italic;
+}
+.neat-sql .p {
+  color: var(--n-fg-muted);
+}
+
+@keyframes neat-caret {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+.neat-caret::after {
+  content: "";
+  display: inline-block;
+  width: 0.55ch;
+  height: 1em;
+  margin-left: 2px;
+  background: var(--n-accent);
+  vertical-align: -0.12em;
+  animation: neat-caret 1.1s steps(1) infinite;
+}
+
+/* Row hover for dense tables */
+.neat-row {
+  transition: background-color 120ms ease;
+}
+.neat-row:hover {
+  background: oklch(0.22 0.006 260 / 0.6);
+}
+
+/* Dotted decorative divider */
+.neat-dots {
+  background-image: radial-gradient(circle, var(--n-line) 1px, transparent 1px);
+  background-size: 8px 8px;
+}
+
+/*
+ * Reduced-motion handling for the SVG motion graphics (ssh-tunnel,
+ * local-vault, no-telemetry) is NOT done here. Their animations are SMIL
+ * (<animate>, <animateMotion>, <animateTransform>), which CSS cannot pause:
+ * animation-play-state only affects CSS animations, and display:none does
+ * not stop a running SMIL timeline. See use-svg-reduced-motion.ts, which
+ * calls svg.pauseAnimations()/unpauseAnimations() on the SVG DOM API instead.
+ */

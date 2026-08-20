@@ -3,7 +3,7 @@ import { electronAPI } from '@electron-toolkit/preload'
 import type {
   ConnectionConfig,
   IpcResponse,
-  DatabaseSchema,
+  DatabaseSchemaResponse,
   EditBatch,
   EditResult,
   TableDefinition,
@@ -15,17 +15,95 @@ import type {
   LicenseActivationRequest,
   LicenseType,
   SavedQuery,
+  QueryHistoryEntry,
+  Snippet,
   SchemaInfo,
   AIProvider,
   AIConfig,
   AIMessage,
   AIChatResponse,
+  AIChatStreamEvent,
   StoredChatMessage,
-  ChatSession
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig,
+  BenchmarkResult,
+  PerformanceAnalysisResult,
+  PerformanceAnalysisConfig,
+  QueryHistoryItemForAnalysis,
+  ScheduledQuery,
+  ScheduledQueryRun,
+  CreateScheduledQueryInput,
+  UpdateScheduledQueryInput,
+  Dashboard,
+  Widget,
+  WidgetRunResult,
+  CreateDashboardInput,
+  UpdateDashboardInput,
+  CreateWidgetInput,
+  UpdateWidgetInput,
+  WidgetLayout,
+  ColumnStats,
+  ColumnStatsRequest,
+  CsvImportRequest,
+  CsvImportResult,
+  CsvImportProgress,
+  DataGenConfig,
+  DataGenResult,
+  DataGenProgress,
+  PgNotificationEvent,
+  PgNotificationChannel,
+  PgNotificationConnectionStatus,
+  ActiveQuery,
+  TableSizeInfo,
+  CacheStats,
+  LockInfo,
+  DatabaseSizeInfo,
+  SchemaIntelCheckId,
+  SchemaIntelReport,
+  PgExportOptions,
+  PgExportProgress,
+  PgExportResult,
+  PgImportOptions,
+  PgImportProgress,
+  PgImportResult,
+  Notebook,
+  NotebookWithCells,
+  NotebookCell,
+  CreateNotebookInput,
+  UpdateNotebookInput,
+  AddCellInput,
+  UpdateCellInput,
+  StartStepRequest,
+  StartStepResponse,
+  NextStepResponse,
+  SkipStepResponse,
+  ContinueStepResponse,
+  RetryStepResponse,
+  StopStepResponse,
+  TimeMachineCapturePayload,
+  TimeMachineRunMeta,
+  TimeMachineSnapshot,
+  TimeMachineListResult,
+  TimeMachineStats,
+  McpServerStatus,
+  McpApprovalRequest,
+  AuditStatus,
+  AuditVerifyResult
 } from '@shared/index'
 
 // Re-export AI types for renderer consumers
-export type { AIProvider, AIConfig, AIMessage, AIChatResponse, StoredChatMessage, ChatSession }
+export type {
+  AIProvider,
+  AIConfig,
+  AIMessage,
+  AIChatResponse,
+  AIChatStreamEvent,
+  StoredChatMessage,
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig
+}
 
 // Custom APIs for renderer
 const api = {
@@ -36,16 +114,42 @@ const api = {
       ipcRenderer.invoke('connections:add', connection),
     update: (connection: ConnectionConfig): Promise<IpcResponse<ConnectionConfig>> =>
       ipcRenderer.invoke('connections:update', connection),
-    delete: (id: string): Promise<IpcResponse<void>> => ipcRenderer.invoke('connections:delete', id)
+    delete: (id: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('connections:delete', id),
+    // Listen for connection changes from other windows
+    onConnectionsUpdated: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('connections:updated', handler)
+      return () => ipcRenderer.removeListener('connections:updated', handler)
+    }
   },
   // Database operations
   db: {
     connect: (config: ConnectionConfig): Promise<IpcResponse<void>> =>
       ipcRenderer.invoke('db:connect', config),
-    query: (config: ConnectionConfig, query: string): Promise<IpcResponse<unknown>> =>
-      ipcRenderer.invoke('db:query', { config, query }),
-    schemas: (config: ConnectionConfig): Promise<IpcResponse<DatabaseSchema>> =>
-      ipcRenderer.invoke('db:schemas', config),
+    query: (
+      config: ConnectionConfig,
+      query: string,
+      executionId?: string,
+      queryTimeoutMs?: number,
+      sessionId?: string
+    ) => ipcRenderer.invoke('db:query', { config, query, executionId, queryTimeoutMs, sessionId }),
+    cancelQuery: (executionId: string): Promise<IpcResponse<{ cancelled: boolean }>> =>
+      ipcRenderer.invoke('db:cancel-query', executionId),
+    schemas: (
+      config: ConnectionConfig,
+      forceRefresh?: boolean
+    ): Promise<IpcResponse<DatabaseSchemaResponse>> =>
+      ipcRenderer.invoke('db:schemas', { config, forceRefresh }),
+    invalidateSchemaCache: (config: ConnectionConfig) =>
+      ipcRenderer.invoke('db:invalidate-schema-cache', config),
+    // Transactions
+    beginTransaction: (config: ConnectionConfig, sessionId: string) =>
+      ipcRenderer.invoke('db:begin-transaction', { config, sessionId }),
+    commitTransaction: (config: ConnectionConfig, sessionId: string) =>
+      ipcRenderer.invoke('db:commit-transaction', { config, sessionId }),
+    rollbackTransaction: (config: ConnectionConfig, sessionId: string) =>
+      ipcRenderer.invoke('db:rollback-transaction', { config, sessionId }),
     execute: (config: ConnectionConfig, batch: EditBatch): Promise<IpcResponse<EditResult>> =>
       ipcRenderer.invoke('db:execute', { config, batch }),
     previewSql: (
@@ -57,7 +161,69 @@ const api = {
       query: string,
       analyze: boolean
     ): Promise<IpcResponse<{ plan: unknown; durationMs: number }>> =>
-      ipcRenderer.invoke('db:explain', { config, query, analyze })
+      ipcRenderer.invoke('db:explain', { config, query, analyze }),
+    // Query with telemetry collection
+    queryWithTelemetry: (
+      config: ConnectionConfig,
+      query: string,
+      executionId?: string,
+      queryTimeoutMs?: number,
+      sessionId?: string
+    ) =>
+      ipcRenderer.invoke('db:query-with-telemetry', {
+        config,
+        query,
+        executionId,
+        queryTimeoutMs,
+        sessionId
+      }),
+    // Benchmark query with multiple runs
+    benchmark: (
+      config: ConnectionConfig,
+      query: string,
+      runCount: number
+    ): Promise<IpcResponse<BenchmarkResult>> =>
+      ipcRenderer.invoke('db:benchmark', { config, query, runCount }),
+    // Analyze query performance (on-demand)
+    analyzePerformance: (
+      config: ConnectionConfig,
+      query: string,
+      queryHistory: QueryHistoryItemForAnalysis[],
+      analysisConfig?: Partial<PerformanceAnalysisConfig>
+    ): Promise<IpcResponse<PerformanceAnalysisResult>> =>
+      ipcRenderer.invoke('db:analyze-performance', { config, query, queryHistory, analysisConfig }),
+    columnStats: (
+      config: ConnectionConfig,
+      request: ColumnStatsRequest
+    ): Promise<IpcResponse<ColumnStats>> => ipcRenderer.invoke('db:column-stats', config, request),
+    importCsv: (
+      config: ConnectionConfig,
+      request: CsvImportRequest,
+      rows: unknown[][]
+    ): Promise<IpcResponse<CsvImportResult>> =>
+      ipcRenderer.invoke('db:import-csv', config, request, rows),
+    cancelImport: (): Promise<IpcResponse<void>> => ipcRenderer.invoke('db:import-cancel'),
+    onImportProgress: (callback: (progress: CsvImportProgress) => void): (() => void) => {
+      const handler = (_: unknown, progress: CsvImportProgress): void => callback(progress)
+      ipcRenderer.on('db:import-progress', handler)
+      return () => ipcRenderer.removeListener('db:import-progress', handler)
+    },
+    generateData: (
+      config: ConnectionConfig,
+      genConfig: DataGenConfig
+    ): Promise<IpcResponse<DataGenResult>> =>
+      ipcRenderer.invoke('db:generate-data', config, genConfig),
+    cancelGenerate: (): Promise<IpcResponse<void>> => ipcRenderer.invoke('db:generate-cancel'),
+    generatePreview: (
+      config: ConnectionConfig,
+      genConfig: DataGenConfig
+    ): Promise<IpcResponse<{ rows: unknown[][] }>> =>
+      ipcRenderer.invoke('db:generate-preview', config, genConfig),
+    onGenerateProgress: (callback: (progress: DataGenProgress) => void): (() => void) => {
+      const handler = (_: unknown, progress: DataGenProgress): void => callback(progress)
+      ipcRenderer.on('db:generate-progress', handler)
+      return () => ipcRenderer.removeListener('db:generate-progress', handler)
+    }
   },
   // DDL operations (Table Designer)
   ddl: {
@@ -117,10 +283,40 @@ const api = {
       ipcRenderer.on('menu:clear-results', handler)
       return () => ipcRenderer.removeListener('menu:clear-results', handler)
     },
+    onToggleWatch: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('menu:toggle-watch', handler)
+      return () => ipcRenderer.removeListener('menu:toggle-watch', handler)
+    },
+    onToggleTimeMachine: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('menu:toggle-time-machine', handler)
+      return () => ipcRenderer.removeListener('menu:toggle-time-machine', handler)
+    },
     onToggleSidebar: (callback: () => void): (() => void) => {
       const handler = (): void => callback()
       ipcRenderer.on('menu:toggle-sidebar', handler)
       return () => ipcRenderer.removeListener('menu:toggle-sidebar', handler)
+    },
+    onOpenSettings: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('menu:open-settings', handler)
+      return () => ipcRenderer.removeListener('menu:open-settings', handler)
+    },
+    onSaveChanges: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('menu:save-changes', handler)
+      return () => ipcRenderer.removeListener('menu:save-changes', handler)
+    },
+    onDiscardChanges: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('menu:discard-changes', handler)
+      return () => ipcRenderer.removeListener('menu:discard-changes', handler)
+    },
+    onAddRow: (callback: () => void): (() => void) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('menu:add-row', handler)
+      return () => ipcRenderer.removeListener('menu:add-row', handler)
     }
   },
   // License management
@@ -135,7 +331,9 @@ const api = {
       type?: LicenseType,
       daysValid?: number
     ): Promise<IpcResponse<LicenseStatus>> =>
-      ipcRenderer.invoke('license:activate-offline', { key, email, type, daysValid })
+      ipcRenderer.invoke('license:activate-offline', { key, email, type, daysValid }),
+    openCustomerPortal: (): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('license:customer-portal')
   },
   // Saved queries management
   savedQueries: {
@@ -154,7 +352,204 @@ const api = {
       return () => ipcRenderer.removeListener('open-saved-queries', handler)
     }
   },
-  // AI Assistant
+  // Query history persistence
+  queryHistory: {
+    list: (): Promise<IpcResponse<QueryHistoryEntry[]>> => ipcRenderer.invoke('query-history:list'),
+    add: (entry: QueryHistoryEntry): Promise<IpcResponse<QueryHistoryEntry>> =>
+      ipcRenderer.invoke('query-history:add', entry),
+    remove: (id: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('query-history:remove', id),
+    clear: (connectionId?: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('query-history:clear', connectionId)
+  },
+  // Snippets management
+  snippets: {
+    list: (): Promise<IpcResponse<Snippet[]>> => ipcRenderer.invoke('snippets:list'),
+    add: (snippet: Snippet): Promise<IpcResponse<Snippet>> =>
+      ipcRenderer.invoke('snippets:add', snippet),
+    update: (id: string, updates: Partial<Snippet>): Promise<IpcResponse<Snippet>> =>
+      ipcRenderer.invoke('snippets:update', { id, updates }),
+    delete: (id: string): Promise<IpcResponse<void>> => ipcRenderer.invoke('snippets:delete', id)
+  },
+  // Notebooks management
+  notebooks: {
+    list: (): Promise<IpcResponse<Notebook[]>> => ipcRenderer.invoke('notebooks:list'),
+    get: (id: string): Promise<IpcResponse<NotebookWithCells>> =>
+      ipcRenderer.invoke('notebooks:get', id),
+    create: (input: CreateNotebookInput): Promise<IpcResponse<Notebook>> =>
+      ipcRenderer.invoke('notebooks:create', input),
+    update: (id: string, updates: UpdateNotebookInput): Promise<IpcResponse<Notebook>> =>
+      ipcRenderer.invoke('notebooks:update', { id, updates }),
+    delete: (id: string): Promise<IpcResponse<void>> => ipcRenderer.invoke('notebooks:delete', id),
+    duplicate: (id: string, connectionId: string): Promise<IpcResponse<Notebook>> =>
+      ipcRenderer.invoke('notebooks:duplicate', { id, connectionId }),
+    addCell: (notebookId: string, input: AddCellInput): Promise<IpcResponse<NotebookCell>> =>
+      ipcRenderer.invoke('notebooks:add-cell', { notebookId, input }),
+    updateCell: (cellId: string, updates: UpdateCellInput): Promise<IpcResponse<NotebookCell>> =>
+      ipcRenderer.invoke('notebooks:update-cell', { cellId, updates }),
+    deleteCell: (cellId: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('notebooks:delete-cell', cellId),
+    reorderCells: (notebookId: string, cellIds: string[]): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('notebooks:reorder-cells', { notebookId, cellIds })
+  },
+  // Time Machine result snapshots
+  timeMachine: {
+    capture: (payload: TimeMachineCapturePayload): Promise<IpcResponse<TimeMachineRunMeta>> =>
+      ipcRenderer.invoke('time-machine:capture', payload),
+    listRuns: (connectionId: string, sql: string): Promise<IpcResponse<TimeMachineListResult>> =>
+      ipcRenderer.invoke('time-machine:list-runs', { connectionId, sql }),
+    getSnapshot: (id: string): Promise<IpcResponse<TimeMachineSnapshot>> =>
+      ipcRenderer.invoke('time-machine:get-snapshot', id),
+    deleteRun: (id: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('time-machine:delete-run', id),
+    clearQuery: (connectionId: string, sql: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('time-machine:clear-query', { connectionId, sql }),
+    clearAll: (connectionId?: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('time-machine:clear-all', connectionId),
+    stats: (): Promise<IpcResponse<TimeMachineStats>> => ipcRenderer.invoke('time-machine:stats')
+  },
+  step: {
+    start: (
+      config: ConnectionConfig,
+      request: StartStepRequest
+    ): Promise<IpcResponse<StartStepResponse>> =>
+      ipcRenderer.invoke('step:start', { config, request }),
+    next: (sessionId: string): Promise<IpcResponse<NextStepResponse>> =>
+      ipcRenderer.invoke('step:next', sessionId),
+    skip: (sessionId: string): Promise<IpcResponse<SkipStepResponse>> =>
+      ipcRenderer.invoke('step:skip', sessionId),
+    continue: (sessionId: string): Promise<IpcResponse<ContinueStepResponse>> =>
+      ipcRenderer.invoke('step:continue', sessionId),
+    retry: (sessionId: string): Promise<IpcResponse<RetryStepResponse>> =>
+      ipcRenderer.invoke('step:retry', sessionId),
+    setBreakpoints: (sessionId: string, breakpoints: number[]): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('step:set-breakpoints', { sessionId, breakpoints }),
+    stop: (sessionId: string): Promise<IpcResponse<StopStepResponse>> =>
+      ipcRenderer.invoke('step:stop', sessionId)
+  },
+  // Scheduled queries management
+  scheduledQueries: {
+    list: (): Promise<IpcResponse<ScheduledQuery[]>> =>
+      ipcRenderer.invoke('scheduled-queries:list'),
+    get: (id: string): Promise<IpcResponse<ScheduledQuery>> =>
+      ipcRenderer.invoke('scheduled-queries:get', id),
+    create: (input: CreateScheduledQueryInput): Promise<IpcResponse<ScheduledQuery>> =>
+      ipcRenderer.invoke('scheduled-queries:create', input),
+    update: (
+      id: string,
+      updates: UpdateScheduledQueryInput
+    ): Promise<IpcResponse<ScheduledQuery>> =>
+      ipcRenderer.invoke('scheduled-queries:update', { id, updates }),
+    delete: (id: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('scheduled-queries:delete', id),
+    pause: (id: string): Promise<IpcResponse<ScheduledQuery>> =>
+      ipcRenderer.invoke('scheduled-queries:pause', id),
+    resume: (id: string): Promise<IpcResponse<ScheduledQuery>> =>
+      ipcRenderer.invoke('scheduled-queries:resume', id),
+    runNow: (id: string): Promise<IpcResponse<ScheduledQueryRun>> =>
+      ipcRenderer.invoke('scheduled-queries:run-now', id),
+    getRuns: (queryId: string, limit?: number): Promise<IpcResponse<ScheduledQueryRun[]>> =>
+      ipcRenderer.invoke('scheduled-queries:get-runs', { queryId, limit }),
+    getAllRuns: (limit?: number): Promise<IpcResponse<ScheduledQueryRun[]>> =>
+      ipcRenderer.invoke('scheduled-queries:get-all-runs', limit),
+    clearRuns: (queryId: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('scheduled-queries:clear-runs', queryId),
+    validateCron: (expression: string): Promise<IpcResponse<{ valid: boolean; error?: string }>> =>
+      ipcRenderer.invoke('scheduled-queries:validate-cron', expression),
+    getNextRuns: (
+      expression: string,
+      count?: number,
+      timezone?: string
+    ): Promise<IpcResponse<number[]>> =>
+      ipcRenderer.invoke('scheduled-queries:get-next-runs', { expression, count, timezone })
+  },
+  // Dashboard management
+  dashboards: {
+    list: (): Promise<IpcResponse<Dashboard[]>> => ipcRenderer.invoke('dashboards:list'),
+    get: (id: string): Promise<IpcResponse<Dashboard>> => ipcRenderer.invoke('dashboards:get', id),
+    create: (input: CreateDashboardInput): Promise<IpcResponse<Dashboard>> =>
+      ipcRenderer.invoke('dashboards:create', input),
+    update: (id: string, updates: UpdateDashboardInput): Promise<IpcResponse<Dashboard>> =>
+      ipcRenderer.invoke('dashboards:update', { id, updates }),
+    delete: (id: string): Promise<IpcResponse<void>> => ipcRenderer.invoke('dashboards:delete', id),
+    duplicate: (id: string): Promise<IpcResponse<Dashboard>> =>
+      ipcRenderer.invoke('dashboards:duplicate', id),
+    addWidget: (dashboardId: string, widget: CreateWidgetInput): Promise<IpcResponse<Widget>> =>
+      ipcRenderer.invoke('dashboards:add-widget', { dashboardId, widget }),
+    updateWidget: (
+      dashboardId: string,
+      widgetId: string,
+      updates: UpdateWidgetInput
+    ): Promise<IpcResponse<Widget>> =>
+      ipcRenderer.invoke('dashboards:update-widget', { dashboardId, widgetId, updates }),
+    deleteWidget: (dashboardId: string, widgetId: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('dashboards:delete-widget', { dashboardId, widgetId }),
+    updateWidgetLayouts: (
+      dashboardId: string,
+      layouts: Record<string, WidgetLayout>
+    ): Promise<IpcResponse<Dashboard>> =>
+      ipcRenderer.invoke('dashboards:update-widget-layouts', { dashboardId, layouts }),
+    executeWidget: (widget: Widget): Promise<IpcResponse<WidgetRunResult>> =>
+      ipcRenderer.invoke('dashboards:execute-widget', widget),
+    executeAllWidgets: (dashboardId: string): Promise<IpcResponse<WidgetRunResult[]>> =>
+      ipcRenderer.invoke('dashboards:execute-all-widgets', dashboardId),
+    getByTag: (tag: string): Promise<IpcResponse<Dashboard[]>> =>
+      ipcRenderer.invoke('dashboards:get-by-tag', tag),
+    getAllTags: (): Promise<IpcResponse<string[]>> => ipcRenderer.invoke('dashboards:get-all-tags'),
+    updateRefreshSchedule: (
+      dashboardId: string,
+      schedule: Dashboard['refreshSchedule']
+    ): Promise<IpcResponse<Dashboard>> =>
+      ipcRenderer.invoke('dashboards:update-refresh-schedule', { dashboardId, schedule }),
+    getNextRefreshTime: (
+      schedule: NonNullable<Dashboard['refreshSchedule']>
+    ): Promise<IpcResponse<number | null>> =>
+      ipcRenderer.invoke('dashboards:get-next-refresh-time', schedule),
+    validateCron: (expression: string): Promise<IpcResponse<{ valid: boolean; error?: string }>> =>
+      ipcRenderer.invoke('dashboards:validate-cron', expression),
+    getNextRefreshTimes: (
+      expression: string,
+      count?: number,
+      timezone?: string
+    ): Promise<IpcResponse<number[]>> =>
+      ipcRenderer.invoke('dashboards:get-next-refresh-times', { expression, count, timezone }),
+    onRefreshComplete: (
+      callback: (data: { dashboardId: string; results: WidgetRunResult[] }) => void
+    ): (() => void) => {
+      const handler = (
+        _: unknown,
+        data: { dashboardId: string; results: WidgetRunResult[] }
+      ): void => callback(data)
+      ipcRenderer.on('dashboard:refresh-complete', handler)
+      return () => ipcRenderer.removeListener('dashboard:refresh-complete', handler)
+    }
+  },
+  // Auto-updater event listeners
+  updater: {
+    onUpdateAvailable: (callback: (version: string) => void): (() => void) => {
+      const handler = (_: unknown, version: string): void => callback(version)
+      ipcRenderer.on('updater:update-available', handler)
+      return () => ipcRenderer.removeListener('updater:update-available', handler)
+    },
+    onUpdateDownloaded: (callback: (version: string) => void): (() => void) => {
+      const handler = (_: unknown, version: string): void => callback(version)
+      ipcRenderer.on('updater:update-downloaded', handler)
+      return () => ipcRenderer.removeListener('updater:update-downloaded', handler)
+    },
+    onDownloadProgress: (callback: (percent: number) => void): (() => void) => {
+      const handler = (_: unknown, percent: number): void => callback(percent)
+      ipcRenderer.on('updater:download-progress', handler)
+      return () => ipcRenderer.removeListener('updater:download-progress', handler)
+    },
+    onError: (callback: (message: string) => void): (() => void) => {
+      const handler = (_: unknown, message: string): void => callback(message)
+      ipcRenderer.on('updater:error', handler)
+      return () => ipcRenderer.removeListener('updater:error', handler)
+    },
+    quitAndInstall: (): void => {
+      ipcRenderer.send('updater:quit-and-install')
+    }
+  },
   ai: {
     getConfig: (): Promise<IpcResponse<AIConfig | null>> => ipcRenderer.invoke('ai:get-config'),
     setConfig: (config: AIConfig): Promise<IpcResponse<void>> =>
@@ -162,12 +557,78 @@ const api = {
     clearConfig: (): Promise<IpcResponse<void>> => ipcRenderer.invoke('ai:clear-config'),
     validateKey: (config: AIConfig): Promise<IpcResponse<{ valid: boolean; error?: string }>> =>
       ipcRenderer.invoke('ai:validate-key', config),
+    detectHarness: (
+      provider?: AIProvider
+    ): Promise<
+      IpcResponse<{ available: boolean; path?: string; version?: string; error?: string }>
+    > => ipcRenderer.invoke('ai:detect-harness', provider),
+    generateDashboard: (
+      prompt: string,
+      schemas: SchemaInfo[],
+      dbType: string,
+      connectionId?: string
+    ): Promise<{
+      success: boolean
+      spec?: {
+        title: string
+        widgets: Array<{
+          title: string
+          kind: 'kpi' | 'chart' | 'table'
+          sql: string
+          chartType?: 'bar' | 'line' | 'pie' | 'area' | null
+          format?: 'number' | 'currency' | 'percent' | 'duration' | null
+          xKey?: string | null
+          yKeys?: string[] | null
+        }>
+      }
+      error?: string
+    }> => ipcRenderer.invoke('ai:generate-dashboard', { prompt, schemas, dbType, connectionId }),
     chat: (
       messages: AIMessage[],
       schemas: SchemaInfo[],
-      dbType: string
-    ): Promise<IpcResponse<AIChatResponse>> =>
-      ipcRenderer.invoke('ai:chat', { messages, schemas, dbType }),
+      dbType: string,
+      connectionId?: string
+    ): Promise<
+      IpcResponse<AIChatResponse> & {
+        meta?: { grounded: boolean; agentic: boolean; turns?: number }
+      }
+    > => ipcRenderer.invoke('ai:chat', { messages, schemas, dbType, connectionId }),
+    // Streaming chat: resolves with the final response; `onEvent` fires with
+    // incremental prose/activity while it runs. Each call is keyed by a
+    // requestId so concurrent chats don't cross streams.
+    chatStream: (
+      messages: AIMessage[],
+      schemas: SchemaInfo[],
+      dbType: string,
+      connectionId: string | undefined,
+      resumeSessionId: string | undefined,
+      onEvent: (event: AIChatStreamEvent) => void
+    ): Promise<
+      IpcResponse<AIChatResponse> & {
+        meta?: { grounded: boolean; agentic: boolean; turns?: number; sessionId?: string }
+      }
+    > => {
+      const requestId =
+        globalThis.crypto?.randomUUID?.() ??
+        `req-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const listener = (
+        _e: unknown,
+        payload: { requestId: string; event: AIChatStreamEvent }
+      ): void => {
+        if (payload?.requestId === requestId) onEvent(payload.event)
+      }
+      ipcRenderer.on('ai:chat-stream:event', listener)
+      return ipcRenderer
+        .invoke('ai:chat-stream', {
+          requestId,
+          messages,
+          schemas,
+          dbType,
+          connectionId,
+          resumeSessionId
+        })
+        .finally(() => ipcRenderer.removeListener('ai:chat-stream:event', listener))
+    },
     // Chat history persistence (legacy API)
     getChatHistory: (connectionId: string): Promise<IpcResponse<StoredChatMessage[]>> =>
       ipcRenderer.invoke('ai:get-chat-history', connectionId),
@@ -195,7 +656,157 @@ const api = {
     ): Promise<IpcResponse<ChatSession | null>> =>
       ipcRenderer.invoke('ai:update-session', { connectionId, sessionId, updates }),
     deleteSession: (connectionId: string, sessionId: string): Promise<IpcResponse<boolean>> =>
-      ipcRenderer.invoke('ai:delete-session', { connectionId, sessionId })
+      ipcRenderer.invoke('ai:delete-session', { connectionId, sessionId }),
+    // Multi-provider configuration
+    getMultiProviderConfig: (): Promise<IpcResponse<AIMultiProviderConfig | null>> =>
+      ipcRenderer.invoke('ai:get-multi-provider-config'),
+    setMultiProviderConfig: (config: AIMultiProviderConfig | null): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-multi-provider-config', config),
+    getProviderConfig: (provider: AIProvider): Promise<IpcResponse<AIProviderConfig | null>> =>
+      ipcRenderer.invoke('ai:get-provider-config', provider),
+    setProviderConfig: (
+      provider: AIProvider,
+      config: AIProviderConfig
+    ): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-provider-config', { provider, config }),
+    removeProviderConfig: (provider: AIProvider): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:remove-provider-config', provider),
+    setActiveProvider: (provider: AIProvider): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-active-provider', provider),
+    setActiveModel: (provider: AIProvider, model: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('ai:set-active-model', { provider, model })
+  },
+  files: {
+    openFilePicker: (): Promise<string | null> => ipcRenderer.invoke('open-file-dialog')
+  },
+  intel: {
+    run: (
+      config: ConnectionConfig,
+      checks?: SchemaIntelCheckId[]
+    ): Promise<IpcResponse<SchemaIntelReport>> =>
+      ipcRenderer.invoke('intel:run', { config, checks })
+  },
+  health: {
+    activeQueries: (config: ConnectionConfig): Promise<IpcResponse<ActiveQuery[]>> =>
+      ipcRenderer.invoke('db:active-queries', config),
+    tableSizes: (
+      config: ConnectionConfig,
+      schema?: string
+    ): Promise<IpcResponse<{ dbSize: DatabaseSizeInfo; tables: TableSizeInfo[] }>> =>
+      ipcRenderer.invoke('db:table-sizes', config, schema),
+    cacheStats: (config: ConnectionConfig): Promise<IpcResponse<CacheStats>> =>
+      ipcRenderer.invoke('db:cache-stats', config),
+    locks: (config: ConnectionConfig): Promise<IpcResponse<LockInfo[]>> =>
+      ipcRenderer.invoke('db:locks', config),
+    killQuery: (
+      config: ConnectionConfig,
+      pid: number
+    ): Promise<IpcResponse<{ success: boolean; error?: string }>> =>
+      ipcRenderer.invoke('db:kill-query', config, pid)
+  },
+  pgNotify: {
+    subscribe: (
+      connectionId: string,
+      config: ConnectionConfig,
+      channel: string
+    ): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('pg-notify:subscribe', connectionId, config, channel),
+    unsubscribe: (connectionId: string, channel: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('pg-notify:unsubscribe', connectionId, channel),
+    send: (
+      config: ConnectionConfig,
+      channel: string,
+      payload: string
+    ): Promise<IpcResponse<void>> => ipcRenderer.invoke('pg-notify:send', config, channel, payload),
+    getChannels: (connectionId: string): Promise<IpcResponse<PgNotificationChannel[]>> =>
+      ipcRenderer.invoke('pg-notify:get-channels', connectionId),
+    getHistory: (
+      connectionId: string,
+      limit?: number
+    ): Promise<IpcResponse<PgNotificationEvent[]>> =>
+      ipcRenderer.invoke('pg-notify:get-history', connectionId, limit),
+    clearHistory: (connectionId: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('pg-notify:clear-history', connectionId),
+    onEvent: (callback: (event: PgNotificationEvent) => void): (() => void) => {
+      const handler = (_: unknown, event: PgNotificationEvent): void => callback(event)
+      ipcRenderer.on('pg-notify:event', handler)
+      return () => ipcRenderer.removeListener('pg-notify:event', handler)
+    },
+    onStatus: (callback: (status: PgNotificationConnectionStatus) => void): (() => void) => {
+      const handler = (_: unknown, status: PgNotificationConnectionStatus): void => callback(status)
+      ipcRenderer.on('pg-notify:status', handler)
+      return () => ipcRenderer.removeListener('pg-notify:status', handler)
+    },
+    reconnect: (connectionId: string): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('pg-notify:reconnect', connectionId),
+    getStatus: (
+      connectionId: string
+    ): Promise<IpcResponse<PgNotificationConnectionStatus | null>> =>
+      ipcRenderer.invoke('pg-notify:get-status', connectionId),
+    getAllStatuses: (): Promise<IpcResponse<PgNotificationConnectionStatus[]>> =>
+      ipcRenderer.invoke('pg-notify:get-all-statuses')
+  },
+  pgDump: {
+    export: (
+      config: ConnectionConfig,
+      options: PgExportOptions
+    ): Promise<IpcResponse<PgExportResult>> => ipcRenderer.invoke('db:pg-export', config, options),
+    cancelExport: (): Promise<IpcResponse<void>> => ipcRenderer.invoke('db:pg-export-cancel'),
+    onExportProgress: (callback: (progress: PgExportProgress) => void): (() => void) => {
+      const handler = (_: unknown, progress: PgExportProgress): void => callback(progress)
+      ipcRenderer.on('db:pg-export-progress', handler)
+      return () => ipcRenderer.removeListener('db:pg-export-progress', handler)
+    },
+    import: (
+      config: ConnectionConfig,
+      options: PgImportOptions
+    ): Promise<IpcResponse<PgImportResult>> => ipcRenderer.invoke('db:pg-import', config, options),
+    cancelImport: (): Promise<IpcResponse<void>> => ipcRenderer.invoke('db:pg-import-cancel'),
+    onImportProgress: (callback: (progress: PgImportProgress) => void): (() => void) => {
+      const handler = (_: unknown, progress: PgImportProgress): void => callback(progress)
+      ipcRenderer.on('db:pg-import-progress', handler)
+      return () => ipcRenderer.removeListener('db:pg-import-progress', handler)
+    }
+  },
+  window: {
+    minimize: (): Promise<void> => ipcRenderer.invoke('minimize-window'),
+    maximize: (): Promise<void> => ipcRenderer.invoke('maximize-window'),
+    close: (): Promise<void> => ipcRenderer.invoke('close-window'),
+    setConnectionInfo: (connectionName: string | null): void =>
+      ipcRenderer.send('window:set-connection-info', connectionName)
+  },
+  mcp: {
+    status: (): Promise<IpcResponse<McpServerStatus>> => ipcRenderer.invoke('mcp:status'),
+    setEnabled: (enabled: boolean): Promise<IpcResponse<McpServerStatus>> =>
+      ipcRenderer.invoke('mcp:setEnabled', { enabled }),
+    setPort: (port: number): Promise<IpcResponse<McpServerStatus>> =>
+      ipcRenderer.invoke('mcp:setPort', { port }),
+    regenerateToken: (): Promise<IpcResponse<McpServerStatus>> =>
+      ipcRenderer.invoke('mcp:regenerateToken'),
+    respondToApproval: (id: string, approved: boolean): Promise<IpcResponse<void>> =>
+      ipcRenderer.invoke('mcp:approval:respond', { id, approved }),
+    onApprovalRequest: (callback: (req: McpApprovalRequest) => void): (() => void) => {
+      const listener = (_event: unknown, req: McpApprovalRequest): void => callback(req)
+      ipcRenderer.on('mcp:approval:request', listener)
+      return () => ipcRenderer.removeListener('mcp:approval:request', listener)
+    },
+    onApprovalResolved: (callback: (payload: { id: string }) => void): (() => void) => {
+      const listener = (_event: unknown, payload: { id: string }): void => callback(payload)
+      ipcRenderer.on('mcp:approval:resolved', listener)
+      return () => ipcRenderer.removeListener('mcp:approval:resolved', listener)
+    }
+  },
+  audit: {
+    status: (): Promise<IpcResponse<AuditStatus>> => ipcRenderer.invoke('audit:status'),
+    setEnabled: (enabled: boolean): Promise<IpcResponse<AuditStatus>> =>
+      ipcRenderer.invoke('audit:setEnabled', { enabled }),
+    setRetention: (days: number): Promise<IpcResponse<AuditStatus>> =>
+      ipcRenderer.invoke('audit:setRetention', { days }),
+    verify: (): Promise<IpcResponse<AuditVerifyResult>> => ipcRenderer.invoke('audit:verify'),
+    export: (
+      format: 'csv' | 'json'
+    ): Promise<IpcResponse<{ path: string; entries: number } | null>> =>
+      ipcRenderer.invoke('audit:export', { format })
   }
 }
 

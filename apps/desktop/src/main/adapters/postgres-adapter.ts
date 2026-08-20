@@ -1,251 +1,115 @@
-import { Client } from 'pg'
-import type {
-  ConnectionConfig,
-  SchemaInfo,
-  TableInfo,
-  ColumnInfo,
-  QueryField,
-  ForeignKeyInfo,
-  TableDefinition,
-  ColumnDefinition,
-  ConstraintDefinition,
-  IndexDefinition,
-  SequenceInfo,
-  CustomTypeInfo,
-  StatementResult
+import { randomUUID } from 'crypto'
+import {
+  resolvePostgresType,
+  type ConnectionConfig,
+  type SchemaInfo,
+  type TableInfo,
+  type ColumnInfo,
+  type QueryField,
+  type ForeignKeyInfo,
+  type TableDefinition,
+  type ColumnDefinition,
+  type ConstraintDefinition,
+  type IndexDefinition,
+  type SequenceInfo,
+  type CustomTypeInfo,
+  type StatementResult,
+  type RoutineInfo,
+  type RoutineParameterInfo,
+  type TriggerInfo,
+  type ColumnStats,
+  type ColumnStatsType,
+  type HistogramBucket,
+  type CommonValue,
+  type ActiveQuery,
+  type TableSizeInfo,
+  type CacheStats,
+  type LockInfo,
+  type DatabaseSizeInfo,
+  type SchemaIntelCheckId,
+  type SchemaIntelReport
 } from '@shared/index'
+import { runPostgresSchemaIntel } from '../schema-intel/postgres'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  DedicatedClient,
+  ExplainResult,
+  NotificationClient,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
+import { splitStatements } from '../lib/sql-parser'
+import { telemetryCollector, TELEMETRY_PHASES } from '../telemetry-collector'
+import {
+  withPgClient,
+  withPgTransaction,
+  acquirePgSessionClient,
+  pgPoolIdentity,
+  type PgSessionLease
+} from './pg-pool-manager'
+
+import { createPgDedicatedClient, createPgNotificationClient } from './pg-dedicated-client'
+
+export { buildClientConfig } from './pg-client-config'
+
+/** Split SQL into statements for PostgreSQL */
+const splitPgStatements = (sql: string) => splitStatements(sql, 'postgresql')
 
 /**
- * PostgreSQL OID to Type Name Mapping
- * Reference: https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat
+ * Parse a PostgreSQL array literal string like "{val1,val2}" into a JS array.
+ * The pg driver sometimes returns array_agg results as raw strings instead of
+ * parsed JS arrays (especially for name[] / _name type).
  */
-const PG_TYPE_MAP: Record<number, string> = {
-  16: 'boolean',
-  17: 'bytea',
-  18: 'char',
-  19: 'name',
-  20: 'bigint',
-  21: 'smallint',
-  23: 'integer',
-  24: 'regproc',
-  25: 'text',
-  26: 'oid',
-  114: 'json',
-  142: 'xml',
-  600: 'point',
-  601: 'lseg',
-  602: 'path',
-  603: 'box',
-  604: 'polygon',
-  628: 'line',
-  700: 'real',
-  701: 'double precision',
-  718: 'circle',
-  790: 'money',
-  829: 'macaddr',
-  869: 'inet',
-  650: 'cidr',
-  1042: 'char',
-  1043: 'varchar',
-  1082: 'date',
-  1083: 'time',
-  1114: 'timestamp',
-  1184: 'timestamptz',
-  1186: 'interval',
-  1266: 'timetz',
-  1560: 'bit',
-  1562: 'varbit',
-  1700: 'numeric',
-  2950: 'uuid',
-  3802: 'jsonb',
-  3904: 'int4range',
-  3906: 'numrange',
-  3908: 'tsrange',
-  3910: 'tstzrange',
-  3912: 'daterange',
-  3926: 'int8range',
-  // Array types (common ones)
-  1000: 'boolean[]',
-  1001: 'bytea[]',
-  1005: 'smallint[]',
-  1007: 'integer[]',
-  1009: 'text[]',
-  1014: 'char[]',
-  1015: 'varchar[]',
-  1016: 'bigint[]',
-  1021: 'real[]',
-  1022: 'double precision[]',
-  1028: 'oid[]',
-  1115: 'timestamp[]',
-  1182: 'date[]',
-  1183: 'time[]',
-  1231: 'numeric[]',
-  2951: 'uuid[]',
-  3807: 'jsonb[]',
-  199: 'json[]'
+export function parsePostgresArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      const inner = trimmed.slice(1, -1)
+      if (inner === '') return []
+      return inner.split(',').map((v) => v.trim().replace(/^"|"$/g, ''))
+    }
+  }
+  return []
 }
 
-/**
- * Resolve PostgreSQL OID to human-readable type name
- */
-function resolvePostgresType(dataTypeID: number): string {
-  return PG_TYPE_MAP[dataTypeID] ?? `unknown(${dataTypeID})`
-}
+// PostgreSQL encodes trigger metadata as a bitmask in pg_trigger.tgtype.
+const TRIGGER_TYPE_ROW = 1 << 0
+const TRIGGER_TYPE_BEFORE = 1 << 1
+const TRIGGER_TYPE_INSERT = 1 << 2
+const TRIGGER_TYPE_DELETE = 1 << 3
+const TRIGGER_TYPE_UPDATE = 1 << 4
+const TRIGGER_TYPE_TRUNCATE = 1 << 5
+const TRIGGER_TYPE_INSTEAD = 1 << 6
 
 /**
- * Split SQL into individual statements, respecting string literals and comments
- * Handles: single quotes, double quotes, dollar-quoted strings, line comments (--)
- * and block comments
+ * Decode a PostgreSQL `pg_trigger.tgtype` bitmask into readable trigger metadata.
  */
-function splitStatements(sql: string): string[] {
-  const statements: string[] = []
-  let current = ''
-  let i = 0
+export function parsePostgresTriggerType(
+  tgtype: number
+): Pick<TriggerInfo, 'timing' | 'events' | 'orientation'> {
+  const timing: TriggerInfo['timing'] =
+    tgtype & TRIGGER_TYPE_INSTEAD ? 'INSTEAD OF' : tgtype & TRIGGER_TYPE_BEFORE ? 'BEFORE' : 'AFTER'
 
-  while (i < sql.length) {
-    const char = sql[i]
-    const nextChar = sql[i + 1]
+  const events: string[] = []
+  if (tgtype & TRIGGER_TYPE_INSERT) events.push('INSERT')
+  if (tgtype & TRIGGER_TYPE_UPDATE) events.push('UPDATE')
+  if (tgtype & TRIGGER_TYPE_DELETE) events.push('DELETE')
+  if (tgtype & TRIGGER_TYPE_TRUNCATE) events.push('TRUNCATE')
 
-    // Handle single-quoted strings
-    if (char === "'") {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") {
-          // Escaped single quote
-          current += "''"
-          i += 2
-        } else if (sql[i] === "'") {
-          current += "'"
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle double-quoted identifiers
-    if (char === '"') {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === '"' && sql[i + 1] === '"') {
-          // Escaped double quote
-          current += '""'
-          i += 2
-        } else if (sql[i] === '"') {
-          current += '"'
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle dollar-quoted strings (PostgreSQL-specific)
-    if (char === '$') {
-      // Find the tag (e.g., $tag$ or $$)
-      let tag = '$'
-      let j = i + 1
-      while (j < sql.length && (sql[j].match(/[a-zA-Z0-9_]/) || sql[j] === '$')) {
-        tag += sql[j]
-        if (sql[j] === '$') {
-          j++
-          break
-        }
-        j++
-      }
-      if (tag.endsWith('$') && tag.length >= 2) {
-        // Valid dollar quote tag
-        current += tag
-        i = j
-        // Find closing tag
-        const closeIdx = sql.indexOf(tag, i)
-        if (closeIdx !== -1) {
-          current += sql.substring(i, closeIdx + tag.length)
-          i = closeIdx + tag.length
-        } else {
-          // No closing tag, consume rest
-          current += sql.substring(i)
-          i = sql.length
-        }
-        continue
-      }
-    }
-
-    // Handle line comments (--)
-    if (char === '-' && nextChar === '-') {
-      current += '--'
-      i += 2
-      while (i < sql.length && sql[i] !== '\n') {
-        current += sql[i]
-        i++
-      }
-      continue
-    }
-
-    // Handle block comments (/* */)
-    if (char === '/' && nextChar === '*') {
-      current += '/*'
-      i += 2
-      let depth = 1
-      while (i < sql.length && depth > 0) {
-        if (sql[i] === '/' && sql[i + 1] === '*') {
-          current += '/*'
-          depth++
-          i += 2
-        } else if (sql[i] === '*' && sql[i + 1] === '/') {
-          current += '*/'
-          depth--
-          i += 2
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Statement separator
-    if (char === ';') {
-      const stmt = current.trim()
-      if (stmt) {
-        statements.push(stmt)
-      }
-      current = ''
-      i++
-      continue
-    }
-
-    current += char
-    i++
+  return {
+    timing,
+    events,
+    orientation: tgtype & TRIGGER_TYPE_ROW ? 'ROW' : 'STATEMENT'
   }
-
-  // Don't forget the last statement (without trailing semicolon)
-  const lastStmt = current.trim()
-  if (lastStmt) {
-    statements.push(lastStmt)
-  }
-
-  return statements
 }
 
 /**
  * Check if a SQL statement is data-returning (SELECT, RETURNING, etc.)
  */
-function isDataReturningStatement(sql: string): boolean {
+export function isDataReturningStatement(sql: string): boolean {
   const normalized = sql.trim().toUpperCase()
   // SELECT statements return data
   if (normalized.startsWith('SELECT')) return true
@@ -269,99 +133,181 @@ function isDataReturningStatement(sql: string): boolean {
  */
 export class PostgresAdapter implements DatabaseAdapter {
   readonly dbType = 'postgresql' as const
+  // Sessions carry the identity of the connection they were opened against so a
+  // connection being edited or deleted can drain just its own parked transactions.
+  private sessions = new Map<string, { lease: PgSessionLease; poolIdentity: string }>()
+  private pendingSessions = new Set<string>()
 
   async connect(config: ConnectionConfig): Promise<void> {
-    const client = new Client(config)
-    await client.connect()
-    await client.end()
+    // Warm the pool AND verify the socket end-to-end. An empty callback would only
+    // exercise pool.connect(), which can hand back a cached idle client without a
+    // round-trip; SELECT 1 guarantees the connection is live.
+    await withPgClient(config, async (client) => {
+      await client.query('SELECT 1')
+    })
   }
 
   async query(config: ConnectionConfig, sql: string): Promise<AdapterQueryResult> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
+    return withPgClient(config, async (client) => {
       const res = await client.query(sql)
-
       const fields: QueryField[] = res.fields.map((f) => ({
         name: f.name,
         dataType: resolvePostgresType(f.dataTypeID),
         dataTypeID: f.dataTypeID
       }))
-
       return {
         rows: res.rows,
         fields,
         rowCount: res.rowCount
       }
-    } finally {
-      await client.end()
-    }
+    })
   }
 
-  async queryMultiple(config: ConnectionConfig, sql: string): Promise<AdapterMultiQueryResult> {
-    const client = new Client(config)
-    await client.connect()
+  async queryMultiple(
+    config: ConnectionConfig,
+    sql: string,
+    options?: QueryOptions
+  ): Promise<AdapterMultiQueryResult> {
+    const collectTelemetry = options?.collectTelemetry ?? false
+    const executionId = options?.executionId ?? randomUUID()
 
-    const totalStart = Date.now()
-    const results: StatementResult[] = []
+    if (collectTelemetry) {
+      telemetryCollector.startQuery(executionId, false)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+    }
 
-    try {
-      const statements = splitStatements(sql)
+    const runWithClient = async (client: import('pg').PoolClient) => {
+      // Closes over the pool acquisition, which is the only connection-level cost left
+      // now that pooling amortises the handshake — and the one worth seeing, since it
+      // spikes when the pool saturates. There is no per-query DB handshake to report.
+      if (collectTelemetry) {
+        telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+      }
 
-      for (let i = 0; i < statements.length; i++) {
-        const statement = statements[i]
-        const stmtStart = Date.now()
+      const queryTimeoutMs = options?.queryTimeoutMs
+      if (
+        typeof queryTimeoutMs === 'number' &&
+        Number.isFinite(queryTimeoutMs) &&
+        queryTimeoutMs > 0
+      ) {
+        await client.query('SELECT set_config($1, $2, false)', [
+          'statement_timeout',
+          `${Math.floor(queryTimeoutMs)}ms`
+        ])
+      }
 
-        try {
-          const res = await client.query(statement)
-          const stmtDuration = Date.now() - stmtStart
+      if (options?.executionId) {
+        registerQuery(options.executionId, { type: 'postgresql', client })
+      }
 
-          const fields: QueryField[] = (res.fields || []).map((f) => ({
-            name: f.name,
-            dataType: resolvePostgresType(f.dataTypeID),
-            dataTypeID: f.dataTypeID
-          }))
+      const totalStart = Date.now()
+      const results: StatementResult[] = []
+      let totalRowCount = 0
 
-          const isDataReturning = isDataReturningStatement(statement)
+      const statements = splitPgStatements(sql)
 
-          results.push({
-            statement,
-            statementIndex: i,
-            rows: res.rows || [],
-            fields,
-            rowCount: res.rowCount ?? res.rows?.length ?? 0,
-            durationMs: stmtDuration,
-            isDataReturning
-          })
-        } catch (error) {
-          // If a statement fails, add an error result and stop execution
-          const stmtDuration = Date.now() - stmtStart
-          const errorMessage = error instanceof Error ? error.message : String(error)
+      try {
+        for (let i = 0; i < statements.length; i++) {
+          const statement = statements[i]
+          const stmtStart = Date.now()
 
-          results.push({
-            statement,
-            statementIndex: i,
-            rows: [],
-            fields: [{ name: 'error', dataType: 'text' }],
-            rowCount: 0,
-            durationMs: stmtDuration,
-            isDataReturning: false
-          })
+          try {
+            if (collectTelemetry) {
+              telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+            }
 
-          // Re-throw to stop execution of remaining statements
-          throw new Error(
-            `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
-          )
+            const res = await client.query(statement)
+
+            if (collectTelemetry) {
+              telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+              telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.PARSE)
+            }
+
+            const stmtDuration = Date.now() - stmtStart
+
+            const fields: QueryField[] = (res.fields || []).map((f) => ({
+              name: f.name,
+              dataType: resolvePostgresType(f.dataTypeID),
+              dataTypeID: f.dataTypeID
+            }))
+
+            const isDataReturning = isDataReturningStatement(statement)
+            const rowCount = res.rowCount ?? res.rows?.length ?? 0
+            totalRowCount += rowCount
+
+            results.push({
+              statement,
+              statementIndex: i,
+              rows: res.rows || [],
+              fields,
+              rowCount,
+              durationMs: stmtDuration,
+              isDataReturning
+            })
+
+            if (collectTelemetry) {
+              telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.PARSE)
+            }
+          } catch (error) {
+            const stmtDuration = Date.now() - stmtStart
+            const errorMessage = error instanceof Error ? error.message : String(error)
+
+            results.push({
+              statement,
+              statementIndex: i,
+              rows: [],
+              fields: [{ name: 'error', dataType: 'text' }],
+              rowCount: 0,
+              durationMs: stmtDuration,
+              isDataReturning: false
+            })
+
+            if (collectTelemetry) {
+              telemetryCollector.cancel(executionId)
+            }
+
+            throw new Error(
+              `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
+            )
+          }
+        }
+
+        // Pooled clients persist session state across checkouts; reset what we set.
+        // If RESET fails, the client's state is unknown — drop it via release(true)
+        // so the next checkout doesn't inherit our statement_timeout.
+        if (
+          typeof queryTimeoutMs === 'number' &&
+          Number.isFinite(queryTimeoutMs) &&
+          queryTimeoutMs > 0
+        ) {
+          try {
+            await client.query('RESET statement_timeout')
+          } catch {
+            client.release(true)
+          }
+        }
+
+        const result: AdapterMultiQueryResult = {
+          results,
+          totalDurationMs: Date.now() - totalStart
+        }
+
+        if (collectTelemetry) {
+          result.telemetry = telemetryCollector.finalize(executionId, totalRowCount)
+        }
+
+        return result
+      } finally {
+        if (options?.executionId) {
+          unregisterQuery(options.executionId)
         }
       }
+    }
 
-      return {
-        results,
-        totalDurationMs: Date.now() - totalStart
-      }
-    } finally {
-      await client.end()
+    if (options?.sessionId && this.sessions.has(options.sessionId)) {
+      return runWithClient(this.sessions.get(options.sessionId)!.lease.client)
+    } else {
+      return withPgClient(config, runWithClient)
     }
   }
 
@@ -370,56 +316,148 @@ export class PostgresAdapter implements DatabaseAdapter {
     sql: string,
     params: unknown[]
   ): Promise<{ rowCount: number | null }> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
+    return withPgClient(config, async (client) => {
       const res = await client.query(sql, params)
       return { rowCount: res.rowCount }
-    } finally {
-      await client.end()
-    }
+    })
   }
 
   async executeTransaction(
     config: ConnectionConfig,
     statements: Array<{ sql: string; params: unknown[] }>
   ): Promise<{ rowsAffected: number; results: Array<{ rowCount: number | null }> }> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
-      await client.query('BEGIN')
-
+    return withPgTransaction(config, async (client) => {
       const results: Array<{ rowCount: number | null }> = []
       let rowsAffected = 0
-
       for (const stmt of statements) {
         const res = await client.query(stmt.sql, stmt.params)
         results.push({ rowCount: res.rowCount })
         rowsAffected += res.rowCount ?? 0
       }
-
-      await client.query('COMMIT')
       return { rowsAffected, results }
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {})
-      throw error
+    })
+  }
+
+  async beginTransaction(_config: ConnectionConfig, sessionId: string): Promise<void> {
+    // Reserve the slot before any await so two concurrent begins for the same
+    // session can't both pass the guard and orphan a checked-out client.
+    if (this.sessions.has(sessionId) || this.pendingSessions.has(sessionId)) {
+      throw new Error(`Session ${sessionId} already has an active transaction`)
+    }
+    this.pendingSessions.add(sessionId)
+    try {
+      // Session clients come from a pool of their own — an open transaction holds its
+      // client until the user commits, which would otherwise starve ad-hoc queries.
+      const lease = await acquirePgSessionClient(_config)
+      try {
+        await lease.client.query('BEGIN')
+        this.sessions.set(sessionId, { lease, poolIdentity: pgPoolIdentity(_config) })
+      } catch (error) {
+        lease.release(true)
+        throw error
+      }
     } finally {
-      await client.end()
+      this.pendingSessions.delete(sessionId)
     }
   }
 
-  async getSchemas(config: ConnectionConfig): Promise<SchemaInfo[]> {
-    const client = new Client(config)
-    await client.connect()
+  async queryInTransaction(
+    _config: ConnectionConfig,
+    sessionId: string,
+    sql: string,
+    params?: unknown[]
+  ): Promise<AdapterQueryResult> {
+    const lease = this.sessions.get(sessionId)?.lease
+    if (!lease) {
+      throw new Error(`Session ${sessionId} does not have an active transaction`)
+    }
+    const res = await lease.client.query(sql, params)
+    const fields: QueryField[] = res.fields.map((f) => ({
+      name: f.name,
+      dataType: resolvePostgresType(f.dataTypeID),
+      dataTypeID: f.dataTypeID
+    }))
+    return {
+      rows: res.rows,
+      fields,
+      rowCount: res.rowCount
+    }
+  }
 
+  async commitTransaction(_config: ConnectionConfig, sessionId: string): Promise<void> {
+    const lease = this.sessions.get(sessionId)?.lease
+    if (!lease) return
+    this.sessions.delete(sessionId)
     try {
+      await lease.client.query('COMMIT')
+    } catch (error) {
+      // A failed COMMIT leaves the connection in an unknown state — discard it.
+      lease.release(true)
+      throw error
+    }
+    lease.release()
+  }
+
+  /**
+   * Roll back every open session. Called on app quit so checked-out clients
+   * don't block pool.end() and open transactions don't linger server-side.
+   */
+  async rollbackAllTransactions(): Promise<void> {
+    const sessionIds = [...this.sessions.keys()]
+    await Promise.allSettled(
+      sessionIds.map((id) => this.rollbackTransaction(undefined as never, id))
+    )
+  }
+
+  /**
+   * Roll back the open sessions belonging to one connection.
+   *
+   * Called before tearing that connection's pool down on edit/delete, mirroring what
+   * quit does globally. A parked session client keeps `sessionPool.end()` pending
+   * forever, so without this the teardown hits its timeout and the transaction is left
+   * open server-side holding whatever locks it had taken.
+   */
+  async drainSessions(config: ConnectionConfig): Promise<void> {
+    const identity = pgPoolIdentity(config)
+    const sessionIds = [...this.sessions.entries()]
+      .filter(([, session]) => session.poolIdentity === identity)
+      .map(([id]) => id)
+    await Promise.allSettled(
+      sessionIds.map((id) => this.rollbackTransaction(undefined as never, id))
+    )
+  }
+
+  async rollbackTransaction(_config: ConnectionConfig, sessionId: string): Promise<void> {
+    const lease = this.sessions.get(sessionId)?.lease
+    if (!lease) return
+    this.sessions.delete(sessionId)
+    let poisoned = false
+    try {
+      await lease.client.query('ROLLBACK')
+    } catch {
+      poisoned = true
+    } finally {
+      lease.release(poisoned ? true : undefined)
+    }
+  }
+
+  createDedicatedClient(config: ConnectionConfig): Promise<DedicatedClient> {
+    return createPgDedicatedClient(config)
+  }
+
+  createNotificationClient(config: ConnectionConfig): Promise<NotificationClient> {
+    return createPgNotificationClient(config)
+  }
+
+  async getSchemas(config: ConnectionConfig): Promise<SchemaInfo[]> {
+    return withPgClient(config, async (client) => {
       // Query 1: Get all schemas (excluding system schemas)
       const schemasResult = await client.query(`
         SELECT schema_name
         FROM information_schema.schemata
         WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND schema_name NOT LIKE 'pg_toast_temp_%'
+          AND schema_name NOT LIKE 'pg_temp_%'
         ORDER BY schema_name
       `)
 
@@ -431,7 +469,22 @@ export class PostgresAdapter implements DatabaseAdapter {
           table_type
         FROM information_schema.tables
         WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND table_schema NOT LIKE 'pg_toast_temp_%'
+          AND table_schema NOT LIKE 'pg_temp_%'
         ORDER BY table_schema, table_name
+      `)
+
+      // Query 2b: Get all materialized views (not included in information_schema.tables)
+      const matViewsResult = await client.query(`
+        SELECT
+          schemaname as table_schema,
+          matviewname as table_name,
+          'MATERIALIZED VIEW' as table_type
+        FROM pg_matviews
+        WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND schemaname NOT LIKE 'pg_toast_temp_%'
+          AND schemaname NOT LIKE 'pg_temp_%'
+        ORDER BY schemaname, matviewname
       `)
 
       // Query 3: Get all columns with primary key info
@@ -464,7 +517,35 @@ export class PostgresAdapter implements DatabaseAdapter {
           AND c.table_name = pk.table_name
           AND c.column_name = pk.column_name
         WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND c.table_schema NOT LIKE 'pg_toast_temp_%'
+          AND c.table_schema NOT LIKE 'pg_temp_%'
         ORDER BY c.table_schema, c.table_name, c.ordinal_position
+      `)
+
+      // Query 3b: Get columns for materialized views (from pg_attribute)
+      const matViewColumnsResult = await client.query(`
+        SELECT
+          n.nspname as table_schema,
+          c.relname as table_name,
+          a.attname as column_name,
+          pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+          t.typname as udt_name,
+          NOT a.attnotnull as is_nullable,
+          pg_get_expr(d.adbin, d.adrelid) as column_default,
+          a.attnum as ordinal_position,
+          false as is_primary_key
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+        JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+        JOIN pg_catalog.pg_type t ON a.atttypid = t.oid
+        LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid, a.attnum) = (d.adrelid, d.adnum)
+        WHERE c.relkind = 'm'  -- 'm' = materialized view
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND n.nspname NOT LIKE 'pg_toast_temp_%'
+          AND n.nspname NOT LIKE 'pg_temp_%'
+        ORDER BY n.nspname, c.relname, a.attnum
       `)
 
       // Query 4: Get all foreign key relationships
@@ -486,7 +567,88 @@ export class PostgresAdapter implements DatabaseAdapter {
           AND ccu.table_schema = tc.constraint_schema
         WHERE tc.constraint_type = 'FOREIGN KEY'
           AND tc.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND tc.table_schema NOT LIKE 'pg_toast_temp_%'
+          AND tc.table_schema NOT LIKE 'pg_temp_%'
         ORDER BY tc.table_schema, tc.table_name, kcu.column_name
+      `)
+
+      // Query 4b: Get enum types with their values
+      const enumTypesResult = await client.query(`
+        SELECT
+          n.nspname as schema,
+          t.typname as name,
+          array_agg(e.enumlabel ORDER BY e.enumsortorder) as values
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        JOIN pg_enum e ON e.enumtypid = t.oid
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+        GROUP BY n.nspname, t.typname
+      `)
+
+      // Query 5: Get all routines (functions and procedures)
+      const routinesResult = await client.query(`
+        SELECT
+          r.routine_schema,
+          r.routine_name,
+          r.routine_type,
+          r.data_type as return_type,
+          r.external_language as language,
+          p.provolatile as volatility,
+          d.description as comment,
+          r.specific_name
+        FROM information_schema.routines r
+        LEFT JOIN pg_catalog.pg_proc p
+          ON p.proname = r.routine_name
+        LEFT JOIN pg_catalog.pg_namespace n
+          ON n.nspname = r.routine_schema
+          AND p.pronamespace = n.oid
+        LEFT JOIN pg_catalog.pg_description d
+          ON d.objoid = p.oid
+        WHERE r.routine_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND r.routine_schema NOT LIKE 'pg_toast_temp_%'
+          AND r.routine_schema NOT LIKE 'pg_temp_%'
+        ORDER BY r.routine_schema, r.routine_name
+      `)
+
+      // Query 6: Get routine parameters
+      const parametersResult = await client.query(`
+        SELECT
+          p.specific_schema,
+          p.specific_name,
+          p.parameter_name,
+          p.data_type,
+          p.parameter_mode,
+          p.parameter_default,
+          p.ordinal_position
+        FROM information_schema.parameters p
+        WHERE p.specific_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND p.specific_schema NOT LIKE 'pg_toast_temp_%'
+          AND p.specific_schema NOT LIKE 'pg_temp_%'
+          AND p.parameter_name IS NOT NULL
+        ORDER BY p.specific_schema, p.specific_name, p.ordinal_position
+      `)
+
+      // Query 7: Get all triggers (excluding internal constraint triggers)
+      const triggersResult = await client.query(`
+        SELECT
+          n.nspname AS schema_name,
+          c.relname AS table_name,
+          t.tgname AS trigger_name,
+          t.tgtype AS trigger_type,
+          t.tgenabled AS trigger_enabled,
+          p.proname AS function_name,
+          np.nspname AS function_schema,
+          pg_get_triggerdef(t.oid) AS definition
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_proc p ON p.oid = t.tgfoid
+        JOIN pg_namespace np ON np.oid = p.pronamespace
+        WHERE NOT t.tgisinternal
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND n.nspname NOT LIKE 'pg_toast_temp_%'
+          AND n.nspname NOT LIKE 'pg_temp_%'
+        ORDER BY n.nspname, c.relname, t.tgname
       `)
 
       // Build foreign key lookup map: "schema.table.column" -> ForeignKeyInfo
@@ -501,6 +663,81 @@ export class PostgresAdapter implements DatabaseAdapter {
         })
       }
 
+      // Build enum lookup map: "typname" -> string[] (enum values)
+      // Also map "schema.typname" -> string[] for schema-qualified lookups
+      const enumMap = new Map<string, string[]>()
+      for (const row of enumTypesResult.rows) {
+        const values = parsePostgresArray(row.values)
+        enumMap.set(row.name, values)
+        enumMap.set(`${row.schema}.${row.name}`, values)
+      }
+
+      // Build parameters lookup map: "schema.specific_name" -> RoutineParameterInfo[]
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of parametersResult.rows) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          defaultValue: row.parameter_default || undefined,
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Build routines lookup map: "schema" -> RoutineInfo[]
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routinesResult.rows) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const params = paramsMap.get(paramsKey) || []
+
+        // Map PostgreSQL volatility codes to readable values
+        let volatility: 'IMMUTABLE' | 'STABLE' | 'VOLATILE' | undefined
+        if (row.volatility === 'i') volatility = 'IMMUTABLE'
+        else if (row.volatility === 's') volatility = 'STABLE'
+        else if (row.volatility === 'v') volatility = 'VOLATILE'
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: params,
+          language: row.language || undefined,
+          volatility,
+          comment: row.comment || undefined
+        })
+      }
+
+      // Build triggers lookup map: "schema" -> TriggerInfo[]
+      const triggersMap = new Map<string, TriggerInfo[]>()
+      for (const row of triggersResult.rows) {
+        if (!triggersMap.has(row.schema_name)) {
+          triggersMap.set(row.schema_name, [])
+        }
+
+        const functionName =
+          row.function_schema && row.function_schema !== row.schema_name
+            ? `${row.function_schema}.${row.function_name}`
+            : row.function_name
+
+        triggersMap.get(row.schema_name)!.push({
+          name: row.trigger_name,
+          schema: row.schema_name,
+          table: row.table_name,
+          ...parsePostgresTriggerType(Number(row.trigger_type)),
+          // tgenabled: 'D' = disabled, anything else (O/R/A) is enabled
+          enabled: row.trigger_enabled !== 'D',
+          functionName: functionName || undefined,
+          definition: row.definition
+        })
+      }
+
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
 
@@ -508,7 +745,9 @@ export class PostgresAdapter implements DatabaseAdapter {
       for (const row of schemasResult.rows) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || [],
+          triggers: triggersMap.get(row.schema_name) || []
         })
       }
 
@@ -530,6 +769,30 @@ export class PostgresAdapter implements DatabaseAdapter {
         }
       }
 
+      // Add materialized views to the tables map
+      for (const row of matViewsResult.rows) {
+        const tableKey = `${row.table_schema}.${row.table_name}`
+        const table: TableInfo = {
+          name: row.table_name,
+          type: 'materialized_view',
+          columns: []
+        }
+        tableMap.set(tableKey, table)
+
+        // Add to schema (create schema if it doesn't exist)
+        let schema = schemaMap.get(row.table_schema)
+        if (!schema) {
+          schema = {
+            name: row.table_schema,
+            tables: [],
+            routines: [],
+            triggers: triggersMap.get(row.table_schema) || []
+          }
+          schemaMap.set(row.table_schema, schema)
+        }
+        schema.tables.push(table)
+      }
+
       // Assign columns to tables
       for (const row of columnsResult.rows) {
         const tableKey = `${row.table_schema}.${row.table_name}`
@@ -547,6 +810,11 @@ export class PostgresAdapter implements DatabaseAdapter {
           const fkKey = `${row.table_schema}.${row.table_name}.${row.column_name}`
           const foreignKey = fkMap.get(fkKey)
 
+          // Check for enum type (USER-DEFINED data_type indicates enum/composite)
+          // Look up enum values by the base udt_name
+          const rawEnumValues = enumMap.get(row.udt_name)
+          const enumValues = Array.isArray(rawEnumValues) ? rawEnumValues : undefined
+
           const column: ColumnInfo = {
             name: row.column_name,
             dataType,
@@ -554,23 +822,36 @@ export class PostgresAdapter implements DatabaseAdapter {
             isPrimaryKey: row.is_primary_key,
             defaultValue: row.column_default || undefined,
             ordinalPosition: row.ordinal_position,
-            foreignKey
+            foreignKey,
+            enumValues
+          }
+          table.columns.push(column)
+        }
+      }
+
+      // Assign columns to materialized views
+      for (const row of matViewColumnsResult.rows) {
+        const tableKey = `${row.table_schema}.${row.table_name}`
+        const table = tableMap.get(tableKey)
+        if (table) {
+          const column: ColumnInfo = {
+            name: row.column_name,
+            dataType: row.data_type,
+            isNullable: row.is_nullable === true,
+            isPrimaryKey: false, // Materialized views don't have primary keys
+            defaultValue: row.column_default || undefined,
+            ordinalPosition: row.ordinal_position
           }
           table.columns.push(column)
         }
       }
 
       return Array.from(schemaMap.values())
-    } finally {
-      await client.end()
-    }
+    })
   }
 
   async explain(config: ConnectionConfig, sql: string, analyze: boolean): Promise<ExplainResult> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
+    return withPgClient(config, async (client) => {
       const explainOptions = analyze
         ? 'ANALYZE, COSTS, VERBOSE, BUFFERS, FORMAT JSON'
         : 'COSTS, VERBOSE, FORMAT JSON'
@@ -586,9 +867,7 @@ export class PostgresAdapter implements DatabaseAdapter {
         plan: planJson,
         durationMs: duration
       }
-    } finally {
-      await client.end()
-    }
+    })
   }
 
   async getTableDDL(
@@ -596,10 +875,7 @@ export class PostgresAdapter implements DatabaseAdapter {
     schema: string,
     table: string
   ): Promise<TableDefinition> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
+    return withPgClient(config, async (client) => {
       // Query columns with full metadata
       const columnsResult = await client.query(
         `
@@ -830,16 +1106,11 @@ export class PostgresAdapter implements DatabaseAdapter {
         indexes,
         comment: tableCommentResult.rows[0]?.comment || undefined
       }
-    } finally {
-      await client.end()
-    }
+    })
   }
 
   async getSequences(config: ConnectionConfig): Promise<SequenceInfo[]> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
+    return withPgClient(config, async (client) => {
       const result = await client.query(`
         SELECT
           schemaname as schema,
@@ -859,16 +1130,11 @@ export class PostgresAdapter implements DatabaseAdapter {
         startValue: row.start_value,
         increment: row.increment
       }))
-    } finally {
-      await client.end()
-    }
+    })
   }
 
   async getTypes(config: ConnectionConfig): Promise<CustomTypeInfo[]> {
-    const client = new Client(config)
-    await client.connect()
-
-    try {
+    return withPgClient(config, async (client) => {
       // Get enum types with their values
       const enumsResult = await client.query(`
         SELECT
@@ -902,7 +1168,7 @@ export class PostgresAdapter implements DatabaseAdapter {
           schema: row.schema,
           name: row.name,
           type: 'enum' as const,
-          values: row.values
+          values: Array.isArray(row.values) ? row.values : parsePostgresArray(row.values)
         })),
         ...domainsResult.rows.map((row) => ({
           schema: row.schema,
@@ -910,8 +1176,429 @@ export class PostgresAdapter implements DatabaseAdapter {
           type: 'domain' as const
         }))
       ]
-    } finally {
-      await client.end()
+    })
+  }
+
+  private classifyColumnType(dataType: string): ColumnStatsType {
+    const lower = dataType.toLowerCase()
+    if (
+      lower.includes('int') ||
+      lower.includes('numeric') ||
+      lower.includes('decimal') ||
+      lower.includes('float') ||
+      lower.includes('double') ||
+      lower.includes('real') ||
+      lower.includes('money') ||
+      lower === 'bigint' ||
+      lower === 'smallint' ||
+      lower === 'number'
+    ) {
+      return 'numeric'
     }
+    if (
+      lower.includes('timestamp') ||
+      lower.includes('date') ||
+      lower.includes('time') ||
+      lower === 'interval'
+    ) {
+      return 'datetime'
+    }
+    if (lower === 'bool' || lower === 'boolean') {
+      return 'boolean'
+    }
+    if (
+      lower.includes('char') ||
+      lower.includes('text') ||
+      lower.includes('varchar') ||
+      lower.includes('string') ||
+      lower === 'name' ||
+      lower === 'citext'
+    ) {
+      return 'text'
+    }
+    return 'other'
+  }
+
+  async getColumnStats(
+    config: ConnectionConfig,
+    schema: string,
+    table: string,
+    column: string,
+    dataType: string
+  ): Promise<ColumnStats> {
+    return withPgClient(config, async (client) => {
+      const statsType = this.classifyColumnType(dataType)
+      const quoteIdent = (name: string) => '"' + name.replace(/"/g, '""') + '"'
+      const quotedTable = `${quoteIdent(schema)}.${quoteIdent(table)}`
+      const quotedCol = quoteIdent(column)
+
+      const baseResult = await client.query(`
+        SELECT
+          COUNT(*) AS total_rows,
+          COUNT(*) - COUNT(${quotedCol}) AS null_count,
+          COUNT(DISTINCT ${quotedCol}) AS distinct_count
+        FROM ${quotedTable}
+      `)
+
+      const totalRows = Number(baseResult.rows[0].total_rows)
+      const nullCount = Number(baseResult.rows[0].null_count)
+      const distinctCount = Number(baseResult.rows[0].distinct_count)
+      const nullPercentage = totalRows > 0 ? (nullCount / totalRows) * 100 : 0
+      const distinctPercentage = totalRows > 0 ? (distinctCount / totalRows) * 100 : 0
+
+      const stats: ColumnStats = {
+        column,
+        dataType,
+        statsType,
+        totalRows,
+        nullCount,
+        nullPercentage,
+        distinctCount,
+        distinctPercentage
+      }
+
+      if (statsType === 'numeric') {
+        const numResult = await client.query(`
+          SELECT
+            MIN(${quotedCol})::text AS min_val,
+            MAX(${quotedCol})::text AS max_val,
+            AVG(${quotedCol}::numeric) AS avg_val,
+            STDDEV(${quotedCol}::numeric) AS stddev_val
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        stats.min = numResult.rows[0]?.min_val ?? null
+        stats.max = numResult.rows[0]?.max_val ?? null
+        stats.avg = numResult.rows[0]?.avg_val != null ? Number(numResult.rows[0].avg_val) : null
+        stats.stdDev =
+          numResult.rows[0]?.stddev_val != null ? Number(numResult.rows[0].stddev_val) : null
+
+        if (totalRows <= 1_000_000 && totalRows > 0) {
+          const medianResult = await client.query(`
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY ${quotedCol}::numeric) AS median_val
+            FROM ${quotedTable}
+            WHERE ${quotedCol} IS NOT NULL
+          `)
+          stats.median =
+            medianResult.rows[0]?.median_val != null
+              ? Number(medianResult.rows[0].median_val)
+              : null
+
+          const histResult = await client.query(`
+            WITH bounds AS (
+              SELECT MIN(${quotedCol}::numeric) AS min_val, MAX(${quotedCol}::numeric) AS max_val
+              FROM ${quotedTable}
+              WHERE ${quotedCol} IS NOT NULL
+            ),
+            bucketed AS (
+              SELECT
+                width_bucket(${quotedCol}::numeric, bounds.min_val, bounds.max_val + 1, 10) AS bucket,
+                COUNT(*) AS cnt
+              FROM ${quotedTable}, bounds
+              WHERE ${quotedCol} IS NOT NULL
+                AND bounds.min_val IS NOT NULL
+                AND bounds.max_val IS NOT NULL
+                AND bounds.min_val < bounds.max_val
+              GROUP BY bucket
+            )
+            SELECT
+              bucket,
+              cnt,
+              bounds.min_val + (bucket - 1) * (bounds.max_val - bounds.min_val) / 10.0 AS range_min,
+              bounds.min_val + bucket * (bounds.max_val - bounds.min_val) / 10.0 AS range_max
+            FROM bucketed, bounds
+            ORDER BY bucket
+          `)
+
+          if (histResult.rows.length > 0) {
+            const histogram: HistogramBucket[] = histResult.rows.map((row) => ({
+              min: Number(row.range_min),
+              max: Number(row.range_max),
+              count: Number(row.cnt)
+            }))
+            stats.histogram = histogram
+          }
+        }
+      } else if (statsType === 'text') {
+        const textResult = await client.query(`
+          SELECT
+            MIN(LENGTH(${quotedCol}::text)) AS min_length,
+            MAX(LENGTH(${quotedCol}::text)) AS max_length,
+            AVG(LENGTH(${quotedCol}::text)) AS avg_length
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        stats.minLength =
+          textResult.rows[0]?.min_length != null ? Number(textResult.rows[0].min_length) : null
+        stats.maxLength =
+          textResult.rows[0]?.max_length != null ? Number(textResult.rows[0].max_length) : null
+        stats.avgLength =
+          textResult.rows[0]?.avg_length != null ? Number(textResult.rows[0].avg_length) : null
+
+        const commonResult = await client.query(`
+          SELECT
+            ${quotedCol}::text AS val,
+            COUNT(*) AS cnt,
+            ROUND(COUNT(*) * 100.0 / ${totalRows}, 2) AS pct
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+          GROUP BY ${quotedCol}
+          ORDER BY cnt DESC
+          LIMIT 5
+        `)
+
+        const commonValues: CommonValue[] = commonResult.rows.map((row) => ({
+          value: row.val,
+          count: Number(row.cnt),
+          percentage: Number(row.pct)
+        }))
+        stats.commonValues = commonValues
+      } else if (statsType === 'datetime') {
+        const dtResult = await client.query(`
+          SELECT
+            MIN(${quotedCol})::text AS min_val,
+            MAX(${quotedCol})::text AS max_val
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        stats.min = dtResult.rows[0]?.min_val ?? null
+        stats.max = dtResult.rows[0]?.max_val ?? null
+      } else if (statsType === 'boolean') {
+        const boolResult = await client.query(`
+          SELECT
+            COUNT(*) FILTER (WHERE ${quotedCol} = true) AS true_count,
+            COUNT(*) FILTER (WHERE ${quotedCol} = false) AS false_count
+          FROM ${quotedTable}
+        `)
+
+        stats.trueCount = Number(boolResult.rows[0]?.true_count ?? 0)
+        stats.falseCount = Number(boolResult.rows[0]?.false_count ?? 0)
+      }
+
+      return stats
+    })
+  }
+
+  async getActiveQueries(config: ConnectionConfig): Promise<ActiveQuery[]> {
+    return withPgClient(config, async (client) => {
+      const result = await client.query(`
+        SELECT
+          pid,
+          usename AS user,
+          datname AS database,
+          state,
+          COALESCE(
+            EXTRACT(EPOCH FROM (now() - query_start))::text || 's',
+            '0s'
+          ) AS duration,
+          COALESCE(EXTRACT(EPOCH FROM (now() - query_start)) * 1000, 0)::bigint AS duration_ms,
+          query,
+          wait_event_type || ':' || wait_event AS wait_event,
+          application_name
+        FROM pg_stat_activity
+        WHERE state != 'idle'
+          AND pid != pg_backend_pid()
+          AND query NOT LIKE '%pg_stat_activity%'
+        ORDER BY query_start ASC NULLS LAST
+      `)
+
+      return result.rows.map((row) => ({
+        pid: Number(row.pid),
+        user: String(row.user ?? ''),
+        database: String(row.database ?? ''),
+        state: String(row.state ?? ''),
+        duration: String(row.duration ?? '0s'),
+        durationMs: Number(row.duration_ms ?? 0),
+        query: String(row.query ?? ''),
+        waitEvent: row.wait_event ? String(row.wait_event) : undefined,
+        applicationName: row.application_name ? String(row.application_name) : undefined
+      }))
+    })
+  }
+
+  async getTableSizes(
+    config: ConnectionConfig,
+    schema?: string
+  ): Promise<{ dbSize: DatabaseSizeInfo; tables: TableSizeInfo[] }> {
+    return withPgClient(config, async (client) => {
+      const dbSizeResult = await client.query(`
+        SELECT
+          pg_size_pretty(pg_database_size(current_database())) AS total_size,
+          pg_database_size(current_database()) AS total_size_bytes
+      `)
+
+      const dbSize: DatabaseSizeInfo = {
+        totalSize: String(dbSizeResult.rows[0].total_size),
+        totalSizeBytes: Number(dbSizeResult.rows[0].total_size_bytes)
+      }
+
+      const schemaFilter = schema
+        ? `AND s.schemaname = $1`
+        : `AND s.schemaname NOT IN ('pg_catalog', 'information_schema')`
+      const params = schema ? [schema] : []
+
+      const tablesResult = await client.query(
+        `
+        SELECT
+          schema, "table", row_count_estimate,
+          pg_size_pretty(data_size_bytes) AS data_size,
+          data_size_bytes,
+          pg_size_pretty(index_size_bytes) AS index_size,
+          index_size_bytes,
+          pg_size_pretty(total_size_bytes) AS total_size,
+          total_size_bytes
+        FROM (
+          SELECT
+            s.schemaname AS schema,
+            s.relname AS "table",
+            s.n_live_tup AS row_count_estimate,
+            pg_relation_size(c.oid) AS data_size_bytes,
+            pg_indexes_size(c.oid) AS index_size_bytes,
+            pg_total_relation_size(c.oid) AS total_size_bytes
+          FROM pg_stat_user_tables s
+          JOIN pg_class c ON c.relname = s.relname
+          JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname
+          WHERE 1=1 ${schemaFilter}
+        ) t
+        ORDER BY total_size_bytes DESC
+        LIMIT 50
+        `,
+        params
+      )
+
+      const tables: TableSizeInfo[] = tablesResult.rows.map((row) => ({
+        schema: String(row.schema),
+        table: String(row.table),
+        rowCountEstimate: Number(row.row_count_estimate ?? 0),
+        dataSize: String(row.data_size),
+        dataSizeBytes: Number(row.data_size_bytes ?? 0),
+        indexSize: String(row.index_size),
+        indexSizeBytes: Number(row.index_size_bytes ?? 0),
+        totalSize: String(row.total_size),
+        totalSizeBytes: Number(row.total_size_bytes ?? 0)
+      }))
+
+      return { dbSize, tables }
+    })
+  }
+
+  async getCacheStats(config: ConnectionConfig): Promise<CacheStats> {
+    return withPgClient(config, async (client) => {
+      const cacheResult = await client.query(`
+        SELECT
+          CASE WHEN SUM(heap_blks_hit) + SUM(heap_blks_read) = 0 THEN 0
+            ELSE ROUND(SUM(heap_blks_hit)::numeric / (SUM(heap_blks_hit) + SUM(heap_blks_read)) * 100, 2)
+          END AS buffer_cache_hit_ratio,
+          CASE WHEN SUM(idx_blks_hit) + SUM(idx_blks_read) = 0 THEN 0
+            ELSE ROUND(SUM(idx_blks_hit)::numeric / (SUM(idx_blks_hit) + SUM(idx_blks_read)) * 100, 2)
+          END AS index_hit_ratio
+        FROM pg_statio_user_tables
+      `)
+
+      const tableDetailsResult = await client.query(`
+        SELECT
+          sio.schemaname || '.' || sio.relname AS table,
+          CASE WHEN sio.heap_blks_hit + sio.heap_blks_read = 0 THEN 0
+            ELSE ROUND(sio.heap_blks_hit::numeric / (sio.heap_blks_hit + sio.heap_blks_read) * 100, 2)
+          END AS hit_ratio,
+          COALESCE(st.seq_scan, 0) AS seq_scans,
+          COALESCE(st.idx_scan, 0) AS index_scans
+        FROM pg_statio_user_tables sio
+        JOIN pg_stat_user_tables st ON sio.relid = st.relid
+        WHERE sio.heap_blks_hit + sio.heap_blks_read > 0
+        ORDER BY sio.heap_blks_hit + sio.heap_blks_read DESC
+        LIMIT 20
+      `)
+
+      return {
+        bufferCacheHitRatio: Number(cacheResult.rows[0]?.buffer_cache_hit_ratio ?? 0),
+        indexHitRatio: Number(cacheResult.rows[0]?.index_hit_ratio ?? 0),
+        tableCacheDetails: tableDetailsResult.rows.map((row) => ({
+          table: String(row.table),
+          hitRatio: Number(row.hit_ratio),
+          seqScans: Number(row.seq_scans),
+          indexScans: Number(row.index_scans)
+        }))
+      }
+    })
+  }
+
+  async getLocks(config: ConnectionConfig): Promise<LockInfo[]> {
+    return withPgClient(config, async (client) => {
+      const result = await client.query(`
+        SELECT
+          blocked.pid AS blocked_pid,
+          blocked_activity.usename AS blocked_user,
+          blocked_activity.query AS blocked_query,
+          blocking.pid AS blocking_pid,
+          blocking_activity.usename AS blocking_user,
+          blocking_activity.query AS blocking_query,
+          blocked.locktype AS lock_type,
+          COALESCE(blocked.relation::regclass::text, '') AS relation,
+          COALESCE(
+            EXTRACT(EPOCH FROM (now() - blocked_activity.query_start))::text || 's',
+            '0s'
+          ) AS wait_duration,
+          COALESCE(
+            EXTRACT(EPOCH FROM (now() - blocked_activity.query_start)) * 1000,
+            0
+          )::bigint AS wait_duration_ms
+        FROM pg_locks blocked
+        JOIN pg_stat_activity blocked_activity ON blocked.pid = blocked_activity.pid
+        JOIN pg_locks blocking ON (
+          blocked.locktype = blocking.locktype
+          AND blocked.database IS NOT DISTINCT FROM blocking.database
+          AND blocked.relation IS NOT DISTINCT FROM blocking.relation
+          AND blocked.page IS NOT DISTINCT FROM blocking.page
+          AND blocked.tuple IS NOT DISTINCT FROM blocking.tuple
+          AND blocked.virtualxid IS NOT DISTINCT FROM blocking.virtualxid
+          AND blocked.transactionid IS NOT DISTINCT FROM blocking.transactionid
+          AND blocked.classid IS NOT DISTINCT FROM blocking.classid
+          AND blocked.objid IS NOT DISTINCT FROM blocking.objid
+          AND blocked.objsubid IS NOT DISTINCT FROM blocking.objsubid
+          AND blocked.pid != blocking.pid
+        )
+        JOIN pg_stat_activity blocking_activity ON blocking.pid = blocking_activity.pid
+        WHERE NOT blocked.granted
+          AND blocking.granted
+        ORDER BY blocked_activity.query_start ASC
+      `)
+
+      return result.rows.map((row) => ({
+        blockedPid: Number(row.blocked_pid),
+        blockedUser: String(row.blocked_user ?? ''),
+        blockedQuery: String(row.blocked_query ?? ''),
+        blockingPid: Number(row.blocking_pid),
+        blockingUser: String(row.blocking_user ?? ''),
+        blockingQuery: String(row.blocking_query ?? ''),
+        lockType: String(row.lock_type ?? ''),
+        relation: row.relation ? String(row.relation) : undefined,
+        waitDuration: String(row.wait_duration ?? '0s'),
+        waitDurationMs: Number(row.wait_duration_ms ?? 0)
+      }))
+    })
+  }
+
+  async killQuery(
+    config: ConnectionConfig,
+    pid: number
+  ): Promise<{ success: boolean; error?: string }> {
+    return withPgClient(config, async (client) => {
+      const result = await client.query('SELECT pg_cancel_backend($1) AS cancelled', [pid])
+      const cancelled = result.rows[0]?.cancelled === true
+      return cancelled
+        ? { success: true }
+        : { success: false, error: 'Failed to cancel query - process may have already completed' }
+    })
+  }
+
+  async runSchemaIntel(
+    config: ConnectionConfig,
+    checks?: SchemaIntelCheckId[]
+  ): Promise<SchemaIntelReport> {
+    return withPgClient(config, (client) => runPostgresSchemaIntel(client, checks))
   }
 }

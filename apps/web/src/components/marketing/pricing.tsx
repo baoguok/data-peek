@@ -1,221 +1,241 @@
-import Link from 'next/link'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import { Check, Heart, Github, ArrowRight, Sparkles } from 'lucide-react'
+"use client";
 
-const plans = [
-  {
-    name: 'Personal',
-    price: '$0',
-    period: 'forever',
-    description: 'All features, personal use only',
-    features: [
-      { text: 'All features unlocked', included: true },
-      { text: 'Unlimited connections', included: true },
-      { text: 'Unlimited query history', included: true },
-      { text: 'All future updates', included: true },
-      { text: 'Personal projects & learning', included: true },
-      { text: 'Open source contributors', included: true },
-      { text: 'Students & educators', included: true },
-    ],
-    cta: 'Download Free',
-    href: '/download',
-    highlighted: false,
-  },
-  {
-    name: 'Pro',
-    price: '$29',
-    originalPrice: '$99',
-    period: 'year',
-    description: 'For commercial use at work',
-    badge: 'Early Bird — 70% off',
-    features: [
-      { text: 'Everything in Personal', included: true },
-      { text: 'Commercial use allowed', included: true },
-      { text: 'Use at work & for clients', included: true },
-      { text: '1 year of updates included', included: true },
-      { text: '3 device activations', included: true },
-      { text: 'Perpetual fallback license', included: true },
-      { text: '30-day money-back guarantee', included: true },
-    ],
-    cta: 'Get Pro License',
-    href: '#buy',
-    highlighted: true,
-  },
-]
+import Link from "next/link";
+import { useState } from "react";
+
+const personal = {
+  name: "Personal",
+  price: "$0",
+  tagline: "Solo devs, OSS, side projects, students.",
+  features: [
+    "All features unlocked",
+    "AI assistant (bring your own key)",
+    "Postgres, MySQL, SQL Server, SQLite",
+    "Unlimited connections & history",
+    "All future updates",
+  ],
+};
+
+const pro = {
+  name: "Pro",
+  price: "$29",
+  priceMeta: "/ year",
+  oldPrice: "$99",
+  tagline: "Commercial use inside a for-profit team.",
+  features: [
+    "Everything in Personal",
+    "Commercial use at work & for clients",
+    "1 year of updates included",
+    "3 device activations",
+    "Perpetual fallback license",
+    "30-day money-back guarantee",
+  ],
+};
+
+function Check() {
+  return (
+    <span
+      aria-hidden
+      className="inline-flex items-center justify-center h-4 w-4 mt-[3px] shrink-0 text-[10px]"
+      style={{ border: "1px solid var(--n-line)", color: "var(--n-accent)" }}
+    >
+      ✓
+    </span>
+  );
+}
+
+type TierShape = {
+  name: string;
+  price: string;
+  priceMeta?: string;
+  oldPrice?: string;
+  tagline: string;
+  features: string[];
+};
+
+function Tier({
+  tier,
+  featured,
+  children,
+}: {
+  tier: TierShape;
+  featured?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="flex flex-col p-8"
+      style={{
+        border: "1px solid var(--n-line)",
+        background: featured ? "var(--n-bg-raised)" : "var(--n-bg-sunken)",
+      }}
+    >
+      <div className="flex items-baseline justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <h3 className="text-[13px] uppercase tracking-[0.16em] text-[var(--n-fg)]">
+            {tier.name}
+          </h3>
+          {featured && (
+            <span
+              className="text-[10px] uppercase tracking-[0.14em] h-5 px-1.5 inline-flex items-center"
+              style={{
+                background: "var(--n-accent)",
+                color: "var(--n-accent-ink)",
+              }}
+            >
+              70% off
+            </span>
+          )}
+        </div>
+        <div className="text-right tabular-nums">
+          {tier.oldPrice && (
+            <span className="mr-2 text-[13px] text-[var(--n-fg-faint)] line-through">
+              {tier.oldPrice}
+            </span>
+          )}
+          <span className="text-[32px] leading-none text-[var(--n-fg)]">
+            {tier.price}
+          </span>
+          {tier.priceMeta && (
+            <span className="ml-1 text-[12px] text-[var(--n-fg-muted)]">
+              {tier.priceMeta}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <p className="mt-3 text-[13px] text-[var(--n-fg-muted)]">
+        {tier.tagline}
+      </p>
+
+      <ul className="mt-6 space-y-2.5 flex-1">
+        {tier.features.map((f) => (
+          <li
+            key={f}
+            className="flex items-start gap-3 text-[13px] text-[var(--n-fg)]"
+          >
+            <Check />
+            <span className="leading-[1.55]">{f}</span>
+          </li>
+        ))}
+      </ul>
+
+      <div className="mt-8">{children}</div>
+    </div>
+  );
+}
+
+function ProCheckoutButton() {
+  const [loading, setLoading] = useState(false);
+
+  const go = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/checkout", { method: "POST" });
+      const data = await res.json();
+      if (data.checkout_url) window.location.href = data.checkout_url;
+      else setLoading(false);
+    } catch {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={go}
+      disabled={loading}
+      className="w-full h-11 inline-flex items-center justify-center text-[13px] font-medium disabled:opacity-60"
+      style={{ background: "var(--n-accent)", color: "var(--n-accent-ink)" }}
+    >
+      {loading ? "Opening checkout…" : "Get Pro license →"}
+    </button>
+  );
+}
 
 export function Pricing() {
   return (
-    <section id="pricing" className="relative py-20 sm:py-32 overflow-hidden">
-      {/* Background */}
-      <div className="absolute inset-0 bg-gradient-to-b from-transparent via-[--color-surface]/50 to-transparent" />
-
-      <div className="relative z-10 max-w-5xl mx-auto px-4 sm:px-6">
-        {/* Section Header */}
-        <div className="text-center mb-10 sm:mb-16">
-          <p
-            className="text-xs uppercase tracking-[0.2em] text-[--color-accent] mb-3 sm:mb-4"
-            style={{ fontFamily: 'var(--font-mono)' }}
-          >
-            Pricing
-          </p>
-          <h2
-            className="text-3xl sm:text-4xl md:text-5xl lg:text-6xl font-semibold tracking-tight mb-4 sm:mb-6 px-2"
-            style={{ fontFamily: 'var(--font-display)' }}
-          >
-            Open source.
-            <br />
-            <span className="text-[--color-text-secondary]">Pay for commercial use.</span>
-          </h2>
-          <p
-            className="text-base sm:text-lg text-[--color-text-secondary] max-w-xl mx-auto px-2"
-            style={{ fontFamily: 'var(--font-body)' }}
-          >
-            Free for personal use. A license supports development and is required
-            for commercial use in for-profit organizations.
-          </p>
-        </div>
-
-        {/* Pricing Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 sm:gap-8 max-w-4xl mx-auto">
-          {plans.map((plan) => (
-            <div
-              key={plan.name}
-              className={`relative rounded-xl sm:rounded-2xl p-5 sm:p-8 ${
-                plan.highlighted
-                  ? 'bg-gradient-to-b from-[--color-accent]/10 to-[--color-surface] border-2 border-[--color-accent]/50'
-                  : 'bg-[--color-surface] border border-[--color-border]'
-              }`}
-            >
-              {/* Badge */}
-              {plan.badge && (
-                <div className="absolute -top-3 left-1/2 -translate-x-1/2">
-                  <Badge variant="default" size="md" className="whitespace-nowrap text-xs sm:text-sm">
-                    <Sparkles className="w-3 h-3 mr-1" />
-                    {plan.badge}
-                  </Badge>
-                </div>
-              )}
-
-              {/* Plan Header */}
-              <div className="mb-6 sm:mb-8">
-                <h3
-                  className="text-lg sm:text-xl font-medium mb-2"
-                  style={{ fontFamily: 'var(--font-display)' }}
-                >
-                  {plan.name}
-                </h3>
-                <div className="flex items-baseline gap-2 mb-2">
-                  <span
-                    className="text-4xl sm:text-5xl font-semibold"
-                    style={{ fontFamily: 'var(--font-display)' }}
-                  >
-                    {plan.price}
-                  </span>
-                  {plan.originalPrice && (
-                    <span className="text-lg sm:text-xl text-[--color-text-muted] line-through">
-                      {plan.originalPrice}
-                    </span>
-                  )}
-                  <span className="text-sm sm:text-base text-[--color-text-muted]">/{plan.period}</span>
-                </div>
-                <p className="text-xs sm:text-sm text-[--color-text-secondary]">{plan.description}</p>
-              </div>
-
-              {/* Features */}
-              <ul className="space-y-2.5 sm:space-y-3 mb-6 sm:mb-8">
-                {plan.features.map((feature) => (
-                  <li key={feature.text} className="flex items-center gap-2.5 sm:gap-3">
-                    <div className="w-4 h-4 sm:w-5 sm:h-5 rounded-full bg-[--color-success]/10 flex items-center justify-center flex-shrink-0">
-                      <Check className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-[--color-success]" />
-                    </div>
-                    <span className="text-xs sm:text-sm text-[--color-text-primary]">
-                      {feature.text}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-
-              {/* CTA */}
-              <Button
-                variant={plan.highlighted ? 'primary' : 'secondary'}
-                size="lg"
-                className="w-full text-sm sm:text-base"
-                asChild
-              >
-                <Link href={plan.href}>
-                  {plan.cta}
-                  <ArrowRight className="w-4 h-4" />
-                </Link>
-              </Button>
+    <section id="pricing" className="relative">
+      <div className="mx-auto max-w-[1240px] px-5 sm:px-8 py-24 sm:py-32">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-end mb-12">
+          <div className="lg:col-span-7">
+            <div className="text-[10.5px] uppercase tracking-[0.18em] text-[var(--n-fg-faint)]">
+              04 — pricing
             </div>
-          ))}
-        </div>
-
-        {/* Honor System Notice */}
-        <div className="mt-8 sm:mt-12 p-4 sm:p-6 rounded-lg sm:rounded-xl bg-[--color-surface] border border-[--color-border] max-w-2xl mx-auto">
-          <div className="flex flex-col sm:flex-row items-start gap-3 sm:gap-4">
-            <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg bg-[--color-accent]/10 flex items-center justify-center flex-shrink-0">
-              <Heart className="w-4 h-4 sm:w-5 sm:h-5 text-[--color-accent]" />
-            </div>
-            <div>
-              <h4
-                className="text-sm sm:text-base font-medium mb-2"
-                style={{ fontFamily: 'var(--font-display)' }}
-              >
-                Honor System Licensing
-              </h4>
-              <p className="text-xs sm:text-sm text-[--color-text-secondary] mb-2 sm:mb-3">
-                Inspired by{' '}
-                <Link
-                  href="https://yaak.app"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[--color-accent] hover:underline"
-                >
-                  Yaak
-                </Link>{' '}
-                and other sustainable indie software. No DRM, no aggressive enforcement.
-                We trust you to do the right thing.
-              </p>
-              <p className="text-xs sm:text-sm text-[--color-text-secondary]">
-                <strong>Students:</strong> Use it free! Just reach out for a free license.
-              </p>
-              <p className="text-xs sm:text-sm text-[--color-text-muted] mt-2">
-                Questions?{' '}
-                <Link
-                  href="https://x.com/gillarohith"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[--color-accent] hover:underline"
-                >
-                  @gillarohith
-                </Link>{' '}
-                or{' '}
-                <Link
-                  href="mailto:gillarohith1@gmail.com"
-                  className="text-[--color-accent] hover:underline"
-                >
-                  gillarohith1@gmail.com
-                </Link>
-              </p>
-            </div>
+            <h2 className="mt-4 text-[36px] sm:text-[48px] leading-[1.02] tracking-[-0.02em] text-[var(--n-fg)] font-medium">
+              Free for personal use.
+              <br />
+              <span className="text-[var(--n-fg-muted)]">
+                Pay once for work.
+              </span>
+            </h2>
+          </div>
+          <div className="lg:col-span-5">
+            <p className="text-[14px] leading-[1.65] text-[var(--n-fg-muted)] max-w-[48ch]">
+              No seats, no subscriptions dressed up as perpetual licenses, no
+              telemetry checking whether you&apos;re still allowed to use the
+              thing you bought.
+            </p>
           </div>
         </div>
 
-        {/* Open Source Notice */}
-        <div className="mt-5 sm:mt-6 text-center">
-          <Link
-            href="https://github.com/Rohithgilla12/data-peek"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 px-3 sm:px-4 py-2 rounded-full bg-[--color-surface] border border-[--color-border] text-xs sm:text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] hover:border-[--color-text-muted] transition-colors"
-          >
-            <Github className="w-4 h-4" />
-            <span>View source on GitHub — MIT Licensed</span>
-          </Link>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Tier tier={personal}>
+            <Link
+              href="/download"
+              className="w-full h-11 inline-flex items-center justify-center text-[13px] text-[var(--n-fg)]"
+              style={{ border: "1px solid var(--n-line)" }}
+            >
+              Download — free
+            </Link>
+          </Tier>
+          <Tier tier={pro} featured>
+            <ProCheckoutButton />
+          </Tier>
+        </div>
+
+        {/* Honor system */}
+        <div
+          className="mt-10 grid grid-cols-1 md:grid-cols-[1fr_auto] items-center gap-6 p-6"
+          style={{ border: "1px solid var(--n-line-soft)" }}
+        >
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.16em] text-[var(--n-fg-faint)]">
+              Honor system
+            </div>
+            <p className="mt-2 text-[13px] leading-[1.6] text-[var(--n-fg-muted)] max-w-[80ch]">
+              No DRM, no license-server shakedowns. If you&apos;re a solo
+              founder, student, educator, or contributor to OSS — it&apos;s
+              free, no questions.{" "}
+              <Link
+                href="https://x.com/gillarohith"
+                target="_blank"
+                className="text-[var(--n-fg)] underline underline-offset-4 decoration-[var(--n-line)]"
+              >
+                DM @gillarohith
+              </Link>{" "}
+              for a license.
+            </p>
+          </div>
+          <div className="flex gap-3 text-[11px] text-[var(--n-fg-muted)]">
+            <Link
+              href="https://github.com/Rohithgilla12/data-peek"
+              target="_blank"
+              className="h-8 px-3 inline-flex items-center gap-2 hover:text-[var(--n-fg)]"
+              style={{ border: "1px solid var(--n-line-soft)" }}
+            >
+              MIT source
+            </Link>
+            <Link
+              href="https://github.com/sponsors/Rohithgilla12"
+              target="_blank"
+              className="h-8 px-3 inline-flex items-center gap-2 hover:text-[var(--n-fg)]"
+              style={{ border: "1px solid var(--n-line-soft)" }}
+            >
+              Sponsor
+            </Link>
+          </div>
         </div>
       </div>
     </section>
-  )
+  );
 }

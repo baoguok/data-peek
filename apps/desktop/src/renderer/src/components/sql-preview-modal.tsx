@@ -1,18 +1,17 @@
-'use client'
-
-import * as React from 'react'
 import { Copy, Check, FileCode, AlertCircle } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 import {
+  Button,
+  Badge,
+  cn,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle
-} from '@/components/ui/dialog'
-import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
+} from '@data-peek/ui'
+
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 
 interface SqlPreviewModalProps {
   open: boolean
@@ -20,6 +19,8 @@ interface SqlPreviewModalProps {
   sqlStatements: Array<{ operationId: string; sql: string; type: 'insert' | 'update' | 'delete' }>
   onConfirm: () => void
   isLoading?: boolean
+  /** Commit error to display; when set the dialog stays open so the user can see what failed. */
+  error?: string | null
 }
 
 function getOperationColor(type: string): string {
@@ -53,19 +54,14 @@ export function SqlPreviewModal({
   onOpenChange,
   sqlStatements,
   onConfirm,
-  isLoading = false
+  isLoading = false,
+  error = null
 }: SqlPreviewModalProps) {
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard()
 
   const handleCopyAll = () => {
     const allSql = sqlStatements.map((s) => s.sql).join(';\n\n')
-    navigator.clipboard.writeText(allSql)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
-  const handleCopySingle = (sql: string) => {
-    navigator.clipboard.writeText(sql)
+    copy(allSql)
   }
 
   const insertCount = sqlStatements.filter((s) => s.type === 'insert').length
@@ -151,7 +147,7 @@ export function SqlPreviewModal({
                     variant="ghost"
                     size="icon"
                     className="size-6 opacity-0 group-hover:opacity-100 transition-opacity"
-                    onClick={() => handleCopySingle(statement.sql)}
+                    onClick={() => copy(statement.sql)}
                   >
                     <Copy className="size-3" />
                   </Button>
@@ -163,6 +159,19 @@ export function SqlPreviewModal({
             ))
           )}
         </div>
+
+        {/* Commit error */}
+        {error && (
+          <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-sm">
+            <AlertCircle className="size-4 text-red-500 shrink-0 mt-0.5" />
+            <div className="min-w-0 flex-1">
+              <p className="font-medium text-red-600">Commit failed</p>
+              <p className="mt-0.5 text-xs text-muted-foreground break-words font-mono whitespace-pre-wrap">
+                {error}
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Warning */}
         <div className="flex items-start gap-2 p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg text-sm">

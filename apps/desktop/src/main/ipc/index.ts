@@ -1,0 +1,154 @@
+import type { ConnectionConfig, QueryHistoryEntry, SavedQuery, Snippet } from '@shared/index'
+import type { DpStorage, PersistentStore } from '../storage'
+import type { NotebookStorage } from '../notebook-storage'
+import { registerConnectionHandlers } from './connection-handlers'
+import { registerQueryHandlers } from './query-handlers'
+import { registerDDLHandlers } from './ddl-handlers'
+import { registerLicenseHandlers } from './license-handlers'
+import { registerSavedQueriesHandlers } from './saved-queries-handlers'
+import { registerQueryHistoryHandlers } from './query-history-handlers'
+import { registerSnippetHandlers } from './snippet-handlers'
+import { registerScheduledQueriesHandlers } from './scheduled-queries-handlers'
+import { registerDashboardHandlers } from './dashboard-handlers'
+import { registerAIHandlers } from './ai-handlers'
+import { createLogger } from '../lib/logger'
+import { registerFileHandlers } from './file-handlers'
+import { registerWindowHandlers } from './window-handler'
+import { registerColumnStatsHandlers } from './column-stats-handlers'
+import { registerImportHandlers } from './import-handlers'
+import { registerDataGenHandlers } from './data-gen-handlers'
+import { registerPgNotifyHandlers } from './pg-notify-handlers'
+import { registerHealthHandlers } from './health-handlers'
+import { registerPgExportImportHandlers } from './pg-export-import-handlers'
+import { registerNotebookHandlers } from './notebook-handlers'
+import { registerIntelHandlers } from './intel-handlers'
+import { registerStepHandlers } from './step-handlers'
+import { registerTimeMachineHandlers } from './time-machine-handlers'
+import type { StepSessionRegistry } from '../step-session'
+import type { TimeMachineStorage } from '../time-machine-storage'
+
+const log = createLogger('ipc')
+
+export interface IpcStores {
+  connections: PersistentStore<{ connections: ConnectionConfig[] }>
+  savedQueries: DpStorage<{ savedQueries: SavedQuery[] }>
+  snippets: DpStorage<{ snippets: Snippet[] }>
+  queryHistory: DpStorage<{ queryHistory: QueryHistoryEntry[] }>
+}
+
+/**
+ * Register every IPC handler used by the application's main process.
+ *
+ * @param stores - Persistent stores required by handler categories; includes `connections` (connection configs) and `savedQueries` (saved query entries)
+ */
+export function registerAllHandlers(
+  stores: IpcStores,
+  notebookStorage: NotebookStorage | null,
+  timeMachineStorage: TimeMachineStorage | null,
+  stepSessionRegistry: StepSessionRegistry
+): void {
+  // Connection CRUD operations
+  registerConnectionHandlers(stores.connections)
+
+  // Database query and schema operations
+  registerQueryHandlers()
+
+  // DDL (table designer) operations
+  registerDDLHandlers()
+
+  // License management
+  registerLicenseHandlers()
+
+  // Saved queries management
+  registerSavedQueriesHandlers(stores.savedQueries)
+
+  // Query history persistence
+  registerQueryHistoryHandlers(stores.queryHistory)
+
+  // Snippets management
+  registerSnippetHandlers(stores.snippets)
+
+  // Scheduled queries management
+  registerScheduledQueriesHandlers()
+
+  // Dashboard management
+  registerDashboardHandlers()
+
+  // AI features
+  registerAIHandlers()
+
+  // File handler
+  registerFileHandlers()
+
+  // Window controls
+  registerWindowHandlers()
+
+  // Column statistics
+  registerColumnStatsHandlers()
+
+  // CSV import
+  registerImportHandlers()
+
+  // Data generator
+  registerDataGenHandlers()
+
+  // PostgreSQL LISTEN/NOTIFY
+  registerPgNotifyHandlers()
+
+  // Health monitor diagnostics
+  registerHealthHandlers()
+
+  // PostgreSQL export/import (pg_dump/pg_restore)
+  registerPgExportImportHandlers()
+
+  // SQL Notebooks — skip if storage failed to initialise (e.g. native module load
+  // failure). Other handlers must still register so the rest of the app works.
+  if (notebookStorage) {
+    registerNotebookHandlers(notebookStorage)
+  } else {
+    log.warn('NotebookStorage unavailable; notebook handlers not registered')
+  }
+
+  // Time Machine result snapshots — same degrade-to-null contract as notebooks.
+  if (timeMachineStorage) {
+    registerTimeMachineHandlers(timeMachineStorage)
+  } else {
+    log.warn('TimeMachineStorage unavailable; time machine handlers not registered')
+  }
+
+  // Schema Intel / diagnostics
+  registerIntelHandlers()
+
+  // Step-through sessions
+  registerStepHandlers(stepSessionRegistry)
+
+  log.debug('All handlers registered')
+}
+
+// Re-export handler registration functions for testing or selective registration
+export { registerConnectionHandlers } from './connection-handlers'
+export { registerQueryHandlers } from './query-handlers'
+export { registerDDLHandlers } from './ddl-handlers'
+export { registerLicenseHandlers } from './license-handlers'
+export { registerSavedQueriesHandlers } from './saved-queries-handlers'
+export { registerQueryHistoryHandlers } from './query-history-handlers'
+export { registerSnippetHandlers } from './snippet-handlers'
+export { registerScheduledQueriesHandlers } from './scheduled-queries-handlers'
+export { registerDashboardHandlers } from './dashboard-handlers'
+export { registerAIHandlers } from './ai-handlers'
+export { registerImportHandlers } from './import-handlers'
+export { registerDataGenHandlers } from './data-gen-handlers'
+export { registerPgNotifyHandlers } from './pg-notify-handlers'
+export { registerHealthHandlers } from './health-handlers'
+export { registerPgExportImportHandlers } from './pg-export-import-handlers'
+export { registerNotebookHandlers } from './notebook-handlers'
+export { registerIntelHandlers } from './intel-handlers'
+export { registerStepHandlers } from './step-handlers'
+export { registerTimeMachineHandlers } from './time-machine-handlers'
+export {
+  registerMcpHandlers,
+  startMcpIfEnabled,
+  createMcpService,
+  MCP_SETTINGS_DEFAULTS,
+  type McpSettings
+} from './mcp-handlers'

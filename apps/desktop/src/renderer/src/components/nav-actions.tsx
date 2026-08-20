@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   Play,
@@ -8,15 +6,22 @@ import {
   Trash2,
   FileJson,
   FileSpreadsheet,
+  FileCode2,
   MoreHorizontal,
   Loader2,
   BookmarkPlus,
   Sparkles
 } from 'lucide-react'
 
-import { Button } from '@/components/ui/button'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import {
+  Button,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  keys,
   Sidebar,
   SidebarContent,
   SidebarGroup,
@@ -24,20 +29,31 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem
-} from '@/components/ui/sidebar'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useQueryStore, useConnectionStore } from '@/stores'
+} from '@data-peek/ui'
+
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatSQL } from '@/lib/sql-formatter'
+import { useQueryStore, useConnectionStore, useTabStore } from '@/stores'
+import { downloadExport, generateExportFilename, type ExportFormat } from '@/lib/export'
+import { getExportDataForTab } from '@/lib/tab-export'
 
 export function NavActions() {
   const [isOpen, setIsOpen] = React.useState(false)
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard()
 
   const activeConnection = useConnectionStore((s) => s.getActiveConnection())
   const { currentQuery, isExecuting, result } = useQueryStore()
   const setCurrentQuery = useQueryStore((s) => s.setCurrentQuery)
   const setIsExecuting = useQueryStore((s) => s.setIsExecuting)
   const addToHistory = useQueryStore((s) => s.addToHistory)
+  const activeTab = useTabStore((s) => s.getActiveTab())
+
+  const exportData = getExportDataForTab(activeTab)
+  const exportTableName = activeTab?.type === 'table-preview' ? activeTab.tableName : undefined
+  const sqlExportOptions =
+    activeTab?.type === 'table-preview'
+      ? { tableName: activeTab.tableName, schemaName: activeTab.schemaName }
+      : { tableName: 'query_result' }
 
   const handleRunQuery = () => {
     if (!activeConnection || isExecuting || !currentQuery.trim()) return
@@ -70,9 +86,7 @@ export function NavActions() {
 
   const handleCopyQuery = async () => {
     if (!currentQuery.trim()) return
-    await navigator.clipboard.writeText(currentQuery)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    await copy(currentQuery)
     setIsOpen(false)
   }
 
@@ -81,48 +95,29 @@ export function NavActions() {
     setIsOpen(false)
   }
 
-  const handleExportCSV = () => {
-    if (!result) return
-    // Generate CSV
-    const headers = result.columns.map((c) => c.name).join(',')
-    const rows = result.rows.map((row) =>
-      result.columns
-        .map((c) => {
-          const val = row[c.name]
-          if (val === null || val === undefined) return ''
-          const str = String(val)
-          return str.includes(',') || str.includes('"') ? `"${str.replace(/"/g, '""')}"` : str
-        })
-        .join(',')
+  const handleExport = (format: ExportFormat) => {
+    if (!exportData) return
+    downloadExport(
+      exportData,
+      format,
+      generateExportFilename(exportTableName),
+      format === 'sql' ? sqlExportOptions : undefined
     )
-    const csv = [headers, ...rows].join('\n')
-
-    // Download
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `query-results-${Date.now()}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
     setIsOpen(false)
   }
 
+  const handleExportCSV = () => handleExport('csv')
+
   const handleExportJSON = () => {
-    if (!result) return
-    const json = JSON.stringify(result.rows, null, 2)
-    const blob = new Blob([json], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `query-results-${Date.now()}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-    setIsOpen(false)
+    handleExport('json')
+  }
+
+  const handleExportSQL = () => {
+    handleExport('sql')
   }
 
   const canRun = activeConnection && currentQuery.trim() && !isExecuting
-  const hasResults = !!result
+  const hasResults = !!exportData
 
   return (
     <div className="flex items-center gap-1.5">
@@ -142,12 +137,13 @@ export function NavActions() {
             )}
             <span className="hidden sm:inline">Run</span>
             <kbd className="ml-0.5 hidden rounded bg-primary-foreground/20 px-1 py-0.5 text-[9px] font-medium sm:inline">
-              ⌘↵
+              {keys.mod}
+              {keys.enter}
             </kbd>
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          <p>Execute query (⌘+Enter)</p>
+          <p>Execute query ({keys.mod}+Enter)</p>
         </TooltipContent>
       </Tooltip>
 
@@ -165,7 +161,9 @@ export function NavActions() {
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          <p>Format SQL (⌘+Shift+F)</p>
+          <p>
+            Format SQL ({keys.mod}+{keys.shift}+F)
+          </p>
         </TooltipContent>
       </Tooltip>
 
@@ -249,6 +247,16 @@ export function NavActions() {
                       >
                         <FileJson className="size-4" />
                         <span>Export as JSON</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton
+                        onClick={handleExportSQL}
+                        disabled={!hasResults}
+                        className="gap-2.5"
+                      >
+                        <FileCode2 className="size-4" />
+                        <span>Export as SQL</span>
                       </SidebarMenuButton>
                     </SidebarMenuItem>
                   </SidebarMenu>

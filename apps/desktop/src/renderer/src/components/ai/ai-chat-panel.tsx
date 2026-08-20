@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   X,
@@ -20,20 +18,25 @@ import {
   Pencil,
   Check
 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
+  Button,
+  Badge,
+  ScrollArea,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  cn,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
-import { cn } from '@/lib/utils'
+} from '@data-peek/ui'
+
 import { AIMessage } from './ai-message'
 import { AISuggestions } from './ai-suggestions'
-import type { ConnectionConfig, SchemaInfo } from '@data-peek/shared'
+import type { ConnectionConfig, SchemaInfo, AIReportWidget } from '@data-peek/shared'
+import { useAIConfig } from '@/stores/ai-store'
+import { resolveHarnessResumeId, type HarnessSessionRef } from '@/lib/harness-session-ref'
 
 // Chat session type (matching preload)
 interface ChatSession {
@@ -59,8 +62,10 @@ export type AIResponseType = 'message' | 'query' | 'chart' | 'metric' | 'schema'
 export interface AIQueryData {
   type: 'query'
   sql: string
-  explanation: string
+  explanation?: string
   warning?: string
+  /** If true, query should NOT be auto-executed (UPDATE/DELETE operations) */
+  requiresConfirmation?: boolean
 }
 
 export interface AIChartData {
@@ -85,13 +90,27 @@ export interface AISchemaData {
   tables: string[]
 }
 
-export type AIResponseData = AIQueryData | AIChartData | AIMetricData | AISchemaData | null
+export interface AIReportData {
+  type: 'report'
+  widgets: AIReportWidget[]
+}
+
+export type AIResponseData =
+  AIQueryData | AIChartData | AIMetricData | AISchemaData | AIReportData | null
 
 export interface AIChatMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
   responseData?: AIResponseData
+  /** True when a BYOH harness answered agentically by querying the live DB. */
+  grounded?: boolean
+  /** True while the assistant reply is still streaming in. */
+  streaming?: boolean
+  /** Live label for the current grounding/tool step (e.g. "Running query…"). */
+  activity?: string
+  /** Short follow-up prompts the model suggested (clickable chips). */
+  suggestions?: string[]
   createdAt: Date
 }
 
@@ -116,6 +135,10 @@ export function AIChatPanel({
 }: AIChatPanelProps) {
   const [messages, setMessages] = React.useState<AIChatMessage[]>([])
   const [input, setInput] = React.useState('')
+  // @-mention autocomplete for schema tables/columns in the composer.
+  const [mentionStart, setMentionStart] = React.useState(-1)
+  const [mentionQuery, setMentionQuery] = React.useState('')
+  const [mentionIndex, setMentionIndex] = React.useState(0)
   const [isLoading, setIsLoading] = React.useState(false)
   const [isExpanded, setIsExpanded] = React.useState(false)
   const [showSessionsList, setShowSessionsList] = React.useState(false)
@@ -127,6 +150,19 @@ export function AIChatPanel({
   const inputRef = React.useRef<HTMLTextAreaElement>(null)
   const previousConnectionId = React.useRef<string | null>(null)
   const isInitialLoad = React.useRef(true)
+  // The provider the next turn will actually run against. Read from the
+  // store (not a prop) so a mid-chat provider switch in settings is visible
+  // here immediately.
+  const activeProvider = useAIConfig()?.provider
+  // CLI session id from the last BYOH turn, tagged with the provider that
+  // produced it, so the next turn resumes the same conversation (server-side
+  // memory) only when that provider is still active. Reset when the
+  // chat/connection/provider changes.
+  const harnessSessionIdRef = React.useRef<HarnessSessionRef | undefined>(undefined)
+
+  React.useEffect(() => {
+    harnessSessionIdRef.current = undefined
+  }, [connection?.id, currentSessionId, activeProvider])
 
   // Load sessions when connection changes
   React.useEffect(() => {
@@ -200,7 +236,8 @@ export function AIChatPanel({
           id: m.id,
           role: m.role,
           content: m.content,
-          responseData: m.responseData || null,
+          // Reports are ephemeral (re-run on demand), so they aren't persisted.
+          responseData: m.responseData && m.responseData.type !== 'report' ? m.responseData : null,
           createdAt: m.createdAt.toISOString()
         }))
         const response = await window.api.ai.updateSession(connectionId, currentSessionId, {
@@ -230,107 +267,229 @@ export function AIChatPanel({
   // Focus input when panel opens
   React.useEffect(() => {
     if (isOpen && inputRef.current) {
-      setTimeout(() => inputRef.current?.focus(), 100)
+      const timer = setTimeout(() => inputRef.current?.focus(), 100)
+      return () => clearTimeout(timer)
     }
+    return undefined
   }, [isOpen])
 
   const handleSendMessage = async () => {
-    if (!input.trim() || isLoading || !isConfigured || !connection) return
+    await sendPrompt(input.trim())
+  }
+
+  // Send an explicit prompt (used by the composer and by follow-up chips).
+  const sendPrompt = async (text: string) => {
+    if (!text || isLoading || !isConfigured || !connection) return
 
     const userMessage: AIChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: input.trim(),
+      content: text,
       createdAt: new Date()
     }
 
-    setMessages((prev) => [...prev, userMessage])
+    // Build message history BEFORE we add the empty streaming placeholder, so
+    // the placeholder itself is never sent to the model.
+    const aiMessages = [...messages, userMessage].map((m) => ({
+      role: m.role,
+      content: m.content
+    }))
+    const dbType = connection.dbType || 'postgresql'
+
+    // Placeholder assistant bubble that fills in as the reply streams.
+    const assistantId = crypto.randomUUID()
+    setMessages((prev) => [
+      ...prev,
+      userMessage,
+      { id: assistantId, role: 'assistant', content: '', streaming: true, createdAt: new Date() }
+    ])
     setInput('')
     setIsLoading(true)
 
+    const patchAssistant = (patch: Partial<AIChatMessage>): void =>
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)))
+
     try {
-      // Build message history for AI context
-      const aiMessages = [...messages, userMessage].map((m) => ({
-        role: m.role,
-        content: m.content
-      }))
+      // Stream the reply. Prose arrives as `message` events; grounding/tool
+      // steps as `activity`. Pass the connection id so a harness provider can
+      // query this database through the MCP server (agentic mode).
+      const response = await window.api.ai.chatStream(
+        aiMessages,
+        schemas,
+        dbType,
+        connection.id,
+        resolveHarnessResumeId(harnessSessionIdRef.current, activeProvider),
+        (event) => {
+          if (event.type === 'message') patchAssistant({ content: event.text })
+          else if (event.type === 'activity') patchAssistant({ activity: event.label })
+        }
+      )
 
-      // Determine database type from connection
-      const dbType = connection.dbType || 'postgresql'
-
-      // Call actual AI service via IPC
-      const response = await window.api.ai.chat(aiMessages, schemas, dbType)
+      // Remember the CLI session (tagged with the provider that produced it)
+      // so the next turn resumes it (conversation memory) — but only while
+      // that same provider stays active.
+      if (response.meta?.sessionId && activeProvider) {
+        harnessSessionIdRef.current = {
+          provider: activeProvider,
+          sessionId: response.meta.sessionId
+        }
+      }
 
       if (response.success && response.data) {
         const data = response.data
 
-        // Extract response data based on type
+        // Map the flat, nullable backend schema to the renderer's response data.
         let responseData: AIResponseData = null
-        if (data.type === 'query') {
+        if (data.type === 'query' && data.sql) {
           responseData = {
             type: 'query',
             sql: data.sql,
-            explanation: data.explanation,
-            warning: data.warning
+            explanation: data.explanation ?? undefined,
+            warning: data.warning ?? undefined,
+            requiresConfirmation: data.requiresConfirmation ?? undefined
           }
-        } else if (data.type === 'chart') {
+        } else if (
+          data.type === 'chart' &&
+          data.title &&
+          data.chartType &&
+          data.sql &&
+          data.xKey &&
+          data.yKeys
+        ) {
           responseData = {
             type: 'chart',
             title: data.title,
-            description: data.description,
+            description: data.description ?? undefined,
             chartType: data.chartType,
             sql: data.sql,
             xKey: data.xKey,
             yKeys: data.yKeys
           }
-        } else if (data.type === 'metric') {
+        } else if (data.type === 'metric' && data.label && data.sql && data.format) {
           responseData = {
             type: 'metric',
             label: data.label,
             sql: data.sql,
             format: data.format
           }
-        } else if (data.type === 'schema') {
+        } else if (data.type === 'schema' && data.tables) {
           responseData = {
             type: 'schema',
             tables: data.tables
           }
+        } else if (data.type === 'report' && data.widgets && data.widgets.length > 0) {
+          responseData = {
+            type: 'report',
+            widgets: data.widgets
+          }
         }
 
-        const assistantMessage: AIChatMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
+        // Finalize with the authoritative parsed response (replaces the live
+        // partial text, clears the activity indicator).
+        patchAssistant({
           content: data.message,
           responseData,
-          createdAt: new Date()
-        }
-
-        setMessages((prev) => [...prev, assistantMessage])
+          grounded: response.meta?.grounded ?? false,
+          suggestions: data.suggestions ?? undefined,
+          streaming: false,
+          activity: undefined
+        })
       } else {
-        // Show error message
-        const errorMessage: AIChatMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
+        patchAssistant({
           content: `Sorry, I encountered an error: ${response.error || 'Unknown error'}`,
-          createdAt: new Date()
-        }
-        setMessages((prev) => [...prev, errorMessage])
+          streaming: false,
+          activity: undefined
+        })
       }
     } catch (error) {
       console.error('AI chat error:', error)
-      const errorMessage: AIChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'assistant',
+      patchAssistant({
         content: `Sorry, I encountered an error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        createdAt: new Date()
-      }
-      setMessages((prev) => [...prev, errorMessage])
+        streaming: false,
+        activity: undefined
+      })
     } finally {
       setIsLoading(false)
     }
   }
 
+  // Flat, ordered candidate list (tables first, then columns) for @-mentions.
+  const mentionItems = React.useMemo(() => {
+    if (mentionStart < 0) return []
+    const tables: Array<{ label: string; detail: string; insert: string }> = []
+    const cols: Array<{ label: string; detail: string; insert: string }> = []
+    for (const schema of schemas) {
+      for (const t of schema.tables) {
+        tables.push({ label: t.name, detail: 'table', insert: t.name })
+        for (const c of t.columns) {
+          cols.push({
+            label: `${t.name}.${c.name}`,
+            detail: c.dataType || 'column',
+            insert: `${t.name}.${c.name}`
+          })
+        }
+      }
+    }
+    const all = [...tables, ...cols]
+    const q = mentionQuery.toLowerCase()
+    return (q ? all.filter((i) => i.label.toLowerCase().includes(q)) : all).slice(0, 8)
+  }, [schemas, mentionStart, mentionQuery])
+
+  // Detect a trailing `@token` before the caret and open the mention menu.
+  const computeMention = (value: string, caret: number) => {
+    const match = value.slice(0, caret).match(/@([\w.]*)$/)
+    if (match) {
+      setMentionStart(caret - match[0].length)
+      setMentionQuery(match[1])
+      setMentionIndex(0)
+    } else if (mentionStart !== -1) {
+      setMentionStart(-1)
+      setMentionQuery('')
+    }
+  }
+
+  const applyMention = (item: { insert: string }) => {
+    if (mentionStart < 0) return
+    const end = mentionStart + 1 + mentionQuery.length
+    const next = input.slice(0, mentionStart) + item.insert + ' ' + input.slice(end)
+    setInput(next)
+    setMentionStart(-1)
+    setMentionQuery('')
+    const pos = mentionStart + item.insert.length + 1
+    requestAnimationFrame(() => {
+      const el = inputRef.current
+      if (el) {
+        el.focus()
+        el.setSelectionRange(pos, pos)
+      }
+    })
+  }
+
+  const mentionOpen = mentionStart >= 0 && mentionItems.length > 0
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (mentionOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setMentionIndex((i) => (i + 1) % mentionItems.length)
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setMentionIndex((i) => (i - 1 + mentionItems.length) % mentionItems.length)
+        return
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault()
+        applyMention(mentionItems[mentionIndex])
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setMentionStart(-1)
+        return
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSendMessage()
@@ -427,6 +586,9 @@ export function AIChatPanel({
   // Clear current session's chat
   const handleClearChat = async () => {
     setMessages([])
+    // Start a fresh CLI session too — resuming the old one would restore the
+    // conversation we just cleared.
+    harnessSessionIdRef.current = undefined
     if (connection?.id && currentSessionId) {
       try {
         await window.api.ai.updateSession(connection.id, currentSessionId, { messages: [] })
@@ -447,7 +609,8 @@ export function AIChatPanel({
     <>
       {/* Backdrop with gradient */}
       <div
-        className="fixed inset-0 z-40 bg-gradient-to-r from-transparent via-black/20 to-black/40 backdrop-blur-[2px] transition-opacity duration-300"
+        role="presentation"
+        className="fixed inset-0 z-40 bg-gradient-to-r from-transparent via-black/20 to-black/40 transition-opacity duration-300"
         onClick={onClose}
       />
 
@@ -492,6 +655,7 @@ export function AIChatPanel({
               ) : (
                 <>
                   <button
+                    type="button"
                     onClick={() => connection && setShowSessionsList(true)}
                     className="font-semibold text-sm hover:text-blue-400 transition-colors flex items-center gap-1.5 truncate max-w-[200px]"
                     disabled={!connection}
@@ -626,7 +790,15 @@ export function AIChatPanel({
                           ? 'bg-blue-500/10 border border-blue-500/20'
                           : 'hover:bg-muted/50'
                       )}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => handleSwitchSession(session.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          handleSwitchSession(session.id)
+                        }
+                      }}
                     >
                       <MessageSquare
                         className={cn(
@@ -641,6 +813,7 @@ export function AIChatPanel({
                           <div className="flex items-center gap-1">
                             <input
                               type="text"
+                              aria-label="Session title"
                               value={editingTitle}
                               onChange={(e) => setEditingTitle(e.target.value)}
                               onKeyDown={(e) => {
@@ -779,14 +952,16 @@ export function AIChatPanel({
                       key={message.id}
                       message={message}
                       onOpenInTab={onOpenInTab}
+                      onSuggestionClick={sendPrompt}
                       connection={connection}
                       schemas={schemas}
                     />
                   ))
                 )}
 
-                {/* Loading indicator */}
-                {isLoading && (
+                {/* Loading indicator — only when there's no streaming bubble
+                    already showing live activity (avoids a double "Thinking"). */}
+                {isLoading && !messages.some((m) => m.streaming) && (
                   <div className="flex items-start gap-3 animate-in fade-in-0 slide-in-from-bottom-2 duration-200">
                     <div className="flex items-center justify-center size-7 rounded-full bg-gradient-to-br from-blue-500/10 to-purple-500/10 border border-blue-500/20 shrink-0">
                       <Sparkles className="size-3.5 text-blue-400" />
@@ -824,10 +999,43 @@ export function AIChatPanel({
                   'focus-within:border-blue-500/30 focus-within:ring-2 focus-within:ring-blue-500/10'
                 )}
               >
+                {/* @-mention autocomplete menu (tables + columns) */}
+                {mentionOpen && (
+                  <div className="absolute bottom-full left-0 mb-2 w-72 max-h-56 overflow-auto rounded-lg border border-border/60 bg-popover shadow-xl z-50 py-1">
+                    <div className="px-2.5 py-1 text-[10px] uppercase tracking-wide text-muted-foreground/50">
+                      Reference a table or column
+                    </div>
+                    {mentionItems.map((item, i) => (
+                      <button
+                        key={item.label}
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault()
+                          applyMention(item)
+                        }}
+                        onMouseEnter={() => setMentionIndex(i)}
+                        className={cn(
+                          'flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-xs',
+                          i === mentionIndex
+                            ? 'bg-blue-500/15 text-blue-200'
+                            : 'text-foreground/80 hover:bg-muted/40'
+                        )}
+                      >
+                        <span className="font-mono truncate">{item.label}</span>
+                        <span className="text-[10px] text-muted-foreground/60 shrink-0">
+                          {item.detail}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   ref={inputRef}
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => {
+                    setInput(e.target.value)
+                    computeMention(e.target.value, e.target.selectionStart ?? e.target.value.length)
+                  }}
                   onKeyDown={handleKeyDown}
                   placeholder="Ask about your data..."
                   rows={1}
@@ -866,7 +1074,7 @@ export function AIChatPanel({
                 </Button>
               </div>
               <p className="text-[10px] text-muted-foreground/50 mt-2 text-center">
-                Press Enter to send, Shift+Enter for new line
+                Press Enter to send, Shift+Enter for new line · Type @ to reference a table
               </p>
             </div>
           </>

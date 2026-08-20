@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import {
   BarChart,
@@ -25,17 +23,17 @@ import {
   Hash,
   Calendar
 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import {
+  Button,
+  Badge,
+  cn,
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
   ChartLegend,
   ChartLegendContent,
   type ChartConfig
-} from '@/components/ui/chart'
-import { cn } from '@/lib/utils'
+} from '@data-peek/ui'
 
 // Chart types supported
 type ChartType = 'bar' | 'line' | 'pie' | 'area'

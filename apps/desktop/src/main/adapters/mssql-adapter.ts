@@ -1,4 +1,5 @@
 import sql from 'mssql'
+import { randomUUID } from 'crypto'
 import type {
   ConnectionConfig,
   SchemaInfo,
@@ -11,14 +12,45 @@ import type {
   IndexDefinition,
   SequenceInfo,
   CustomTypeInfo,
-  StatementResult
+  StatementResult,
+  RoutineInfo,
+  RoutineParameterInfo,
+  TriggerInfo,
+  ColumnStats,
+  ColumnStatsType,
+  CommonValue,
+  ActiveQuery,
+  TableSizeInfo,
+  CacheStats,
+  LockInfo,
+  DatabaseSizeInfo,
+  SchemaIntelCheckId,
+  SchemaIntelReport
 } from '@shared/index'
+import { runMssqlSchemaIntel } from '../schema-intel/mssql'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  ExplainResult,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
+import { toMSSQLConfig } from './mssql-client-config'
+import {
+  withMSSQLPool,
+  withMSSQLTransaction,
+  withDedicatedMSSQLConnection
+} from './mssql-pool-manager'
+import { splitStatements } from '../lib/sql-parser'
+import { telemetryCollector, TELEMETRY_PHASES } from '../telemetry-collector'
+
+// Re-exported because it was part of this module's surface before it moved out to break
+// an import cycle with the pool manager.
+export { toMSSQLConfig }
+
+/** Split SQL into statements for MSSQL */
+const splitMssqlStatements = (sqlText: string) => splitStatements(sqlText, 'mssql')
 
 const MSSQL_TYPE_MAP: Record<number, string> = {
   34: 'image',
@@ -72,11 +104,11 @@ const SYSTEM_SCHEMAS = [
   'db_denydatawriter'
 ]
 
-function resolveMSSQLType(dataTypeID: number): string {
+export function resolveMSSQLType(dataTypeID: number): string {
   return MSSQL_TYPE_MAP[dataTypeID] ?? `unknown(${dataTypeID})`
 }
 
-function inferTypeFromValue(value: unknown): { dataType: string; dataTypeID: number } {
+export function inferTypeFromValue(value: unknown): { dataType: string; dataTypeID: number } {
   if (value === null || value === undefined) return { dataType: 'nvarchar', dataTypeID: 231 }
   if (typeof value === 'number') {
     return Number.isInteger(value)
@@ -105,215 +137,9 @@ function bindParameter(request: sql.Request, paramName: string, value: unknown):
 }
 
 /**
- * Create MSSQL connection config from our ConnectionConfig
- */
-function toMSSQLConfig(config: ConnectionConfig): sql.config {
-  const mssqlOptions = config.mssqlOptions || {}
-
-  // Handle authentication methods first to determine what options are needed
-  const authentication = mssqlOptions.authentication
-  const isAzureAD = authentication === 'ActiveDirectoryIntegrated'
-
-  // Build options object - for Azure AD, keep it minimal
-  const defaultSsl = config.ssl ?? false
-  const options: sql.config['options'] = {}
-
-  // Always set encrypt if specified
-  if (mssqlOptions.encrypt !== undefined) {
-    options.encrypt = mssqlOptions.encrypt
-  } else if (defaultSsl) {
-    options.encrypt = true
-  }
-
-  // For Azure AD, don't set trustServerCertificate or enableArithAbort
-  // These can interfere with Azure AD authentication
-  if (!isAzureAD) {
-    if (mssqlOptions.trustServerCertificate !== undefined) {
-      options.trustServerCertificate = mssqlOptions.trustServerCertificate
-    } else if (!defaultSsl) {
-      options.trustServerCertificate = true
-    }
-    options.enableArithAbort = mssqlOptions.enableArithAbort ?? true
-  }
-
-  // Add connection timeout if specified
-  if (mssqlOptions.connectionTimeout !== undefined) {
-    options.connectTimeout = mssqlOptions.connectionTimeout
-  }
-
-  // Add request timeout if specified
-  if (mssqlOptions.requestTimeout !== undefined) {
-    options.requestTimeout = mssqlOptions.requestTimeout
-  }
-
-  // Build base config
-  const sqlConfig: sql.config = {
-    server: config.host,
-    database: config.database,
-    options
-  }
-
-  // Include port if provided (optional in mssql config)
-  if (config.port) {
-    sqlConfig.port = config.port
-  }
-
-  // Handle authentication methods
-  if (authentication === 'ActiveDirectoryIntegrated') {
-    // Azure AD Integrated Authentication - uses azure-active-directory-default
-    sqlConfig.authentication = {
-      type: 'azure-active-directory-default',
-      options: {}
-    }
-    // Explicitly don't set user/password for Azure AD authentication
-    // Even if they exist in config, we should not include them
-  } else if (authentication === 'ActiveDirectoryPassword') {
-    // Azure AD Password Authentication
-    // Note: This requires clientId and tenantId which aren't in our config yet
-    // For now, use SQL Server auth as fallback
-    if (config.user) sqlConfig.user = config.user
-    if (config.password) sqlConfig.password = config.password
-  } else if (authentication === 'ActiveDirectoryServicePrincipal') {
-    // Azure AD Service Principal - would need clientId and clientSecret
-    // For now, fall back to SQL Server auth
-    if (config.user) sqlConfig.user = config.user
-    if (config.password) sqlConfig.password = config.password
-  } else {
-    // Default: SQL Server Authentication
-    if (config.user) sqlConfig.user = config.user
-    if (config.password) sqlConfig.password = config.password
-  }
-
-  return sqlConfig
-}
-
-/**
- * Split SQL into individual statements, respecting string literals and comments
- */
-function splitStatements(sqlText: string): string[] {
-  const statements: string[] = []
-  let current = ''
-  let i = 0
-
-  while (i < sqlText.length) {
-    const char = sqlText[i]
-    const nextChar = sqlText[i + 1]
-
-    // Handle single-quoted strings
-    if (char === "'") {
-      current += char
-      i++
-      while (i < sqlText.length) {
-        if (sqlText[i] === "'" && sqlText[i + 1] === "'") {
-          current += "''"
-          i += 2
-        } else if (sqlText[i] === "'") {
-          current += "'"
-          i++
-          break
-        } else {
-          current += sqlText[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle bracket-quoted identifiers (MSSQL-specific)
-    if (char === '[') {
-      current += char
-      i++
-      while (i < sqlText.length) {
-        if (sqlText[i] === ']' && sqlText[i + 1] === ']') {
-          current += ']]'
-          i += 2
-        } else if (sqlText[i] === ']') {
-          current += ']'
-          i++
-          break
-        } else {
-          current += sqlText[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle double-quoted identifiers
-    if (char === '"') {
-      current += char
-      i++
-      while (i < sqlText.length) {
-        if (sqlText[i] === '"' && sqlText[i + 1] === '"') {
-          current += '""'
-          i += 2
-        } else if (sqlText[i] === '"') {
-          current += '"'
-          i++
-          break
-        } else {
-          current += sqlText[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle line comments (--)
-    if (char === '-' && nextChar === '-') {
-      current += '--'
-      i += 2
-      while (i < sqlText.length && sqlText[i] !== '\n') {
-        current += sqlText[i]
-        i++
-      }
-      continue
-    }
-
-    // Handle block comments (/* */)
-    if (char === '/' && nextChar === '*') {
-      current += '/*'
-      i += 2
-      while (i < sqlText.length) {
-        if (sqlText[i] === '*' && sqlText[i + 1] === '/') {
-          current += '*/'
-          i += 2
-          break
-        } else {
-          current += sqlText[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Statement separator (MSSQL uses ; or GO, but GO must be on its own line)
-    if (char === ';') {
-      const stmt = current.trim()
-      if (stmt) {
-        statements.push(stmt)
-      }
-      current = ''
-      i++
-      continue
-    }
-
-    current += char
-    i++
-  }
-
-  const lastStmt = current.trim()
-  if (lastStmt) {
-    statements.push(lastStmt)
-  }
-
-  return statements
-}
-
-/**
  * Check if a SQL statement is data-returning (SELECT, etc.)
  */
-function isDataReturningStatement(sqlText: string): boolean {
+export function isDataReturningStatement(sqlText: string): boolean {
   const normalized = sqlText.trim().toUpperCase()
   if (normalized.startsWith('SELECT')) return true
   if (normalized.startsWith('WITH') && normalized.includes('SELECT')) return true
@@ -331,25 +157,40 @@ export class MSSQLAdapter implements DatabaseAdapter {
   readonly dbType = 'mssql' as const
 
   async connect(config: ConnectionConfig): Promise<void> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-    await pool.close()
+    // Warm the pool AND verify the socket end-to-end. Connecting alone can be satisfied
+    // by an already-open pooled connection; SELECT 1 proves it's live.
+    await withMSSQLPool(config, async (pool) => {
+      await pool.request().query('SELECT 1')
+    })
   }
 
   async query(config: ConnectionConfig, sqlQuery: string): Promise<AdapterQueryResult> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-
-    try {
+    return withMSSQLPool(config, async (pool) => {
       const result = await pool.request().query(sqlQuery)
       const rows = result.recordset as Record<string, unknown>[]
       const fields: QueryField[] = []
 
       if (result.recordset?.columns) {
+        let colIndex = 0
         for (const col of Object.values(result.recordset.columns)) {
           const meta = col as { name: string; type?: { id?: number; name?: string } }
           let dataTypeID: number | undefined
           let dataType: string
+
+          // MSSQL returns empty string for unnamed columns (e.g., COUNT(*), SUM(), etc.)
+          // Generate a fallback name and remap the row data
+          const originalName = meta.name
+          const columnName = originalName || `column_${colIndex + 1}`
+
+          // If column name was empty, remap the row data to use the generated name
+          if (!originalName && rows.length > 0) {
+            for (const row of rows) {
+              if (originalName in row) {
+                row[columnName] = row[originalName]
+                delete row[originalName]
+              }
+            }
+          }
 
           if (meta.type?.id) {
             dataTypeID = meta.type.id
@@ -361,16 +202,17 @@ export class MSSQLAdapter implements DatabaseAdapter {
             )
             dataTypeID = match ? Number(match[0]) : undefined
           } else {
-            const inferred = inferTypeFromValue(rows[0]?.[meta.name])
+            const inferred = inferTypeFromValue(rows[0]?.[columnName])
             dataType = inferred.dataType
             dataTypeID = inferred.dataTypeID
           }
 
           fields.push({
-            name: meta.name,
+            name: columnName,
             dataType: dataType || 'nvarchar',
             dataTypeID: dataTypeID || 231
           })
+          colIndex++
         }
       } else if (rows.length > 0) {
         for (const [name, value] of Object.entries(rows[0])) {
@@ -380,108 +222,205 @@ export class MSSQLAdapter implements DatabaseAdapter {
       }
 
       return { rows, fields, rowCount: result.rowsAffected[0] ?? rows.length }
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async queryMultiple(
     config: ConnectionConfig,
-    sqlQuery: string
+    sqlQuery: string,
+    options?: QueryOptions
   ): Promise<AdapterMultiQueryResult> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
+    const collectTelemetry = options?.collectTelemetry ?? false
+    const executionId = options?.executionId ?? randomUUID()
+
+    // Start telemetry collection if requested
+    if (collectTelemetry) {
+      telemetryCollector.startQuery(executionId, false)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+    }
 
     const totalStart = Date.now()
     const results: StatementResult[] = []
+    let totalRowCount = 0
 
-    try {
-      const statements = splitStatements(sqlQuery)
+    const statements = splitMssqlStatements(sqlQuery)
 
-      for (let i = 0; i < statements.length; i++) {
-        const statement = statements[i]
-        const stmtStart = Date.now()
+    // A multi-statement script may carry session state between its statements — a temp
+    // table, SET, DECLARE, SET IDENTITY_INSERT — and `pool.request()` can route each
+    // statement to a different pooled connection, which would break all of those. Pin
+    // the whole loop to one connection when there is more than one statement; a lone
+    // statement has nothing to inherit, so it keeps the pooled fast path.
+    const run = statements.length > 1 ? withDedicatedMSSQLConnection : withMSSQLPool
 
-        try {
-          const result = await pool.request().query(statement)
-          const stmtDuration = Date.now() - stmtStart
+    return run(config, async (pool) => {
+      // Closes over the pool acquisition, which is the only connection-level cost left
+      // now that pooling amortises the handshake — and the one worth seeing, since it
+      // spikes when the pool saturates. There is no per-query DB handshake to report.
+      if (collectTelemetry) {
+        telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+      }
 
-          const rows = (result.recordset || []) as Record<string, unknown>[]
-          const fields: QueryField[] = []
+      try {
+        for (let i = 0; i < statements.length; i++) {
+          const statement = statements[i]
+          const stmtStart = Date.now()
 
-          if (result.recordset?.columns) {
-            for (const col of Object.values(result.recordset.columns)) {
-              const meta = col as { name: string; type?: { id?: number; name?: string } }
-              let dataTypeID: number | undefined
-              let dataType: string
+          try {
+            const request = pool.request()
 
-              if (meta.type?.id) {
-                dataTypeID = meta.type.id
-                dataType = resolveMSSQLType(dataTypeID)
-              } else if (meta.type?.name) {
-                dataType = meta.type.name.toLowerCase()
-                const match = Object.entries(MSSQL_TYPE_MAP).find(
-                  ([, name]) => name.toLowerCase() === dataType
-                )
-                dataTypeID = match ? Number(match[0]) : undefined
-              } else {
-                const inferred = inferTypeFromValue(rows[0]?.[meta.name])
-                dataType = inferred.dataType
-                dataTypeID = inferred.dataTypeID
+            // Set per-request timeout if specified (overrides connection-level timeout)
+            const queryTimeoutMs = options?.queryTimeoutMs
+            if (
+              queryTimeoutMs !== undefined &&
+              typeof queryTimeoutMs === 'number' &&
+              Number.isFinite(queryTimeoutMs)
+            ) {
+              // The mssql library supports request.timeout at runtime but types don't expose it
+              ;(request as unknown as { timeout: number }).timeout = Math.max(
+                0,
+                Math.floor(queryTimeoutMs)
+              )
+            }
+
+            // Register the current request for cancellation support
+            if (options?.executionId) {
+              registerQuery(options.executionId, { type: 'mssql', request })
+            }
+
+            // Start execution phase timing
+            if (collectTelemetry) {
+              telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+            }
+
+            const result = await request.query(statement)
+
+            if (collectTelemetry) {
+              telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+              telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.PARSE)
+            }
+
+            const stmtDuration = Date.now() - stmtStart
+
+            const rows = (result.recordset || []) as Record<string, unknown>[]
+            const fields: QueryField[] = []
+
+            if (result.recordset?.columns) {
+              let colIndex = 0
+              for (const col of Object.values(result.recordset.columns)) {
+                const meta = col as { name: string; type?: { id?: number; name?: string } }
+                let dataTypeID: number | undefined
+                let dataType: string
+
+                // MSSQL returns empty string for unnamed columns (e.g., COUNT(*), SUM(), etc.)
+                // Generate a fallback name and remap the row data
+                const originalName = meta.name
+                const columnName = originalName || `column_${colIndex + 1}`
+
+                // If column name was empty, remap the row data to use the generated name
+                if (!originalName && rows.length > 0) {
+                  for (const row of rows) {
+                    if (originalName in row) {
+                      row[columnName] = row[originalName]
+                      delete row[originalName]
+                    }
+                  }
+                }
+
+                if (meta.type?.id) {
+                  dataTypeID = meta.type.id
+                  dataType = resolveMSSQLType(dataTypeID)
+                } else if (meta.type?.name) {
+                  dataType = meta.type.name.toLowerCase()
+                  const match = Object.entries(MSSQL_TYPE_MAP).find(
+                    ([, name]) => name.toLowerCase() === dataType
+                  )
+                  dataTypeID = match ? Number(match[0]) : undefined
+                } else {
+                  const inferred = inferTypeFromValue(rows[0]?.[columnName])
+                  dataType = inferred.dataType
+                  dataTypeID = inferred.dataTypeID
+                }
+
+                fields.push({
+                  name: columnName,
+                  dataType: dataType || 'nvarchar',
+                  dataTypeID: dataTypeID || 231
+                })
+                colIndex++
               }
+            } else if (rows.length > 0) {
+              for (const [name, value] of Object.entries(rows[0])) {
+                const inferred = inferTypeFromValue(value)
+                fields.push({ name, ...inferred })
+              }
+            }
 
-              fields.push({
-                name: meta.name,
-                dataType: dataType || 'nvarchar',
-                dataTypeID: dataTypeID || 231
-              })
+            const isDataReturning = isDataReturningStatement(statement)
+            const rowCount = isDataReturning ? rows.length : (result.rowsAffected[0] ?? 0)
+            totalRowCount += rowCount
+
+            results.push({
+              statement,
+              statementIndex: i,
+              rows,
+              fields,
+              rowCount,
+              durationMs: stmtDuration,
+              isDataReturning
+            })
+
+            if (collectTelemetry) {
+              telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.PARSE)
             }
-          } else if (rows.length > 0) {
-            for (const [name, value] of Object.entries(rows[0])) {
-              const inferred = inferTypeFromValue(value)
-              fields.push({ name, ...inferred })
+
+            // Unregister after each statement completes successfully
+            if (options?.executionId) {
+              unregisterQuery(options.executionId)
             }
+          } catch (error) {
+            const stmtDuration = Date.now() - stmtStart
+            const errorMessage = error instanceof Error ? error.message : String(error)
+
+            results.push({
+              statement,
+              statementIndex: i,
+              rows: [],
+              fields: [{ name: 'error', dataType: 'nvarchar' }],
+              rowCount: 0,
+              durationMs: stmtDuration,
+              isDataReturning: false
+            })
+
+            // Cancel telemetry on error
+            if (collectTelemetry) {
+              telemetryCollector.cancel(executionId)
+            }
+
+            throw new Error(
+              `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
+            )
           }
+        }
 
-          const isDataReturning = isDataReturningStatement(statement)
-          const rowCount = isDataReturning ? rows.length : (result.rowsAffected[0] ?? 0)
+        const result: AdapterMultiQueryResult = {
+          results,
+          totalDurationMs: Date.now() - totalStart
+        }
 
-          results.push({
-            statement,
-            statementIndex: i,
-            rows,
-            fields,
-            rowCount,
-            durationMs: stmtDuration,
-            isDataReturning
-          })
-        } catch (error) {
-          const stmtDuration = Date.now() - stmtStart
-          const errorMessage = error instanceof Error ? error.message : String(error)
+        // Finalize telemetry
+        if (collectTelemetry) {
+          result.telemetry = telemetryCollector.finalize(executionId, totalRowCount)
+        }
 
-          results.push({
-            statement,
-            statementIndex: i,
-            rows: [],
-            fields: [{ name: 'error', dataType: 'nvarchar' }],
-            rowCount: 0,
-            durationMs: stmtDuration,
-            isDataReturning: false
-          })
-
-          throw new Error(
-            `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
-          )
+        return result
+      } finally {
+        // The per-statement unregister above only runs on the success path, so a failed
+        // statement would otherwise leave a stale request registered as cancellable.
+        if (options?.executionId) {
+          unregisterQuery(options.executionId)
         }
       }
-
-      return {
-        results,
-        totalDurationMs: Date.now() - totalStart
-      }
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async execute(
@@ -489,10 +428,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
     sqlQuery: string,
     params: unknown[]
   ): Promise<{ rowCount: number | null }> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-
-    try {
+    return withMSSQLPool(config, async (pool) => {
       const request = pool.request()
       const hasMSSQLPlaceholders = /@p\d+/.test(sqlQuery)
 
@@ -510,21 +446,14 @@ export class MSSQLAdapter implements DatabaseAdapter {
 
       const result = await request.query(sqlQuery)
       return { rowCount: result.rowsAffected[0] ?? null }
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async executeTransaction(
     config: ConnectionConfig,
     statements: Array<{ sql: string; params: unknown[] }>
   ): Promise<{ rowsAffected: number; results: Array<{ rowCount: number | null }> }> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-    const transaction = new sql.Transaction(pool)
-
-    try {
-      await transaction.begin()
+    return withMSSQLTransaction(config, async (transaction) => {
       const results: Array<{ rowCount: number | null }> = []
       let rowsAffected = 0
 
@@ -551,21 +480,12 @@ export class MSSQLAdapter implements DatabaseAdapter {
         rowsAffected += affected
       }
 
-      await transaction.commit()
       return { rowsAffected, results }
-    } catch (error) {
-      await transaction.rollback().catch(() => {})
-      throw error
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async getSchemas(config: ConnectionConfig): Promise<SchemaInfo[]> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-
-    try {
+    return withMSSQLPool(config, async (pool) => {
       const schemaList = SYSTEM_SCHEMAS.map((s) => `'${s}'`).join(', ')
 
       const [schemasResult, tablesResult] = await Promise.all([
@@ -581,8 +501,9 @@ export class MSSQLAdapter implements DatabaseAdapter {
           )
       ])
 
-      const [columnsResult, foreignKeysResult] = await Promise.all([
-        pool.request().query(`
+      const [columnsResult, foreignKeysResult, routinesResult, paramsResult, triggersResult] =
+        await Promise.all([
+          pool.request().query(`
           SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable,
                  c.column_default, c.ordinal_position, c.character_maximum_length,
                  c.numeric_precision, c.numeric_scale,
@@ -598,7 +519,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
           WHERE c.table_schema NOT IN (${schemaList})
           ORDER BY c.table_schema, c.table_name, c.ordinal_position
         `),
-        pool.request().query(`
+          pool.request().query(`
           SELECT fk_schema.table_schema, fk_schema.table_name, fk_col.column_name,
                  fk_schema.constraint_name, pk_schema.table_schema AS referenced_schema,
                  pk_schema.table_name AS referenced_table, pk_col.column_name AS referenced_column
@@ -616,8 +537,95 @@ export class MSSQLAdapter implements DatabaseAdapter {
             AND fk_schema.table_schema NOT IN (${schemaList})
             AND pk_schema.table_schema NOT IN (${schemaList})
           ORDER BY fk_schema.table_schema, fk_schema.table_name, fk_col.column_name
+        `),
+          pool.request().query(`
+          SELECT r.routine_schema, r.routine_name, r.routine_type,
+                 r.data_type as return_type, r.specific_name
+          FROM information_schema.routines r
+          WHERE r.routine_schema NOT IN (${schemaList})
+          ORDER BY r.routine_schema, r.routine_name
+        `),
+          pool.request().query(`
+          SELECT p.specific_schema, p.specific_name, p.parameter_name,
+                 p.data_type, p.parameter_mode, p.ordinal_position
+          FROM information_schema.parameters p
+          WHERE p.specific_schema NOT IN (${schemaList})
+            AND p.parameter_name IS NOT NULL
+          ORDER BY p.specific_schema, p.specific_name, p.ordinal_position
+        `),
+          pool.request().query(`
+          SELECT s.name AS trigger_schema, o.name AS table_name, tr.name AS trigger_name,
+                 tr.is_disabled, tr.is_instead_of_trigger, m.definition, te.type_desc AS event
+          FROM sys.triggers tr
+          JOIN sys.objects o ON o.object_id = tr.parent_id
+          JOIN sys.schemas s ON s.schema_id = o.schema_id
+          LEFT JOIN sys.sql_modules m ON m.object_id = tr.object_id
+          LEFT JOIN sys.trigger_events te ON te.object_id = tr.object_id
+          WHERE tr.is_ms_shipped = 0 AND tr.parent_class = 1
+            AND s.name NOT IN (${schemaList})
+          ORDER BY s.name, o.name, tr.name
         `)
-      ])
+        ])
+
+      // Build parameters lookup map
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of paramsResult.recordset) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Build routines lookup map
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routinesResult.recordset) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const routineParams = paramsMap.get(paramsKey) || []
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: routineParams
+        })
+      }
+
+      // Build triggers lookup map. A trigger may fire on multiple events, so we
+      // aggregate the per-event rows into a single TriggerInfo per trigger.
+      const triggersMap = new Map<string, TriggerInfo[]>()
+      const triggerByKey = new Map<string, TriggerInfo>()
+      for (const row of triggersResult.recordset) {
+        const key = `${row.trigger_schema}.${row.table_name}.${row.trigger_name}`
+        let trigger = triggerByKey.get(key)
+        if (!trigger) {
+          trigger = {
+            name: row.trigger_name,
+            schema: row.trigger_schema,
+            table: row.table_name,
+            timing: row.is_instead_of_trigger ? 'INSTEAD OF' : 'AFTER',
+            events: [],
+            enabled: !row.is_disabled,
+            definition: row.definition || ''
+          }
+          triggerByKey.set(key, trigger)
+          if (!triggersMap.has(row.trigger_schema)) {
+            triggersMap.set(row.trigger_schema, [])
+          }
+          triggersMap.get(row.trigger_schema)!.push(trigger)
+        }
+        if (row.event && !trigger.events.includes(row.event)) {
+          trigger.events.push(row.event)
+        }
+      }
 
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
@@ -626,7 +634,9 @@ export class MSSQLAdapter implements DatabaseAdapter {
       for (const row of schemasResult.recordset) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || [],
+          triggers: triggersMap.get(row.schema_name) || []
         })
       }
 
@@ -690,9 +700,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
       }
 
       return Array.from(schemaMap.values())
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async explain(
@@ -700,10 +708,9 @@ export class MSSQLAdapter implements DatabaseAdapter {
     sqlQuery: string,
     analyze: boolean
   ): Promise<ExplainResult> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-
-    try {
+    // Pinned to one connection: the SET below configures the statement that follows it,
+    // and pooled requests are not guaranteed to share a connection.
+    return withDedicatedMSSQLConnection(config, async (pool) => {
       const start = Date.now()
 
       if (analyze) {
@@ -743,9 +750,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
           durationMs: Date.now() - start
         }
       }
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async getTableDDL(
@@ -753,10 +758,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
     schema: string,
     table: string
   ): Promise<TableDefinition> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-
-    try {
+    return withMSSQLPool(config, async (pool) => {
       // Query columns with full metadata
       const columnsResult = await pool
         .request()
@@ -973,9 +975,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
         indexes,
         comment: tableCommentResult.recordset[0]?.comment || undefined
       }
-    } finally {
-      await pool.close()
-    }
+    })
   }
 
   async getSequences(): Promise<SequenceInfo[]> {
@@ -985,10 +985,7 @@ export class MSSQLAdapter implements DatabaseAdapter {
   }
 
   async getTypes(config: ConnectionConfig): Promise<CustomTypeInfo[]> {
-    const pool = new sql.ConnectionPool(toMSSQLConfig(config))
-    await pool.connect()
-
-    try {
+    return withMSSQLPool(config, async (pool) => {
       // Get user-defined types from sys.types
       const typesResult = await pool.request().query(`
         SELECT
@@ -1010,8 +1007,427 @@ export class MSSQLAdapter implements DatabaseAdapter {
         name: row.type_name,
         type: 'composite' as const // Treat as composite for now
       }))
-    } finally {
-      await pool.close()
+    })
+  }
+
+  private classifyColumnType(dataType: string): ColumnStatsType {
+    const lower = dataType.toLowerCase()
+    if (
+      lower.includes('int') ||
+      lower.includes('decimal') ||
+      lower.includes('numeric') ||
+      lower.includes('float') ||
+      lower.includes('real') ||
+      lower.includes('money') ||
+      lower === 'number'
+    ) {
+      return 'numeric'
     }
+    if (lower.includes('date') || lower.includes('time')) {
+      return 'datetime'
+    }
+    if (lower === 'bit') {
+      return 'boolean'
+    }
+    if (
+      lower.includes('char') ||
+      lower.includes('text') ||
+      lower.includes('varchar') ||
+      lower.includes('nvarchar') ||
+      lower.includes('nchar')
+    ) {
+      return 'text'
+    }
+    return 'other'
+  }
+
+  async getColumnStats(
+    config: ConnectionConfig,
+    schema: string,
+    table: string,
+    column: string,
+    dataType: string
+  ): Promise<ColumnStats> {
+    return withMSSQLPool(config, async (pool) => {
+      const statsType = this.classifyColumnType(dataType)
+      const quoteIdent = (name: string) => '[' + name.replace(/\]/g, ']]') + ']'
+      const quotedTable = `${quoteIdent(schema)}.${quoteIdent(table)}`
+      const quotedCol = quoteIdent(column)
+
+      const baseResult = await pool.request().query(`
+        SELECT
+          COUNT(*) AS total_rows,
+          COUNT(*) - COUNT(${quotedCol}) AS null_count,
+          COUNT(DISTINCT ${quotedCol}) AS distinct_count
+        FROM ${quotedTable}
+      `)
+
+      const baseRow = baseResult.recordset[0]
+      const totalRows = Number(baseRow.total_rows)
+      const nullCount = Number(baseRow.null_count)
+      const distinctCount = Number(baseRow.distinct_count)
+      const nullPercentage = totalRows > 0 ? (nullCount / totalRows) * 100 : 0
+      const distinctPercentage = totalRows > 0 ? (distinctCount / totalRows) * 100 : 0
+
+      const stats: ColumnStats = {
+        column,
+        dataType,
+        statsType,
+        totalRows,
+        nullCount,
+        nullPercentage,
+        distinctCount,
+        distinctPercentage
+      }
+
+      if (statsType === 'numeric') {
+        const numResult = await pool.request().query(`
+          SELECT
+            CAST(MIN(${quotedCol}) AS NVARCHAR(MAX)) AS min_val,
+            CAST(MAX(${quotedCol}) AS NVARCHAR(MAX)) AS max_val,
+            AVG(CAST(${quotedCol} AS FLOAT)) AS avg_val,
+            STDEV(CAST(${quotedCol} AS FLOAT)) AS stddev_val
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        const numRow = numResult.recordset[0]
+        stats.min = numRow?.min_val ?? null
+        stats.max = numRow?.max_val ?? null
+        stats.avg = numRow?.avg_val != null ? Number(numRow.avg_val) : null
+        stats.stdDev = numRow?.stddev_val != null ? Number(numRow.stddev_val) : null
+
+        if (totalRows <= 1_000_000 && totalRows > 0) {
+          const medianResult = await pool.request().query(`
+            SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST(${quotedCol} AS FLOAT))
+              OVER () AS median_val
+            FROM ${quotedTable}
+            WHERE ${quotedCol} IS NOT NULL
+          `)
+          if (medianResult.recordset.length > 0) {
+            stats.median =
+              medianResult.recordset[0]?.median_val != null
+                ? Number(medianResult.recordset[0].median_val)
+                : null
+          }
+
+          const mmResult = await pool.request().query(`
+            SELECT
+              MIN(CAST(${quotedCol} AS FLOAT)) AS min_val,
+              MAX(CAST(${quotedCol} AS FLOAT)) AS max_val
+            FROM ${quotedTable}
+            WHERE ${quotedCol} IS NOT NULL
+          `)
+          const mmRow = mmResult.recordset[0]
+          const minVal = Number(mmRow?.min_val)
+          const maxVal = Number(mmRow?.max_val)
+
+          if (!isNaN(minVal) && !isNaN(maxVal) && minVal < maxVal) {
+            const histResult = await pool.request().query(`
+              SELECT
+                NTILE(10) OVER (ORDER BY CAST(${quotedCol} AS FLOAT)) AS bucket,
+                CAST(${quotedCol} AS FLOAT) AS val
+              FROM ${quotedTable}
+              WHERE ${quotedCol} IS NOT NULL
+            `)
+
+            const bucketMap = new Map<number, { min: number; max: number; count: number }>()
+            for (const row of histResult.recordset) {
+              const b = Number(row.bucket)
+              const v = Number(row.val)
+              if (!bucketMap.has(b)) {
+                bucketMap.set(b, { min: v, max: v, count: 0 })
+              }
+              const entry = bucketMap.get(b)!
+              if (v < entry.min) entry.min = v
+              if (v > entry.max) entry.max = v
+              entry.count++
+            }
+
+            stats.histogram = Array.from(bucketMap.entries())
+              .sort(([a], [b]) => a - b)
+              .map(([, v]) => v)
+          }
+        }
+      } else if (statsType === 'text') {
+        const textResult = await pool.request().query(`
+          SELECT
+            MIN(LEN(${quotedCol})) AS min_length,
+            MAX(LEN(${quotedCol})) AS max_length,
+            AVG(CAST(LEN(${quotedCol}) AS FLOAT)) AS avg_length
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        const textRow = textResult.recordset[0]
+        stats.minLength = textRow?.min_length != null ? Number(textRow.min_length) : null
+        stats.maxLength = textRow?.max_length != null ? Number(textRow.max_length) : null
+        stats.avgLength = textRow?.avg_length != null ? Number(textRow.avg_length) : null
+
+        const commonResult = await pool.request().query(`
+          SELECT TOP 5
+            CAST(${quotedCol} AS NVARCHAR(MAX)) AS val,
+            COUNT(*) AS cnt,
+            ROUND(COUNT(*) * 100.0 / ${totalRows}, 2) AS pct
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+          GROUP BY CAST(${quotedCol} AS NVARCHAR(MAX))
+          ORDER BY cnt DESC
+        `)
+
+        const commonValues: CommonValue[] = commonResult.recordset.map((row) => ({
+          value: row.val != null ? String(row.val) : null,
+          count: Number(row.cnt),
+          percentage: Number(row.pct)
+        }))
+        stats.commonValues = commonValues
+      } else if (statsType === 'datetime') {
+        const dtResult = await pool.request().query(`
+          SELECT
+            CAST(MIN(${quotedCol}) AS NVARCHAR(MAX)) AS min_val,
+            CAST(MAX(${quotedCol}) AS NVARCHAR(MAX)) AS max_val
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        const dtRow = dtResult.recordset[0]
+        stats.min = dtRow?.min_val ?? null
+        stats.max = dtRow?.max_val ?? null
+      } else if (statsType === 'boolean') {
+        const boolResult = await pool.request().query(`
+          SELECT
+            SUM(CASE WHEN ${quotedCol} = 1 THEN 1 ELSE 0 END) AS true_count,
+            SUM(CASE WHEN ${quotedCol} = 0 THEN 1 ELSE 0 END) AS false_count
+          FROM ${quotedTable}
+        `)
+
+        const boolRow = boolResult.recordset[0]
+        stats.trueCount = Number(boolRow?.true_count ?? 0)
+        stats.falseCount = Number(boolRow?.false_count ?? 0)
+      }
+
+      return stats
+    })
+  }
+
+  async getActiveQueries(config: ConnectionConfig): Promise<ActiveQuery[]> {
+    return withMSSQLPool(config, async (pool) => {
+      const result = await pool.request().query(`
+        SELECT
+          r.session_id AS pid,
+          s.login_name AS [user],
+          DB_NAME(r.database_id) AS [database],
+          r.status AS state,
+          r.total_elapsed_time AS duration_ms,
+          CAST(r.total_elapsed_time / 1000.0 AS VARCHAR) + 's' AS duration,
+          t.text AS query,
+          r.wait_type AS wait_event
+        FROM sys.dm_exec_requests r
+        JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+        CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+        WHERE r.session_id != @@SPID
+          AND r.status != 'background'
+        ORDER BY r.total_elapsed_time DESC
+      `)
+
+      return result.recordset.map((row) => ({
+        pid: Number(row.pid),
+        user: String(row.user ?? ''),
+        database: String(row.database ?? ''),
+        state: String(row.state ?? ''),
+        duration: String(row.duration ?? '0s'),
+        durationMs: Number(row.duration_ms ?? 0),
+        query: String(row.query ?? ''),
+        waitEvent: row.wait_event ? String(row.wait_event) : undefined
+      }))
+    })
+  }
+
+  async getTableSizes(
+    config: ConnectionConfig,
+    schema?: string
+  ): Promise<{ dbSize: DatabaseSizeInfo; tables: TableSizeInfo[] }> {
+    return withMSSQLPool(config, async (pool) => {
+      const dbSizeResult = await pool.request().query(`
+        SELECT
+          SUM(size * 8 * 1024) AS total_size_bytes
+        FROM sys.database_files
+      `)
+      const totalSizeBytes = Number(dbSizeResult.recordset[0]?.total_size_bytes ?? 0)
+      const dbSize: DatabaseSizeInfo = {
+        totalSize: this.formatBytes(totalSizeBytes),
+        totalSizeBytes
+      }
+
+      const schemaFilter = schema ? `AND s.name = @schema` : ''
+      const request = pool.request()
+      if (schema) {
+        request.input('schema', sql.NVarChar, schema)
+      }
+
+      const tablesResult = await request.query(`
+        SELECT
+          s.name AS [schema],
+          t.name AS [table],
+          SUM(p.rows) AS row_count_estimate,
+          SUM(CASE WHEN i.index_id < 2
+            THEN a.used_pages * 8 * 1024
+            ELSE 0
+          END) AS data_size_bytes,
+          SUM(CASE WHEN i.index_id >= 2
+            THEN a.used_pages * 8 * 1024
+            ELSE 0
+          END) AS index_size_bytes,
+          SUM(a.used_pages * 8 * 1024) AS total_size_bytes
+        FROM sys.tables t
+        JOIN sys.schemas s ON t.schema_id = s.schema_id
+        JOIN sys.indexes i ON t.object_id = i.object_id
+        JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+        JOIN sys.allocation_units a ON p.partition_id = a.container_id
+        WHERE t.is_ms_shipped = 0
+          ${schemaFilter}
+        GROUP BY s.name, t.name
+        ORDER BY SUM(a.used_pages) DESC
+      `)
+
+      const tables: TableSizeInfo[] = tablesResult.recordset.map((row) => {
+        const dataSizeBytes = Number(row.data_size_bytes ?? 0)
+        const indexSizeBytes = Number(row.index_size_bytes ?? 0)
+        const tSizeBytes = Number(row.total_size_bytes ?? 0)
+        return {
+          schema: String(row.schema),
+          table: String(row.table),
+          rowCountEstimate: Number(row.row_count_estimate ?? 0),
+          dataSize: this.formatBytes(dataSizeBytes),
+          dataSizeBytes,
+          indexSize: this.formatBytes(indexSizeBytes),
+          indexSizeBytes,
+          totalSize: this.formatBytes(tSizeBytes),
+          totalSizeBytes: tSizeBytes
+        }
+      })
+
+      return { dbSize, tables }
+    })
+  }
+
+  async getCacheStats(config: ConnectionConfig): Promise<CacheStats> {
+    return withMSSQLPool(config, async (pool) => {
+      const cacheResult = await pool.request().query(`
+        SELECT
+          CASE WHEN SUM(CAST(page_count AS BIGINT)) = 0 THEN 0
+            ELSE ROUND(
+              CAST(SUM(CASE WHEN is_modified = 0 THEN 1 ELSE 0 END) AS FLOAT)
+              / SUM(CAST(page_count AS BIGINT)) * 100, 2
+            )
+          END AS buffer_cache_hit_ratio
+        FROM sys.dm_os_buffer_descriptors
+        WHERE database_id = DB_ID()
+      `)
+
+      const bufferCacheHitRatio = Number(cacheResult.recordset[0]?.buffer_cache_hit_ratio ?? 0)
+
+      let indexHitRatio = bufferCacheHitRatio
+      try {
+        const indexResult = await pool.request().query(`
+          SELECT
+            CASE WHEN SUM(user_seeks + user_scans + user_lookups) = 0 THEN 0
+              ELSE ROUND(
+                CAST(SUM(user_seeks + user_lookups) AS FLOAT)
+                / SUM(user_seeks + user_scans + user_lookups) * 100, 2
+              )
+            END AS index_hit_ratio
+          FROM sys.dm_db_index_usage_stats
+          WHERE database_id = DB_ID()
+        `)
+        indexHitRatio = Number(indexResult.recordset[0]?.index_hit_ratio ?? bufferCacheHitRatio)
+      } catch {
+        // fall through with default
+      }
+
+      return {
+        bufferCacheHitRatio,
+        indexHitRatio
+      }
+    })
+  }
+
+  async getLocks(config: ConnectionConfig): Promise<LockInfo[]> {
+    return withMSSQLPool(config, async (pool) => {
+      const result = await pool.request().query(`
+        SELECT
+          blocked.request_session_id AS blocked_pid,
+          blocked_s.login_name AS blocked_user,
+          blocked_t.text AS blocked_query,
+          blocker.request_session_id AS blocking_pid,
+          blocker_s.login_name AS blocking_user,
+          blocker_t.text AS blocking_query,
+          blocked.resource_type AS lock_type,
+          blocked.resource_description AS relation,
+          r.total_elapsed_time AS wait_duration_ms,
+          CAST(r.total_elapsed_time / 1000.0 AS VARCHAR) + 's' AS wait_duration
+        FROM sys.dm_tran_locks blocked
+        JOIN sys.dm_exec_sessions blocked_s ON blocked.request_session_id = blocked_s.session_id
+        JOIN sys.dm_exec_requests r ON blocked.request_session_id = r.session_id
+        CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) blocked_t
+        JOIN sys.dm_tran_locks blocker ON (
+          blocked.resource_type = blocker.resource_type
+          AND blocked.resource_database_id = blocker.resource_database_id
+          AND blocked.resource_associated_entity_id = blocker.resource_associated_entity_id
+          AND blocked.request_session_id != blocker.request_session_id
+        )
+        JOIN sys.dm_exec_sessions blocker_s ON blocker.request_session_id = blocker_s.session_id
+        OUTER APPLY (
+          SELECT TOP 1 req.sql_handle FROM sys.dm_exec_requests req
+          WHERE req.session_id = blocker.request_session_id
+        ) blocker_r
+        OUTER APPLY sys.dm_exec_sql_text(blocker_r.sql_handle) blocker_t
+        WHERE blocked.request_status = 'WAIT'
+          AND blocker.request_status = 'GRANT'
+      `)
+
+      return result.recordset.map((row) => ({
+        blockedPid: Number(row.blocked_pid ?? 0),
+        blockedUser: String(row.blocked_user ?? ''),
+        blockedQuery: String(row.blocked_query ?? ''),
+        blockingPid: Number(row.blocking_pid ?? 0),
+        blockingUser: String(row.blocking_user ?? ''),
+        blockingQuery: String(row.blocking_query ?? ''),
+        lockType: String(row.lock_type ?? ''),
+        relation: row.relation ? String(row.relation) : undefined,
+        waitDuration: String(row.wait_duration ?? '0s'),
+        waitDurationMs: Number(row.wait_duration_ms ?? 0)
+      }))
+    })
+  }
+
+  async killQuery(
+    config: ConnectionConfig,
+    pid: number
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      return await withMSSQLPool(config, async (pool) => {
+        await pool.request().query(`KILL ${Number(pid)}`)
+        return { success: true }
+      })
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  }
+
+  async runSchemaIntel(
+    config: ConnectionConfig,
+    checks?: SchemaIntelCheckId[]
+  ): Promise<SchemaIntelReport> {
+    return withMSSQLPool(config, async (pool) => {
+      return await runMssqlSchemaIntel(pool, checks)
+    })
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 bytes'
+    const units = ['bytes', 'kB', 'MB', 'GB', 'TB']
+    const i = Math.floor(Math.log(bytes) / Math.log(1024))
+    return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
   }
 }

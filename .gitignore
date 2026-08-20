@@ -4,6 +4,10 @@ out/
 
 # Business documentation (contains sensitive info)
 /docs/
+apps/docs/content/docs/marketing/
+
+# Plans (local only)
+/plans/
 
 # OS files
 .DS_Store
@@ -32,3 +36,28 @@ pnpm-debug.log*
 
 # Test coverage
 coverage/
+
+# MCP
+.playwright-mcp/
+
+# Superpowers
+.superpowers/
+docs/superpowers/
+
+# AI assistant configs
+.agents/
+.claude/
+.factory/
+.goose/
+.junie/
+.qwen/
+.trae/
+.windsurf/
+skills/
+skills-lock.json
+
+tools/feature-clips/footage/*
+!tools/feature-clips/footage/.gitkeep
+tools/feature-clips/dist/
+apps/web/test-results/
+apps/web/playwright-report/

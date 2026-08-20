@@ -1,44 +1,85 @@
-'use client'
+import { AddRowSheet, type ForeignKeyValue } from '@/components/add-row-sheet'
+import { EditToolbar } from '@/components/edit-toolbar'
+import { EditableCell } from '@/components/editable-cell'
+import { FKCellValue } from '@/components/fk-cell-value'
+import { JsonCellValue } from '@/components/json-cell-value'
+import { RowContextMenu } from '@/components/row-context-menu'
+import { SqlPreviewModal } from '@/components/sql-preview-modal'
+import {
+  Badge,
+  Button,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@data-peek/ui'
 
-import * as React from 'react'
+import {
+  generateLimitClause,
+  buildFullyQualifiedTableRef,
+  quoteIdentifier
+} from '@/lib/sql-helpers'
+import { useClickCopy } from '@/hooks'
+import { getTypeColor } from '@/lib/type-colors'
+import { useEditStore } from '@/stores/edit-store'
+import { useSettingsStore } from '@/stores/settings-store'
+import { useMaskingStore } from '@/stores/masking-store'
+import { PaginationControls } from '@/components/pagination-controls'
+import { SmartFilterBar, chipMatchesRow, type FilterChip } from '@/components/smart-filter-bar'
+import { SmartSortBar } from '@/components/sort/smart-sort-bar'
+import { applySorts, toggleColumnSort, type SortChip } from '@/lib/sort-model'
+import type { SortScope } from '@/lib/sort-scope'
+import type { ColumnInfo, ConnectionConfig, EditContext, ForeignKeyInfo } from '@data-peek/shared'
 import {
   flexRender,
   getCoreRowModel,
   getFilteredRowModel,
   getPaginationRowModel,
-  getSortedRowModel,
   useReactTable,
-  type ColumnDef,
-  type ColumnFiltersState,
-  type SortingState
+  type ColumnDef
 } from '@tanstack/react-table'
+import { useVirtualizer, type Virtualizer } from '@tanstack/react-virtual'
 import {
-  ArrowUpDown,
-  ArrowUp,
   ArrowDown,
-  ChevronLeft,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
-  Filter,
-  X,
-  Trash2,
+  ArrowUp,
+  ArrowUpDown,
+  BarChart2,
+  Copy,
+  Link2,
+  Lock,
+  MoreHorizontal,
   RotateCcw,
-  Link2
+  Trash2,
+  Unlock,
+  X
 } from 'lucide-react'
-import type { ForeignKeyInfo, ColumnInfo, EditContext, ConnectionConfig } from '@data-peek/shared'
-import { Input } from '@/components/ui/input'
-import { Button } from '@/components/ui/button'
-import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
-import { EditableCell } from '@/components/editable-cell'
-import { EditToolbar } from '@/components/edit-toolbar'
-import { SqlPreviewModal } from '@/components/sql-preview-modal'
-import { JsonCellValue } from '@/components/json-cell-value'
-import { FKCellValue } from '@/components/fk-cell-value'
-import { useEditStore } from '@/stores/edit-store'
+import { useHotkeys, type UseHotkeyDefinition } from '@tanstack/react-hotkeys'
+import * as React from 'react'
+import { CellGridInspector, CellGridOverlays, useCellGrid } from '@/components/cell-grid'
+import { WatchDecorationOverlay } from '@/components/cell-grid/watch-decoration-overlay'
+import { useWatchStore } from '@/stores/watch-store'
+import {
+  INLINE_ADDED_ROW_STYLE,
+  INLINE_CHANGED_CELL_STYLE,
+  inlineDiffPlan,
+  isInlineChangedCell,
+  resolveInlineRowDecoration,
+  selectInlineWatchDiff
+} from '@/lib/watch-inline-diff'
+
+const VIRTUALIZATION_THRESHOLD = 50
+const ROW_HEIGHT = 37
 
 export interface DataTableColumn {
   name: string
@@ -54,10 +95,10 @@ export interface DataTableFilter {
   value: string
 }
 
-export interface DataTableSort {
-  column: string
-  direction: 'asc' | 'desc'
-}
+// Re-exported rather than redeclared: the two tables feed the same `onSortingChange`
+// consumers, and a second copy of the shape silently drifted out of sync once already.
+import type { DataTableSort } from '@/components/data-table'
+export type { DataTableSort }
 
 interface EditableDataTableProps<TData> {
   tabId: string
@@ -72,52 +113,223 @@ interface EditableDataTableProps<TData> {
   connection?: ConnectionConfig | null
   onFiltersChange?: (filters: DataTableFilter[]) => void
   onSortingChange?: (sorting: DataTableSort[]) => void
+  /** Push the active filters into the query's WHERE clause. Filter bar only. */
+  onApplyToQuery?: () => void
+  /**
+   * Whether a client-side sort covers every row, or only the loaded slice.
+   * Defaults to `complete` over `data` — correct for callers that hand the table
+   * the entire result set. Paginated callers must pass their real scope.
+   */
+  sortScope?: SortScope
+  /** True while a server-side sort re-run is debouncing or in flight. */
+  isSortingOnServer?: boolean
+  /** Rewrite ORDER BY and re-run so the sort covers rows not yet loaded. */
+  onSortWholeSet?: () => void
+  onPageSizeChange?: (size: number) => void
   onForeignKeyClick?: (foreignKey: ForeignKeyInfo, value: unknown) => void
   onForeignKeyOpenTab?: (foreignKey: ForeignKeyInfo, value: unknown) => void
+  /** Called when user requests column statistics */
+  onColumnStatsClick?: (column: DataTableColumn) => void
   /** Called after changes are successfully committed */
   onChangesCommitted?: () => void
+  autoCommit?: boolean
+  hasActiveTransaction?: boolean
+  onTransactionStart?: () => void
+  /** Server-side pagination: current page (1-indexed) */
+  serverCurrentPage?: number
+  /** Server-side pagination: total row count from database */
+  serverTotalRowCount?: number | null
+  /** Server-side pagination: called when page or pageSize changes */
+  onServerPaginationChange?: (page: number, pageSize: number) => void
 }
 
-function getTypeColor(type: string): string {
-  const lower = type.toLowerCase()
-  if (lower.includes('uuid')) return 'text-purple-400'
-  if (lower.includes('varchar') || lower.includes('text') || lower.includes('char'))
-    return 'text-green-400'
-  if (
-    lower.includes('int') ||
-    lower.includes('numeric') ||
-    lower.includes('decimal') ||
-    lower.includes('bigint')
+function MaskedEditCell({
+  hoverToPeek,
+  children
+}: {
+  hoverToPeek: boolean
+  children: React.ReactNode
+}) {
+  const [peeking, setPeeking] = React.useState(false)
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!hoverToPeek) return
+    if (e.altKey) {
+      if (!peeking) setPeeking(true)
+    } else if (peeking) {
+      setPeeking(false)
+    }
+  }
+
+  const handleMouseLeave = () => setPeeking(false)
+
+  return (
+    <span
+      style={peeking ? undefined : { filter: 'blur(5px)', userSelect: 'none' }}
+      onMouseEnter={handleMouseMove}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+      className="inline-block select-none"
+    >
+      {children}
+    </span>
   )
-    return 'text-blue-400'
-  if (lower.includes('timestamp') || lower.includes('date') || lower.includes('time'))
-    return 'text-orange-400'
-  if (lower.includes('bool')) return 'text-yellow-400'
-  return 'text-muted-foreground'
+}
+
+function CopyableCell({
+  value,
+  onDoubleClick,
+  children
+}: {
+  value: string
+  onDoubleClick?: () => void
+  children: React.ReactNode
+}) {
+  const { copied, handleClick, handleDoubleClick } = useClickCopy({ onDoubleClick })
+
+  return (
+    <span
+      className={cn(
+        'relative cursor-default inline-flex items-center',
+        'transition-[background-color] duration-200',
+        copied && 'rounded bg-green-500/10'
+      )}
+      onClick={() => handleClick(value)}
+      onDoubleClick={onDoubleClick ? handleDoubleClick : undefined}
+      title={onDoubleClick ? 'Click to copy \u00b7 Double-click to edit' : 'Click to copy'}
+    >
+      <span className={cn('transition-opacity duration-150', copied ? 'opacity-0' : 'opacity-100')}>
+        {children}
+      </span>
+      {copied && (
+        <span className="absolute inset-0 flex items-center px-1 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:duration-150">
+          <svg
+            className="size-3 text-green-400 mr-1"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path
+              d="M3 8.5 L6.5 12 L13 4"
+              className="motion-safe:[stroke-dasharray:20] motion-safe:[stroke-dashoffset:20] motion-safe:animate-[check-draw_300ms_ease-out_forwards]"
+            />
+          </svg>
+          <span className="text-[10px] text-green-400 font-medium">Copied</span>
+        </span>
+      )}
+    </span>
+  )
 }
 
 export function EditableDataTable<TData extends Record<string, unknown>>({
   tabId,
   columns: columnDefs,
   data,
-  pageSize = 50,
+  pageSize: propPageSize,
   canEdit = false,
   editContext,
   connection,
   onFiltersChange,
   onSortingChange,
+  onPageSizeChange,
+  onApplyToQuery,
+  sortScope,
+  isSortingOnServer,
+  onSortWholeSet,
   onForeignKeyClick,
   onForeignKeyOpenTab,
-  onChangesCommitted
+  onColumnStatsClick,
+  onChangesCommitted,
+  autoCommit = true,
+  hasActiveTransaction = false,
+  onTransactionStart,
+  serverCurrentPage,
+  serverTotalRowCount,
+  onServerPaginationChange
 }: EditableDataTableProps<TData>) {
-  const [sorting, setSorting] = React.useState<SortingState>([])
-  const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>([])
-  const [showFilters, setShowFilters] = React.useState(false)
+  const { defaultPageSize } = useSettingsStore()
+  const pageSize = propPageSize ?? defaultPageSize
+
+  const toggleColumnMask = useMaskingStore((s) => s.toggleColumnMask)
+  const hoverToPeek = useMaskingStore((s) => s.hoverToPeek)
+  const maskedColumnsMap = useMaskingStore((s) => s.maskedColumns)
+  const autoMaskRules = useMaskingStore((s) => s.autoMaskRules)
+  const autoMaskEnabled = useMaskingStore((s) => s.autoMaskEnabled)
+  const getEffectiveMaskedColumns = useMaskingStore((s) => s.getEffectiveMaskedColumns)
+
+  const allColumnNames = React.useMemo(() => columnDefs.map((c) => c.name), [columnDefs])
+  const effectiveMasked = React.useMemo(
+    () => getEffectiveMaskedColumns(tabId, allColumnNames),
+    [
+      tabId,
+      allColumnNames,
+      getEffectiveMaskedColumns,
+      maskedColumnsMap,
+      autoMaskRules,
+      autoMaskEnabled
+    ]
+  )
+
+  const [sortChips, setSortChips] = React.useState<SortChip[]>([])
+  const [filterChips, setFilterChips] = React.useState<FilterChip[]>([])
+
+  const sortedData = React.useMemo(() => {
+    if (sortChips.length === 0) return data
+    return applySorts(data, sortChips, columnDefs)
+  }, [data, sortChips, columnDefs])
+
+  const toggleHeaderSort = React.useCallback(
+    (col: { name: string; dataType: string }, multi: boolean) => {
+      setSortChips((prev) => toggleColumnSort(prev, col, { multi }))
+    },
+    []
+  )
+
+  const globalFilterFn = React.useCallback(
+    (row: { original: unknown }): boolean => {
+      if (filterChips.length === 0) return true
+      return filterChips.every((chip) =>
+        chipMatchesRow(chip, row.original as Record<string, unknown>)
+      )
+    },
+    [filterChips]
+  )
+
+  const handleFilterChange = React.useCallback(
+    (chips: FilterChip[]) => {
+      setFilterChips(chips)
+      if (onFiltersChange) {
+        const filters: DataTableFilter[] = chips
+          .filter((c) => c.column !== null)
+          .map((c) => ({
+            column: c.column!,
+            value: c.value
+          }))
+        onFiltersChange(filters)
+      }
+    },
+    [onFiltersChange]
+  )
   const [showSqlPreview, setShowSqlPreview] = React.useState(false)
   const [sqlStatements, setSqlStatements] = React.useState<
     Array<{ operationId: string; sql: string; type: 'insert' | 'update' | 'delete' }>
   >([])
   const [isCommitting, setIsCommitting] = React.useState(false)
+  const [commitError, setCommitError] = React.useState<string | null>(null)
+
+  // Add Row Sheet state
+  const [showAddRowSheet, setShowAddRowSheet] = React.useState(false)
+  const [duplicateRowValues, setDuplicateRowValues] = React.useState<Record<
+    string,
+    unknown
+  > | null>(null)
+  const [foreignKeyValuesMap, setForeignKeyValuesMap] = React.useState<
+    Record<string, ForeignKeyValue[]>
+  >({})
+  const [loadingFkValues, setLoadingFkValues] = React.useState(false)
 
   // Edit store
   const {
@@ -147,33 +359,116 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
   const isEditMode = isInEditMode(tabId)
   const pendingChanges = getPendingChangesCount(tabId)
   const newRows = getNewRows(tabId)
+  const hasChanges = pendingChanges.updates + pendingChanges.inserts + pendingChanges.deletes > 0
 
   // Check for primary key
   const hasPrimaryKey = editContext?.primaryKeyColumns && editContext.primaryKeyColumns.length > 0
 
-  // Notify parent of filter changes
+  // Ref to store latest handler functions (avoids stale closure in event listeners)
+  const keyboardHandlersRef = React.useRef<{
+    handleSaveChanges: () => void
+    handleDiscardChanges: () => void
+    handleToggleEditMode: () => void
+    handleAddRowWithSheet: () => void
+  }>({
+    handleSaveChanges: () => {},
+    handleDiscardChanges: () => {},
+    handleToggleEditMode: () => {},
+    handleAddRowWithSheet: () => {}
+  })
+
+  // Keyboard shortcuts for edit mode
+  const isEditing = tabEdit?.editingCell !== null
+  const editHotkeys = React.useMemo<UseHotkeyDefinition[]>(
+    () => [
+      {
+        hotkey: 'Mod+S',
+        callback: () => keyboardHandlersRef.current.handleSaveChanges(),
+        options: { enabled: isEditMode && hasChanges }
+      },
+      {
+        hotkey: 'Escape',
+        callback: () => {
+          if (hasChanges) {
+            keyboardHandlersRef.current.handleToggleEditMode()
+          } else {
+            exitEditMode(tabId)
+          }
+        },
+        options: { enabled: isEditMode && !isEditing }
+      },
+      {
+        hotkey: 'Mod+Shift+A',
+        callback: () => {
+          if (!isEditMode && editContext) {
+            enterEditMode(tabId, editContext)
+          }
+          keyboardHandlersRef.current.handleAddRowWithSheet()
+        },
+        options: { enabled: canEdit && !!hasPrimaryKey }
+      },
+      {
+        hotkey: 'Mod+Shift+Z',
+        callback: () => keyboardHandlersRef.current.handleDiscardChanges(),
+        options: { enabled: isEditMode && hasChanges }
+      }
+    ],
+    [
+      isEditMode,
+      hasChanges,
+      isEditing,
+      tabId,
+      canEdit,
+      hasPrimaryKey,
+      editContext,
+      enterEditMode,
+      exitEditMode
+    ]
+  )
+  useHotkeys(editHotkeys)
+
+  // Listen for menu events (for menu bar shortcuts)
   React.useEffect(() => {
-    if (onFiltersChange) {
-      const filters: DataTableFilter[] = columnFilters
-        .filter((f) => f.value !== '')
-        .map((f) => ({
-          column: f.id,
-          value: String(f.value)
-        }))
-      onFiltersChange(filters)
+    const cleanupSave = window.api.menu.onSaveChanges(() => {
+      if (isEditMode && hasChanges) {
+        keyboardHandlersRef.current.handleSaveChanges()
+      }
+    })
+
+    const cleanupDiscard = window.api.menu.onDiscardChanges(() => {
+      if (isEditMode && hasChanges) {
+        keyboardHandlersRef.current.handleDiscardChanges()
+      }
+    })
+
+    const cleanupAddRow = window.api.menu.onAddRow(() => {
+      if (canEdit && hasPrimaryKey) {
+        if (!isEditMode && editContext) {
+          enterEditMode(tabId, editContext)
+        }
+        keyboardHandlersRef.current.handleAddRowWithSheet()
+      }
+    })
+
+    return () => {
+      cleanupSave()
+      cleanupDiscard()
+      cleanupAddRow()
     }
-  }, [columnFilters, onFiltersChange])
+  }, [isEditMode, hasChanges, canEdit, hasPrimaryKey, editContext, tabId, enterEditMode])
 
   // Notify parent of sorting changes
   React.useEffect(() => {
     if (onSortingChange) {
-      const sorts: DataTableSort[] = sorting.map((s) => ({
-        column: s.id,
-        direction: s.desc ? 'desc' : 'asc'
+      const sorts: DataTableSort[] = sortChips.map((c) => ({
+        column: c.column,
+        direction: c.direction,
+        mode: c.mode,
+        nullsPosition: c.nullsPosition
       }))
       onSortingChange(sorts)
     }
-  }, [sorting, onSortingChange])
+  }, [sortChips, onSortingChange])
 
   // Handle toggle edit mode
   const handleToggleEditMode = () => {
@@ -184,7 +479,7 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     }
   }
 
-  // Handle add new row
+  // Handle add new row (inline quick add)
   const handleAddRow = () => {
     // Create default values for all columns
     const defaultValues: Record<string, unknown> = {}
@@ -193,6 +488,102 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     })
     addNewRow(tabId, defaultValues)
   }
+
+  // Handle add row with sheet (form-based)
+  const handleAddRowWithSheet = () => {
+    setDuplicateRowValues(null)
+    setShowAddRowSheet(true)
+  }
+
+  // Handle duplicate row
+  const handleDuplicateRow = (rowData: Record<string, unknown>) => {
+    setDuplicateRowValues(rowData)
+    setShowAddRowSheet(true)
+  }
+
+  // Handle sheet submit
+  const handleSheetSubmit = (values: Record<string, unknown>) => {
+    // Enter edit mode if not already in edit mode
+    if (!isEditMode && editContext) {
+      enterEditMode(tabId, editContext)
+    }
+    addNewRow(tabId, values)
+    setShowAddRowSheet(false)
+    setDuplicateRowValues(null)
+  }
+
+  // Convert DataTableColumn to ColumnInfo for the sheet
+  const columnInfos: ColumnInfo[] = columnDefs.map((col, idx) => ({
+    name: col.name,
+    dataType: col.dataType,
+    isPrimaryKey: col.isPrimaryKey ?? false,
+    isNullable: col.isNullable ?? true,
+    ordinalPosition: idx + 1,
+    foreignKey: col.foreignKey
+  }))
+
+  // Build enum values map
+  const enumValuesMap: Record<string, string[]> = {}
+  columnDefs.forEach((col) => {
+    if (Array.isArray(col.enumValues) && col.enumValues.length > 0) {
+      enumValuesMap[col.name] = col.enumValues
+    }
+  })
+
+  // Fetch FK values when sheet opens
+  React.useEffect(() => {
+    if (!showAddRowSheet || !connection) return
+
+    // Find columns with foreign keys
+    const fkColumns = columnDefs.filter((col) => col.foreignKey)
+    if (fkColumns.length === 0) return
+
+    const fetchFkValues = async () => {
+      setLoadingFkValues(true)
+      const fkValuesMap: Record<string, ForeignKeyValue[]> = {}
+
+      try {
+        // Fetch FK values for each column in parallel
+        await Promise.all(
+          fkColumns.map(async (col) => {
+            const fk = col.foreignKey!
+            // Query the referenced table - limit to 1000 rows for performance
+            // Use TOP for MSSQL, LIMIT for other databases
+            const dbType = connection?.dbType
+            const limitClause = generateLimitClause(dbType, 1000)
+            const tableRef = buildFullyQualifiedTableRef(
+              fk.referencedSchema,
+              fk.referencedTable,
+              dbType
+            )
+            const quotedCol = quoteIdentifier(fk.referencedColumn, dbType)
+            const query =
+              dbType === 'mssql'
+                ? `SELECT ${limitClause} DISTINCT ${quotedCol} FROM ${tableRef} ORDER BY ${quotedCol}`
+                : `SELECT DISTINCT ${quotedCol} FROM ${tableRef} ORDER BY ${quotedCol} ${limitClause}`
+
+            try {
+              const result = await window.api.db.query(connection, query)
+              if (result.success && Array.isArray(result.data)) {
+                fkValuesMap[col.name] = (result.data as Record<string, unknown>[]).map((row) => ({
+                  value: row[fk.referencedColumn] as string | number
+                }))
+              }
+            } catch (err) {
+              console.error(`Failed to fetch FK values for ${col.name}:`, err)
+              fkValuesMap[col.name] = []
+            }
+          })
+        )
+
+        setForeignKeyValuesMap(fkValuesMap)
+      } finally {
+        setLoadingFkValues(false)
+      }
+    }
+
+    fetchFkValues()
+  }, [showAddRowSheet, connection, columnDefs])
 
   // Handle preview SQL
   const handlePreviewSql = async () => {
@@ -247,25 +638,35 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     if (!batch) return
 
     setIsCommitting(true)
+    setCommitError(null)
 
     try {
+      if (!autoCommit && !hasActiveTransaction) {
+        const beginRes = await window.api.db.beginTransaction(connection, tabId)
+        if (beginRes.success) {
+          onTransactionStart?.()
+        } else {
+          throw new Error('Failed to begin transaction: ' + beginRes.error)
+        }
+      }
+
+      if (!autoCommit) {
+        batch.sessionId = tabId
+      }
+
       const response = await window.api.db.execute(connection, batch)
 
       if (response.success && response.data?.success) {
-        // Clear pending changes
         clearPendingChanges(tabId)
         setShowSqlPreview(false)
-        // Notify parent to refresh data
         onChangesCommitted?.()
       } else {
-        // Handle errors
         const errorMsg =
           response.data?.errors?.[0]?.message || response.error || 'Failed to save changes'
-        console.error('Commit failed:', errorMsg)
-        // Could show a toast notification here
+        setCommitError(errorMsg)
       }
     } catch (error) {
-      console.error('Commit error:', error)
+      setCommitError(error instanceof Error ? error.message : String(error))
     } finally {
       setIsCommitting(false)
     }
@@ -275,6 +676,17 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
   const handleDiscardChanges = () => {
     revertAllChanges(tabId)
   }
+
+  // Update ref with latest handlers (for keyboard shortcuts)
+  // Using useLayoutEffect ensures this runs synchronously after render
+  React.useLayoutEffect(() => {
+    keyboardHandlersRef.current = {
+      handleSaveChanges,
+      handleDiscardChanges,
+      handleToggleEditMode,
+      handleAddRowWithSheet
+    }
+  })
 
   // Build table columns
   const columns = React.useMemo<ColumnDef<TData>[]>(() => {
@@ -286,9 +698,8 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
         id: '_select',
         header: () => null,
         cell: ({ row }) => {
-          const rowIndex = row.index
-          const isDeleted = isRowMarkedForDeletion(tabId, rowIndex)
-          const originalRow = row.original
+          const originalRow = row.original as Record<string, unknown>
+          const isDeleted = isRowMarkedForDeletion(tabId, originalRow)
 
           return (
             <div className="flex items-center gap-1">
@@ -299,7 +710,7 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                       variant="ghost"
                       size="icon"
                       className="size-6 text-muted-foreground hover:text-foreground"
-                      onClick={() => unmarkRowForDeletion(tabId, rowIndex)}
+                      onClick={() => unmarkRowForDeletion(tabId, originalRow)}
                     >
                       <RotateCcw className="size-3" />
                     </Button>
@@ -307,21 +718,34 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                   <TooltipContent>Restore row</TooltipContent>
                 </Tooltip>
               ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="size-6 text-muted-foreground hover:text-red-500"
-                      onClick={() =>
-                        markRowForDeletion(tabId, rowIndex, originalRow as Record<string, unknown>)
-                      }
+                      className="size-6 text-muted-foreground hover:text-foreground"
                     >
-                      <Trash2 className="size-3" />
+                      <MoreHorizontal className="size-3" />
                     </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Delete row</TooltipContent>
-                </Tooltip>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-40">
+                    <DropdownMenuItem
+                      onClick={() => handleDuplicateRow(originalRow)}
+                      className="gap-2"
+                    >
+                      <Copy className="size-4 text-amber-500" />
+                      Duplicate Row
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={() => markRowForDeletion(tabId, originalRow)}
+                      className="gap-2 text-red-500 focus:text-red-500"
+                    >
+                      <Trash2 className="size-4" />
+                      Delete Row
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               )}
             </div>
           )
@@ -331,39 +755,97 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     }
 
     // Data columns
-    columnDefs.forEach((col) => {
+    columnDefs.forEach((col, index) => {
+      // Generate a stable id for columns - MSSQL can return empty names for aggregates like COUNT(*)
+      // TanStack Table requires explicit id when header is a function and accessorKey might be empty
+      const columnId = col.name || `_col_${index}`
+      const displayName = col.name || `(column ${index + 1})`
+
       cols.push({
+        id: columnId,
+        // Keep accessorKey as col.name since that's how row data is keyed (even if empty)
         accessorKey: col.name,
-        header: ({ column }) => {
-          const isSorted = column.getIsSorted()
+        enableSorting: false,
+        header: () => {
+          const activeChip = sortChips.find((c) => c.column === col.name)
+          const activeRank = activeChip ? sortChips.findIndex((c) => c.column === col.name) + 1 : 0
+          const isMasked = effectiveMasked.has(col.name)
           return (
             <div className="flex flex-col gap-0.5">
-              <Button
-                variant="ghost"
-                className="h-auto py-1 px-2 -mx-2 font-medium hover:bg-accent/50"
-                onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
-              >
-                <span>{col.name}</span>
-                {col.isPrimaryKey && (
-                  <span className="ml-1 text-amber-500" title="Primary Key">
-                    🔑
-                  </span>
-                )}
-                {col.foreignKey && <Link2 className="ml-1 size-3 text-blue-400" />}
-                <Badge
-                  variant="outline"
-                  className={`ml-1.5 text-[9px] px-1 py-0 font-mono ${getTypeColor(col.dataType)}`}
+              <div className="flex items-center">
+                <Button
+                  variant="ghost"
+                  className="h-auto py-1 px-2 -mx-2 font-medium hover:bg-accent/50 flex-1"
+                  onClick={(e) => toggleHeaderSort(col, e.shiftKey || e.metaKey || e.ctrlKey)}
+                  title="Click to sort, Shift+click for multi-sort"
                 >
-                  {col.dataType}
-                </Badge>
-                {isSorted === 'asc' ? (
-                  <ArrowUp className="ml-1 size-3 text-primary" />
-                ) : isSorted === 'desc' ? (
-                  <ArrowDown className="ml-1 size-3 text-primary" />
-                ) : (
-                  <ArrowUpDown className="ml-1 size-3 opacity-50" />
-                )}
-              </Button>
+                  <span>{displayName}</span>
+                  {col.isPrimaryKey && (
+                    <span className="ml-1 text-amber-500" title="Primary Key">
+                      🔑
+                    </span>
+                  )}
+                  {isMasked && <Lock className="ml-1 size-3 text-amber-500" />}
+                  {col.foreignKey && <Link2 className="ml-1 size-3 text-blue-400" />}
+                  <Badge
+                    variant="outline"
+                    className={`ml-1.5 text-[9px] px-1 py-0 font-mono ${getTypeColor(col.dataType)}`}
+                  >
+                    {col.dataType}
+                  </Badge>
+                  {activeChip ? (
+                    <span className="ml-1 inline-flex items-center gap-0.5">
+                      {activeChip.direction === 'asc' ? (
+                        <ArrowUp className="size-3 text-primary" />
+                      ) : (
+                        <ArrowDown className="size-3 text-primary" />
+                      )}
+                      {sortChips.length > 1 && (
+                        <span className="text-[9px] font-mono font-semibold text-primary/80 tabular-nums">
+                          {activeRank}
+                        </span>
+                      )}
+                    </span>
+                  ) : (
+                    <ArrowUpDown className="ml-1 size-3 opacity-50" />
+                  )}
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      data-testid={`column-stats-trigger-${col.name}`}
+                      className="size-5 ml-0.5 opacity-0 group-hover/head:opacity-100 hover:opacity-100 focus:opacity-100"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <MoreHorizontal className="size-3" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {onColumnStatsClick && (
+                      <DropdownMenuItem onClick={() => onColumnStatsClick(col)}>
+                        <BarChart2 className="size-3 mr-2" />
+                        Column Statistics
+                      </DropdownMenuItem>
+                    )}
+                    {onColumnStatsClick && <DropdownMenuSeparator />}
+                    <DropdownMenuItem onClick={() => toggleColumnMask(tabId, col.name)}>
+                      {isMasked ? (
+                        <>
+                          <Unlock className="size-3 mr-2" />
+                          Unmask Column
+                        </>
+                      ) : (
+                        <>
+                          <Lock className="size-3 mr-2" />
+                          Mask Column
+                        </>
+                      )}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
               {col.foreignKey && (
                 <span className="text-[9px] text-muted-foreground px-2 -mt-0.5">
                   → {col.foreignKey.referencedTable}
@@ -375,16 +857,36 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
         cell: ({ row, getValue }) => {
           const rowIndex = row.index
           const value = getValue()
-          const isDeleted = isRowMarkedForDeletion(tabId, rowIndex)
-          const isModified = isCellModified(tabId, rowIndex, col.name)
-          const modifiedValue = getModifiedCellValue(tabId, rowIndex, col.name)
-          const displayValue = isModified ? modifiedValue : value
           const originalRow = row.original as Record<string, unknown>
+          const isDeleted = isRowMarkedForDeletion(tabId, originalRow)
+          const isModified = isCellModified(tabId, originalRow, col.name)
+          const modifiedValue = getModifiedCellValue(tabId, originalRow, col.name)
+          const displayValue = isModified ? modifiedValue : value
           const isEditing =
             tabEdit?.editingCell?.rowIndex === rowIndex &&
             tabEdit?.editingCell?.columnName === col.name
+          const isMasked = effectiveMasked.has(col.name)
 
           if (isEditMode) {
+            if (isMasked) {
+              return (
+                <MaskedEditCell hoverToPeek={hoverToPeek}>
+                  <EditableCell
+                    value={displayValue}
+                    originalValue={value}
+                    dataType={col.dataType}
+                    isEditing={false}
+                    isModified={isModified}
+                    isDeleted={isDeleted}
+                    enumValues={col.enumValues}
+                    columnName={col.name}
+                    onStartEdit={() => {}}
+                    onSave={() => {}}
+                    onCancel={() => {}}
+                  />
+                </MaskedEditCell>
+              )
+            }
             return (
               <EditableCell
                 value={displayValue}
@@ -396,88 +898,134 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                 enumValues={col.enumValues}
                 columnName={col.name}
                 onStartEdit={() => startCellEdit(tabId, rowIndex, col.name)}
-                onSave={(newValue) =>
-                  updateCellValue(tabId, rowIndex, col.name, newValue, originalRow)
-                }
+                onSave={(newValue) => updateCellValue(tabId, originalRow, col.name, newValue)}
                 onCancel={() => cancelCellEdit(tabId)}
                 onRevert={
-                  isModified ? () => revertCellChange(tabId, rowIndex, col.name) : undefined
+                  isModified ? () => revertCellChange(tabId, originalRow, col.name) : undefined
                 }
               />
             )
           }
 
           // Non-edit mode rendering
-          // Single-click to enter edit mode for simple cells
-          // Double-click for cells with special interactive elements (JSON viewer, FK navigation)
+          // Click to copy cell value, double-click to enter edit mode
           const handleActivate = () => {
-            if (!canEdit || !editContext) return
+            if (!canEdit || !editContext || isMasked) return
             enterEditMode(tabId, editContext)
             setTimeout(() => startCellEdit(tabId, rowIndex, col.name), 0)
           }
 
+          const copyText = value === null || value === undefined ? 'NULL' : String(value)
+          const canActivate = canEdit && !isMasked
+
           if (value === null || value === undefined) {
-            return (
-              <span
-                className={cn(
-                  'text-muted-foreground/50 italic px-1 py-0.5 rounded',
-                  canEdit && 'cursor-pointer hover:bg-accent/50'
-                )}
-                onClick={handleActivate}
+            const nullContent = (
+              <CopyableCell
+                value={copyText}
+                onDoubleClick={canActivate ? handleActivate : undefined}
               >
-                NULL
-              </span>
+                <span
+                  className={cn(
+                    'text-muted-foreground/50 italic px-1 py-0.5 rounded',
+                    canActivate && 'hover:bg-accent/50'
+                  )}
+                >
+                  NULL
+                </span>
+              </CopyableCell>
             )
+            if (isMasked) {
+              return <MaskedEditCell hoverToPeek={hoverToPeek}>{nullContent}</MaskedEditCell>
+            }
+            return nullContent
           }
 
-          // Handle JSON/JSONB types specially
-          // Single-click opens viewer, double-click on cell background enters edit mode
           const lowerType = col.dataType.toLowerCase()
           if (lowerType.includes('json')) {
-            return (
-              <div
-                onDoubleClick={handleActivate}
-                className={cn('flex items-center', canEdit && 'cursor-pointer')}
-                title={canEdit ? 'Double-click to edit' : undefined}
+            const jsonContent = (
+              <CopyableCell
+                value={copyText}
+                onDoubleClick={canActivate ? handleActivate : undefined}
               >
-                <JsonCellValue value={value} columnName={col.name} />
-              </div>
+                <div className={cn('flex items-center', canActivate && 'cursor-default')}>
+                  <JsonCellValue value={value} columnName={col.name} />
+                </div>
+              </CopyableCell>
             )
+            if (isMasked) {
+              return <MaskedEditCell hoverToPeek={hoverToPeek}>{jsonContent}</MaskedEditCell>
+            }
+            return jsonContent
           }
 
-          // Handle Foreign Key columns
-          // Single-click navigates, double-click on cell background enters edit mode
           if (col.foreignKey) {
-            return (
-              <div
-                onDoubleClick={handleActivate}
-                className={cn('flex items-center', canEdit && 'cursor-pointer')}
-                title={canEdit ? 'Double-click to edit' : undefined}
+            const fkContent = (
+              <CopyableCell
+                value={copyText}
+                onDoubleClick={canActivate ? handleActivate : undefined}
               >
-                <FKCellValue
-                  value={value}
-                  foreignKey={col.foreignKey}
-                  onForeignKeyClick={onForeignKeyClick}
-                  onForeignKeyOpenTab={onForeignKeyOpenTab}
-                />
-              </div>
+                <div className={cn('flex items-center', canActivate && 'cursor-default')}>
+                  <FKCellValue
+                    value={value}
+                    foreignKey={col.foreignKey}
+                    onForeignKeyClick={onForeignKeyClick}
+                    onForeignKeyOpenTab={onForeignKeyOpenTab}
+                  />
+                </div>
+              </CopyableCell>
             )
+            if (isMasked) {
+              return <MaskedEditCell hoverToPeek={hoverToPeek}>{fkContent}</MaskedEditCell>
+            }
+            return fkContent
+          }
+
+          if (lowerType.includes('bool')) {
+            const boolVal = value === true || value === 'true' || value === 't' || value === 1
+            const boolContent = (
+              <CopyableCell
+                value={copyText}
+                onDoubleClick={canActivate ? handleActivate : undefined}
+              >
+                <span
+                  className={cn(
+                    'text-xs font-mono px-1.5 py-0.5 rounded',
+                    boolVal ? 'text-green-500' : 'text-red-400',
+                    canActivate && 'hover:bg-accent/50'
+                  )}
+                >
+                  {String(value)}
+                </span>
+              </CopyableCell>
+            )
+            if (isMasked) {
+              return <MaskedEditCell hoverToPeek={hoverToPeek}>{boolContent}</MaskedEditCell>
+            }
+            return boolContent
           }
 
           const stringValue = String(value)
           const isLong = stringValue.length > 50
 
-          return (
-            <span
-              className={cn(
-                'truncate max-w-[300px] block px-1 py-0.5 rounded',
-                canEdit && 'cursor-pointer hover:bg-accent/50'
-              )}
-              onClick={handleActivate}
+          const textContent = (
+            <CopyableCell
+              value={stringValue}
+              onDoubleClick={canActivate ? handleActivate : undefined}
             >
-              {isLong ? stringValue.substring(0, 50) + '...' : stringValue}
-            </span>
+              <span
+                className={cn(
+                  'truncate max-w-[300px] block px-1 py-0.5 rounded',
+                  canActivate && 'hover:bg-accent/50'
+                )}
+              >
+                {isLong ? stringValue.substring(0, 50) + '...' : stringValue}
+              </span>
+            </CopyableCell>
           )
+          if (isMasked) {
+            return <MaskedEditCell hoverToPeek={hoverToPeek}>{textContent}</MaskedEditCell>
+          }
+          return textContent
         },
         filterFn: 'includesString'
       })
@@ -503,105 +1051,193 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
     editContext,
     enterEditMode,
     onForeignKeyClick,
-    onForeignKeyOpenTab
+    onForeignKeyOpenTab,
+    onColumnStatsClick,
+    effectiveMasked,
+    toggleColumnMask,
+    hoverToPeek,
+    sortChips,
+    toggleHeaderSort
   ])
 
+  const tableState = React.useMemo(
+    () => ({
+      globalFilter: filterChips
+    }),
+    [filterChips]
+  )
+
+  const tableInitialState = React.useMemo(
+    () => ({
+      pagination: { pageSize }
+    }),
+    [pageSize]
+  )
+
+  const tableGlobalFilterFn = React.useCallback(
+    (row: { original: unknown }) => globalFilterFn(row),
+    [globalFilterFn]
+  )
+
   const table = useReactTable({
-    data,
+    data: sortedData,
     columns,
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    onSortingChange: setSorting,
-    onColumnFiltersChange: setColumnFilters,
-    state: {
-      sorting,
-      columnFilters
-    },
-    initialState: {
-      pagination: {
-        pageSize
-      }
-    }
+    globalFilterFn: tableGlobalFilterFn,
+    state: tableState,
+    initialState: tableInitialState
   })
 
-  const activeFilterCount = columnFilters.filter((f) => f.value !== '').length
+  React.useEffect(() => {
+    table.setPageIndex(0)
+  }, [sortChips, filterChips, table])
 
-  const clearAllFilters = () => {
-    setColumnFilters([])
-  }
+  const tableContainerRef = React.useRef<HTMLDivElement>(null)
+  const headerRef = React.useRef<HTMLTableRowElement>(null)
+  const [columnWidths, setColumnWidths] = React.useState<number[]>([])
+
+  const rows = table.getRowModel().rows
+  const shouldVirtualize = rows.length > VIRTUALIZATION_THRESHOLD
+
+  // Below the threshold `EditableWatchOverlay` can't paint — it positions
+  // rectangles from measured column widths, which only the virtualized path
+  // produces — so the row map further down tints rows and cells inline instead.
+  // Scoped to the non-virtualized case on purpose: this subscription re-renders
+  // the whole grid on every tick, which is only acceptable at <= 50 rows, and
+  // there the grid re-renders anyway since a tick replaces `tab.result`.
+  const inlineWatchDiff = useWatchStore((s) =>
+    selectInlineWatchDiff(tabId ? s.states[tabId] : undefined, shouldVirtualize)
+  )
+  const inlineDiffKeyingPlan = inlineDiffPlan(inlineWatchDiff)
+
+  // `columns` prepends a `_select` action column in edit mode, so a cell's
+  // position is not its position in `columnDefs`. Resolve the diff's field name
+  // from the column id, generated by the same rule the column builder uses.
+  const diffFieldByColumnId = React.useMemo(() => {
+    const map = new Map<string, string>()
+    columnDefs.forEach((col, index) => map.set(col.name || `_col_${index}`, col.name))
+    return map
+  }, [columnDefs])
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => tableContainerRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 10
+  })
+
+  const columnKey = columnDefs.map((c) => c.name).join(',')
+
+  React.useEffect(() => {
+    setColumnWidths([])
+  }, [columnKey])
+
+  React.useEffect(() => {
+    if (!shouldVirtualize || !headerRef.current) return
+
+    const measureWidths = () => {
+      const headerCells = headerRef.current?.querySelectorAll('th')
+      if (!headerCells) return
+      const widths = Array.from(headerCells, (cell) => cell.offsetWidth)
+      // Skip the update when widths haven't changed — otherwise every ResizeObserver
+      // tick churns geometry identity and re-renders the overlay layer.
+      setColumnWidths((prev) =>
+        prev.length === widths.length && prev.every((w, i) => w === widths[i]) ? prev : widths
+      )
+    }
+
+    const timeoutId = setTimeout(measureWidths, 0)
+
+    const resizeObserver = new ResizeObserver(measureWidths)
+    if (headerRef.current) {
+      resizeObserver.observe(headerRef.current)
+    }
+
+    return () => {
+      clearTimeout(timeoutId)
+      resizeObserver.disconnect()
+    }
+  }, [shouldVirtualize, columnKey])
+
+  const cellGrid = useCellGrid({
+    rows,
+    columnDefs,
+    columnWidths,
+    rowHeight: ROW_HEIGHT,
+    // Must match the sticky <TableHeader> row height; drift causes overlay misalignment.
+    headerHeight: 40,
+    containerRef: tableContainerRef,
+    virtualizer,
+    enabled: shouldVirtualize
+  })
 
   return (
     <TooltipProvider>
       <div className="flex flex-col h-full min-h-0">
-        {/* Toolbar Row */}
-        <div className="flex items-center justify-between px-2 py-1.5 border-b border-border/30 shrink-0">
-          <div className="flex items-center gap-2">
-            <Button
-              variant={showFilters ? 'secondary' : 'ghost'}
-              size="sm"
-              className="h-7 gap-1.5 text-xs"
-              onClick={() => setShowFilters(!showFilters)}
-            >
-              <Filter className="size-3" />
-              Filter
-              {activeFilterCount > 0 && (
-                <Badge variant="secondary" className="ml-1 px-1.5 py-0 text-[10px]">
-                  {activeFilterCount}
-                </Badge>
+        {/* Filter Bar + Edit Toolbar */}
+        <div className="shrink-0">
+          <SmartFilterBar
+            columns={columnDefs}
+            onFilterChange={handleFilterChange}
+            onApplyToQuery={onApplyToQuery}
+            totalRows={data.length}
+            filteredRows={table.getFilteredRowModel().rows.length}
+          />
+          <SmartSortBar
+            columns={columnDefs}
+            chips={sortChips}
+            onChipsChange={setSortChips}
+            scope={sortScope ?? { kind: 'complete', rows: data.length }}
+            isSortingOnServer={isSortingOnServer}
+            onSortWholeSet={onSortWholeSet}
+          />
+          {canEdit && (
+            <div className="flex items-center px-2 py-1 border-b border-border/30">
+              <EditToolbar
+                isEditMode={isEditMode}
+                canEdit={canEdit}
+                noPrimaryKey={!hasPrimaryKey}
+                pendingChanges={pendingChanges}
+                isCommitting={isCommitting}
+                onToggleEditMode={handleToggleEditMode}
+                onAddRow={handleAddRow}
+                onAddRowWithSheet={handleAddRowWithSheet}
+                onSaveChanges={handleSaveChanges}
+                onDiscardChanges={handleDiscardChanges}
+                onPreviewSql={handlePreviewSql}
+              />
+              {newRows.length > 0 && (
+                <span className="text-xs text-green-500 ml-auto">+{newRows.length} new</span>
               )}
-            </Button>
-            {activeFilterCount > 0 && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 gap-1 text-xs text-muted-foreground"
-                onClick={clearAllFilters}
-              >
-                <X className="size-3" />
-                Clear all
-              </Button>
-            )}
-
-            {canEdit && (
-              <>
-                <div className="h-4 w-px bg-border mx-1" />
-                <EditToolbar
-                  isEditMode={isEditMode}
-                  canEdit={canEdit}
-                  noPrimaryKey={!hasPrimaryKey}
-                  pendingChanges={pendingChanges}
-                  isCommitting={isCommitting}
-                  onToggleEditMode={handleToggleEditMode}
-                  onAddRow={handleAddRow}
-                  onSaveChanges={handleSaveChanges}
-                  onDiscardChanges={handleDiscardChanges}
-                  onPreviewSql={handlePreviewSql}
-                />
-              </>
-            )}
-          </div>
-          <div className="text-xs text-muted-foreground">
-            {table.getFilteredRowModel().rows.length} of {data.length} rows
-            {newRows.length > 0 && (
-              <span className="text-green-500 ml-2">+{newRows.length} new</span>
-            )}
-          </div>
+            </div>
+          )}
         </div>
 
         {/* Table */}
         <div className="flex-1 min-h-0 border rounded-lg border-border/50 relative">
-          <div className="absolute inset-0 overflow-auto">
+          <CellGridInspector
+            cellGrid={cellGrid}
+            rowCount={rows.length}
+            colCount={columnDefs.length}
+            onForeignKeyOpen={onForeignKeyClick}
+          />
+          <div
+            ref={tableContainerRef}
+            tabIndex={0}
+            onClick={cellGrid.handleGridClick}
+            className="absolute inset-0 overflow-auto outline-none rounded-lg"
+          >
             <table className="w-full min-w-max caption-bottom text-sm">
               <TableHeader className="sticky top-0 bg-muted/95 backdrop-blur-sm z-10">
                 {table.getHeaderGroups().map((headerGroup) => (
                   <React.Fragment key={headerGroup.id}>
-                    <TableRow className="hover:bg-transparent border-border/50">
+                    <TableRow ref={headerRef} className="hover:bg-transparent border-border/50">
                       {headerGroup.headers.map((header) => (
                         <TableHead
                           key={header.id}
-                          className="h-10 text-xs font-medium text-muted-foreground whitespace-nowrap bg-muted/95"
+                          className="h-10 text-xs font-medium text-muted-foreground whitespace-nowrap bg-muted/95 group/head"
                           style={{ width: header.column.getSize() }}
                         >
                           {header.isPlaceholder
@@ -610,51 +1246,141 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                         </TableHead>
                       ))}
                     </TableRow>
-                    {showFilters && (
-                      <TableRow className="hover:bg-transparent border-border/50 bg-muted/80">
-                        {headerGroup.headers.map((header) => (
-                          <TableHead
-                            key={`filter-${header.id}`}
-                            className="h-9 py-1 px-2 bg-muted/80"
-                          >
-                            {header.column.getCanFilter() && header.id !== '_select' ? (
-                              <Input
-                                placeholder="Filter..."
-                                value={(header.column.getFilterValue() as string) ?? ''}
-                                onChange={(e) => header.column.setFilterValue(e.target.value)}
-                                className="h-7 text-xs bg-background/80"
-                              />
-                            ) : null}
-                          </TableHead>
-                        ))}
-                      </TableRow>
-                    )}
                   </React.Fragment>
                 ))}
               </TableHeader>
               <TableBody>
-                {/* Existing rows */}
-                {table.getRowModel().rows?.length ? (
-                  table.getRowModel().rows.map((row) => {
-                    const rowIndex = row.index
-                    const isDeleted = isRowMarkedForDeletion(tabId, rowIndex)
+                {rows.length ? (
+                  shouldVirtualize && columnWidths.length > 0 ? (
+                    <tr>
+                      <td colSpan={columns.length} style={{ padding: 0 }}>
+                        <div
+                          role="rowgroup"
+                          aria-rowcount={rows.length}
+                          style={{
+                            height: virtualizer.getTotalSize(),
+                            position: 'relative'
+                          }}
+                        >
+                          {virtualizer.getVirtualItems().map((virtualRow) => {
+                            const row = rows[virtualRow.index]
+                            const rowIndex = row.index
+                            const originalRow = row.original as Record<string, unknown>
+                            const isDeleted = isRowMarkedForDeletion(tabId, originalRow)
+                            return (
+                              <RowContextMenu
+                                key={row.id}
+                                row={originalRow}
+                                columns={columnDefs.map((c) => ({
+                                  name: c.name,
+                                  dataType: c.dataType
+                                }))}
+                                onDuplicate={
+                                  canEdit && editContext
+                                    ? () => handleDuplicateRow(originalRow)
+                                    : undefined
+                                }
+                                onDelete={
+                                  canEdit && editContext && !isDeleted
+                                    ? () => markRowForDeletion(tabId, originalRow)
+                                    : undefined
+                                }
+                              >
+                                <div
+                                  role="row"
+                                  aria-rowindex={rowIndex + 1}
+                                  data-index={virtualRow.index}
+                                  className={cn(
+                                    'hover:bg-accent/30 border-b border-border/30 transition-colors flex items-center',
+                                    isDeleted && 'bg-red-500/5'
+                                  )}
+                                  style={{
+                                    position: 'absolute',
+                                    top: 0,
+                                    left: 0,
+                                    height: `${virtualRow.size}px`,
+                                    transform: `translateY(${virtualRow.start}px)`
+                                  }}
+                                >
+                                  {row.getVisibleCells().map((cell, cellIndex) => (
+                                    <div
+                                      key={cell.id}
+                                      role="cell"
+                                      data-cell-row={virtualRow.index}
+                                      data-cell-col={cellIndex}
+                                      className="py-2 px-4 text-sm whitespace-nowrap overflow-hidden"
+                                      style={{
+                                        width: columnWidths[cellIndex] || 'auto',
+                                        flexShrink: 0
+                                      }}
+                                    >
+                                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                    </div>
+                                  ))}
+                                </div>
+                              </RowContextMenu>
+                            )
+                          })}
+                        </div>
+                      </td>
+                    </tr>
+                  ) : (
+                    rows.map((row) => {
+                      const originalRow = row.original as Record<string, unknown>
+                      const isDeleted = isRowMarkedForDeletion(tabId, originalRow)
+                      const decoration = resolveInlineRowDecoration(
+                        inlineWatchDiff,
+                        inlineDiffKeyingPlan,
+                        originalRow,
+                        row.index
+                      )
 
-                    return (
-                      <TableRow
-                        key={row.id}
-                        className={cn(
-                          'hover:bg-accent/30 border-border/30 transition-colors',
-                          isDeleted && 'bg-red-500/5'
-                        )}
-                      >
-                        {row.getVisibleCells().map((cell) => (
-                          <TableCell key={cell.id} className="py-2 text-sm whitespace-nowrap">
-                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                          </TableCell>
-                        ))}
-                      </TableRow>
-                    )
-                  })
+                      return (
+                        <RowContextMenu
+                          key={row.id}
+                          row={originalRow}
+                          columns={columnDefs.map((c) => ({ name: c.name, dataType: c.dataType }))}
+                          onDuplicate={
+                            canEdit && editContext
+                              ? () => handleDuplicateRow(originalRow)
+                              : undefined
+                          }
+                          onDelete={
+                            canEdit && editContext && !isDeleted
+                              ? () => markRowForDeletion(tabId, originalRow)
+                              : undefined
+                          }
+                        >
+                          <TableRow
+                            className={cn(
+                              'hover:bg-accent/30 border-border/30 transition-colors',
+                              isDeleted && 'bg-red-500/5'
+                            )}
+                            style={
+                              decoration.isAdded && !isDeleted ? INLINE_ADDED_ROW_STYLE : undefined
+                            }
+                          >
+                            {row.getVisibleCells().map((cell) => {
+                              const isChangedCell = isInlineChangedCell(
+                                inlineWatchDiff,
+                                decoration,
+                                diffFieldByColumnId.get(cell.column.id)
+                              )
+                              return (
+                                <TableCell
+                                  key={cell.id}
+                                  className="py-2 text-sm whitespace-nowrap"
+                                  style={isChangedCell ? INLINE_CHANGED_CELL_STYLE : undefined}
+                                >
+                                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                </TableCell>
+                              )
+                            })}
+                          </TableRow>
+                        </RowContextMenu>
+                      )
+                    })
+                  )
                 ) : (
                   <TableRow>
                     <TableCell colSpan={columns.length} className="h-24 text-center">
@@ -663,14 +1389,12 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                   </TableRow>
                 )}
 
-                {/* New rows (in edit mode) */}
                 {isEditMode &&
                   newRows.map((newRow) => (
                     <TableRow
                       key={newRow.id}
                       className="hover:bg-accent/30 border-border/30 bg-green-500/5"
                     >
-                      {/* Delete button for new row */}
                       <TableCell className="py-2 text-sm whitespace-nowrap">
                         <Button
                           variant="ghost"
@@ -681,7 +1405,6 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                           <X className="size-3" />
                         </Button>
                       </TableCell>
-                      {/* Data cells */}
                       {columnDefs.map((col) => (
                         <TableCell key={col.name} className="py-2 text-sm whitespace-nowrap">
                           <EditableCell
@@ -703,68 +1426,119 @@ export function EditableDataTable<TData extends Record<string, unknown>>({
                   ))}
               </TableBody>
             </table>
+            <CellGridOverlays cellGrid={cellGrid} />
+            {/*
+              Mutually exclusive with the inline tints on the rows above: this
+              overlay needs measured column widths, which only the virtualized
+              path produces. See lib/watch-inline-diff.ts.
+            */}
+            <EditableWatchOverlay
+              tabId={tabId}
+              rows={rows}
+              columnNames={columnDefs.map((c) => c.name)}
+              geometry={cellGrid.geometry}
+              virtualizer={virtualizer}
+              enabled={shouldVirtualize && columnWidths.length > 0}
+            />
           </div>
         </div>
 
         {/* Pagination */}
-        <div className="flex items-center justify-between py-2 shrink-0">
-          <div className="text-xs text-muted-foreground">
-            {table.getFilteredRowModel().rows.length} row(s) total
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="text-xs text-muted-foreground">
-              Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
-            </div>
-            <div className="flex items-center gap-1">
-              <Button
-                variant="outline"
-                size="icon"
-                className="size-7"
-                onClick={() => table.setPageIndex(0)}
-                disabled={!table.getCanPreviousPage()}
-              >
-                <ChevronsLeft className="size-3.5" />
-              </Button>
-              <Button
-                variant="outline"
-                size="icon"
-                className="size-7"
-                onClick={() => table.previousPage()}
-                disabled={!table.getCanPreviousPage()}
-              >
-                <ChevronLeft className="size-3.5" />
-              </Button>
-              <Button
-                variant="outline"
-                size="icon"
-                className="size-7"
-                onClick={() => table.nextPage()}
-                disabled={!table.getCanNextPage()}
-              >
-                <ChevronRight className="size-3.5" />
-              </Button>
-              <Button
-                variant="outline"
-                size="icon"
-                className="size-7"
-                onClick={() => table.setPageIndex(table.getPageCount() - 1)}
-                disabled={!table.getCanNextPage()}
-              >
-                <ChevronsRight className="size-3.5" />
-              </Button>
-            </div>
-          </div>
-        </div>
+        {onServerPaginationChange && serverTotalRowCount != null ? (
+          // Server-side pagination for table preview tabs
+          <PaginationControls
+            currentPage={serverCurrentPage ?? 1}
+            totalPages={Math.ceil(serverTotalRowCount / pageSize)}
+            pageSize={pageSize}
+            totalRows={serverTotalRowCount}
+            onPageChange={(page) => onServerPaginationChange(page, pageSize)}
+            onPageSizeChange={(size) => onServerPaginationChange(1, size)}
+            canPreviousPage={(serverCurrentPage ?? 1) > 1}
+            canNextPage={(serverCurrentPage ?? 1) < Math.ceil(serverTotalRowCount / pageSize)}
+          />
+        ) : (
+          // Client-side pagination
+          <PaginationControls
+            currentPage={table.getState().pagination.pageIndex + 1}
+            totalPages={table.getPageCount()}
+            pageSize={table.getState().pagination.pageSize}
+            totalRows={data.length}
+            filteredRows={table.getFilteredRowModel().rows.length}
+            onPageChange={(page) => table.setPageIndex(page - 1)}
+            onPageSizeChange={(size) => {
+              table.setPageSize(size)
+              onPageSizeChange?.(size)
+            }}
+            canPreviousPage={table.getCanPreviousPage()}
+            canNextPage={table.getCanNextPage()}
+          />
+        )}
 
         {/* SQL Preview Modal */}
         <SqlPreviewModal
           open={showSqlPreview}
-          onOpenChange={setShowSqlPreview}
+          onOpenChange={(open) => {
+            setShowSqlPreview(open)
+            if (!open) setCommitError(null)
+          }}
           sqlStatements={sqlStatements}
           onConfirm={handleConfirmCommit}
           isLoading={isCommitting}
+          error={commitError}
+        />
+
+        {/* Add Row Sheet */}
+        <AddRowSheet
+          open={showAddRowSheet}
+          onOpenChange={setShowAddRowSheet}
+          columns={columnInfos}
+          tableName={editContext?.table ?? 'table'}
+          schemaName={editContext?.schema}
+          initialValues={duplicateRowValues ?? undefined}
+          enumValuesMap={enumValuesMap}
+          foreignKeyValuesMap={foreignKeyValuesMap}
+          loadingFkValues={loadingFkValues}
+          onSubmit={handleSheetSubmit}
+          isDuplicate={duplicateRowValues !== null}
         />
       </div>
     </TooltipProvider>
+  )
+}
+
+/**
+ * Watch Mode diff overlay for editable-data-table, used on the virtualized
+ * path only. Subscribing here rather than in the grid keeps a per-tick diff
+ * change from re-rendering every row of a large result.
+ *
+ * Results at or below VIRTUALIZATION_THRESHOLD are decorated inline instead —
+ * see `selectInlineWatchDiff` at the top of the grid.
+ */
+function EditableWatchOverlay({
+  tabId,
+  rows,
+  columnNames,
+  geometry,
+  virtualizer,
+  enabled
+}: {
+  tabId?: string
+  rows: ReadonlyArray<{ original: Record<string, unknown> }>
+  columnNames: string[]
+  geometry: ReturnType<typeof useCellGrid>['geometry']
+  virtualizer: Virtualizer<HTMLDivElement, Element>
+  enabled: boolean
+}) {
+  const watchState = useWatchStore((s) => (tabId ? s.states[tabId] : null))
+  if (!enabled || !tabId || !watchState || !watchState.enabled || !watchState.diff) return null
+  return (
+    <WatchDecorationOverlay
+      diff={watchState.diff}
+      rows={rows}
+      columnNames={columnNames}
+      geometry={geometry}
+      virtualizer={virtualizer}
+      fadeMs={watchState.config.fadeMs}
+    />
   )
 }

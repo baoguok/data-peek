@@ -1,9 +1,6 @@
-'use client'
-
 import { useEffect } from 'react'
 import { Check, AlertCircle, User } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Button, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@data-peek/ui'
 import { useLicenseStore } from '@/stores/license-store'
 
 export function LicenseStatusIndicator() {

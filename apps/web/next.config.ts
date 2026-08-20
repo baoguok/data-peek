@@ -1,22 +1,58 @@
 import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
-  /* config options here */
-
-  async rewrites() {
+  images: {
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "pub-84538e6ab6f94b80b94b8aa308ad1270.r2.dev",
+      },
+    ],
+    formats: ["image/avif", "image/webp"],
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 3840],
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
+  },
+  compress: true,
+  poweredByHeader: false,
+  reactStrictMode: true,
+  experimental: {
+    optimizePackageImports: ["lucide-react"],
+  },
+  // Redirect non-www to www for SEO consistency
+  async redirects() {
     return [
       {
-        source: "/ingest/static/:path*",
-        destination: "https://us-assets.i.posthog.com/static/:path*",
+        source: "/:path*",
+        has: [
+          {
+            type: "host",
+            value: "datapeek.dev",
+          },
+        ],
+        destination: "https://www.datapeek.dev/:path*",
+        permanent: true,
       },
+      // Shipped desktop builds link to /dashboard, which has no standalone
+      // page — keep it resolving instead of 404ing.
       {
-        source: "/ingest/:path*",
-        destination: "https://us.i.posthog.com/:path*",
+        source: "/dashboard",
+        destination: "/",
+        permanent: false,
       },
     ];
   },
-  // This is required to support PostHog trailing slash API requests
-  skipTrailingSlashRedirect: true,
 };
 
-export default nextConfig;
+export default withSentryConfig(nextConfig, {
+  org: "rohith-gilla",
+  project: "data-peek-app",
+  silent: !process.env.CI,
+  widenClientFileUpload: true,
+  webpack: {
+    treeshake: {
+      removeDebugLogging: true,
+    },
+    automaticVercelMonitors: true,
+  },
+});

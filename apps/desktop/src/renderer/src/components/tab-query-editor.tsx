@@ -1,56 +1,72 @@
-'use client'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Database } from 'lucide-react'
+import { usePanelCollapse } from '@/hooks/use-panel-collapse'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  Play,
-  Download,
-  FileJson,
-  FileSpreadsheet,
-  Loader2,
-  AlertCircle,
-  Database,
-  Wand2,
-  PanelTopClose,
-  PanelTop,
-  PanelBottomClose,
-  PanelBottom,
-  DatabaseZap,
-  BarChart3,
-  Bookmark,
-  Maximize2
-} from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
-import { useTabStore, useConnectionStore, useQueryStore, useSettingsStore } from '@/stores'
-import type { Tab, MultiQueryResult } from '@/stores/tab-store'
+  useTabStore,
+  useConnectionStore,
+  useQueryStore,
+  useSettingsStore,
+  useSnippetStore
+} from '@/stores'
+import { isExecutableTab, type Tab, type MultiQueryResult } from '@/stores/tab-store'
 import type { StatementResult } from '@data-peek/shared'
+import { type DataTableFilter, type DataTableSort } from '@/components/data-table'
+import { sqlMatchesStoredTable } from '@/lib/editable-select'
 import {
-  DataTable,
-  type DataTableFilter,
-  type DataTableSort,
-  type DataTableColumn
-} from '@/components/data-table'
-import {
-  EditableDataTable,
-  type DataTableColumn as EditableDataTableColumn
-} from '@/components/editable-data-table'
-import type { EditContext } from '@data-peek/shared'
+  resolveForRun,
+  crossTabErrorMessage,
+  buildCrossTabRefs,
+  isHeavyResolve
+} from '@/lib/cross-tab-integration'
+import type { ResolveForRunSummary } from '@/lib/cross-tab-integration'
+import { CrossTabSubmitDialog } from '@/components/cross-tab/cross-tab-submit-dialog'
 import { SQLEditor } from '@/components/sql-editor'
 import { formatSQL } from '@/lib/sql-formatter'
-import { downloadCSV, downloadJSON, generateExportFilename } from '@/lib/export'
-import { buildSelectQuery } from '@/lib/sql-helpers'
-import type { QueryResult as IpcQueryResult, ForeignKeyInfo, ColumnInfo } from '@data-peek/shared'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { FKPanelStack, type FKPanelItem } from '@/components/fk-panel-stack'
+import { generateExportFilename } from '@/lib/export'
+import { buildQualifiedTableRef, buildSelectQuery, buildCountQuery } from '@/lib/sql-helpers'
+import {
+  buildQueryWithFilters,
+  generateWhereClause,
+  generateOrderByClause
+} from '@/lib/table-query-builder'
+import { getSortScope, type SortScope } from '@/lib/sort-scope'
+import { isServerExpressibleSort } from '@/lib/sort-model'
+import { notify } from '@/stores/notification-store'
+import type { QueryResult as IpcQueryResult } from '@data-peek/shared'
+import { FKPanelStack } from '@/components/fk-panel-stack'
 import { ERDVisualization } from '@/components/erd-visualization'
 import { ExecutionPlanViewer } from '@/components/execution-plan-viewer'
 import { TableDesigner } from '@/components/table-designer'
+import { DataGenerator } from '@/components/data-generator'
+import { PgNotificationsPanel } from '@/components/pg-notifications-panel'
+import { HealthMonitor } from '@/components/health-monitor'
+import { SchemaIntelPanel } from '@/components/schema-intel'
 import { SaveQueryDialog } from '@/components/save-query-dialog'
+import { ShareQueryDialog } from '@/components/share-query-dialog'
+import { ColumnStatsPanel } from '@/components/column-stats-panel'
+import { StepRibbon } from './step-ribbon'
+import { StepResultsTabs } from './step-results-tabs'
+import { EditorToolbar } from './query-editor/editor-toolbar'
+import { QueryResults } from './query-editor/query-results'
+import { MaskedExportDialog } from './query-editor/masked-export-dialog'
+import { ShareResultsImage } from './query-editor/share-results-image'
+import { useEditableResult } from './query-editor/use-editable-result'
+import { useFkPanels } from './query-editor/use-fk-panels'
+import { useColumnStatsPanel } from './query-editor/use-column-stats-panel'
+import { useQueryAnalysis } from './query-editor/use-query-analysis'
+import { useManualTransaction } from './query-editor/use-manual-transaction'
+import { useResultExport } from './query-editor/use-result-export'
+import { useWatchRunner } from './query-editor/use-watch-runner'
+import { WatchButton } from '@/components/watch-button'
+import { TimeMachineButton } from '@/components/time-machine/time-machine-button'
+import { captureRun } from '@/lib/time-machine-capture'
+import { resolveSelectKeyColumns } from '@/lib/result-key-columns'
+import { useMaskingStore } from '@/stores/masking-store'
+import { useTimeMachineStore } from '@/stores/time-machine-store'
+import { useStepStore } from '@/stores/step-store'
+import { DDL_KEYWORD_REGEX } from '@shared/index'
+import type { editor as monacoEditor } from 'monaco-editor'
 
 interface TabQueryEditorProps {
   tabId: string
@@ -68,505 +84,766 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   const getActiveResultPaginatedRows = useTabStore((s) => s.getActiveResultPaginatedRows)
   const getAllStatementResults = useTabStore((s) => s.getAllStatementResults)
   const getActiveStatementResult = useTabStore((s) => s.getActiveStatementResult)
+  const setTablePreviewTotalCount = useTabStore((s) => s.setTablePreviewTotalCount)
+  const updateTablePreviewPagination = useTabStore((s) => s.updateTablePreviewPagination)
 
   const connections = useConnectionStore((s) => s.connections)
   const schemas = useConnectionStore((s) => s.schemas)
   const getEnumValues = useConnectionStore((s) => s.getEnumValues)
   const addToHistory = useQueryStore((s) => s.addToHistory)
   const hideQueryEditorByDefault = useSettingsStore((s) => s.hideQueryEditorByDefault)
+  const queryTimeoutMs = useSettingsStore((s) => s.queryTimeoutMs)
+  const getAllSnippets = useSnippetStore((s) => s.getAllSnippets)
+  const initializeSnippets = useSnippetStore((s) => s.initializeSnippets)
+  const allSnippets = getAllSnippets()
+
+  const allTabs = useTabStore((s) => s.tabs)
+  const crossTabRefs = useMemo(
+    () => buildCrossTabRefs(allTabs, tab?.connectionId ?? null, tabId),
+    [allTabs, tab?.connectionId, tabId]
+  )
+
+  const stepSession = useStepStore((s) => s.sessions.get(tabId))
+  const startStep = useStepStore((s) => s.startStep)
+  const toggleBreakpoint = useStepStore((s) => s.toggleBreakpoint)
+  const [inTransactionMode, setInTransactionMode] = useState(false)
+
+  const tabQuery = tab && 'query' in tab ? tab.query : ''
+  const tabType = tab?.type
+
+  useEffect(() => {
+    if (tabType !== 'query') return
+    const hasDDL = DDL_KEYWORD_REGEX.test(tabQuery)
+    setInTransactionMode(!hasDDL)
+  }, [tabQuery, tabType])
+
+  // Initialize snippets on mount
+  useEffect(() => {
+    initializeSnippets()
+  }, [initializeSnippets])
 
   // Get the connection for this tab
   const tabConnection = tab?.connectionId
     ? connections.find((c) => c.id === tab.connectionId)
     : null
 
+  // Telemetry, benchmark, EXPLAIN, and performance-analysis state (extracted to hook)
+  const {
+    telemetry,
+    benchmark,
+    isRunningBenchmark,
+    showTelemetryPanel,
+    showConnectionOverhead,
+    selectedPercentile,
+    viewMode,
+    setTelemetry,
+    setBenchmark,
+    setShowTelemetryPanel,
+    setShowConnectionOverhead,
+    setSelectedPercentile,
+    setViewMode,
+    perf,
+    executionPlan,
+    setExecutionPlan,
+    isExplaining,
+    executionPlanWidth,
+    startResizing,
+    handleBenchmark,
+    handleExplainQuery,
+    handleAnalyzePerformance
+  } = useQueryAnalysis(tabId, tab, tabConnection, updateTabResult)
+  const {
+    analysis: perfAnalysis,
+    isAnalyzing: isPerfAnalyzing,
+    showPerfPanel,
+    showCritical,
+    showWarning,
+    showInfo,
+    setShowPerfPanel,
+    toggleSeverityFilter
+  } = perf
+
+  // Manual transaction mode (auto-commit off) — extracted to hook
+  const {
+    autoCommit,
+    setAutoCommit,
+    hasActiveTransaction,
+    setHasActiveTransaction,
+    handleCommit,
+    handleRollback
+  } = useManualTransaction(tabId, tabConnection)
+
   // Track if we've already attempted auto-run for this tab
   const hasAutoRun = useRef(false)
 
-  // Collapse state for query editor and results panel
-  // For table-preview tabs, use the hideQueryEditorByDefault setting
-  const [isEditorCollapsed, setIsEditorCollapsed] = useState(
-    tab?.type === 'table-preview' ? hideQueryEditorByDefault : false
-  )
-  const [isResultsCollapsed, setIsResultsCollapsed] = useState(false)
+  // Monaco editor ref for step-through decorations
+  const editorRef = useRef<monacoEditor.IStandaloneCodeEditor | null>(null)
+  const monacoRef = useRef<typeof import('monaco-editor') | null>(null)
+  const [editorMounted, setEditorMounted] = useState(false)
+  const activeLineDecoIds = useRef<string[]>([])
+  const breakpointDecoIds = useRef<string[]>([])
+
+  // Panel collapse state (extracted to hook)
+  const { isEditorCollapsed, setIsEditorCollapsed, isResultsCollapsed, setIsResultsCollapsed } =
+    usePanelCollapse({
+      initialEditorCollapsed: tab?.type === 'table-preview' ? hideQueryEditorByDefault : false
+    })
 
   // Track client-side filters and sorting for "Apply to Query"
   const [tableFilters, setTableFilters] = useState<DataTableFilter[]>([])
   const [tableSorting, setTableSorting] = useState<DataTableSort[]>([])
+  const [isSortingOnServer, setIsSortingOnServer] = useState(false)
 
-  // FK Panel stack state
-  const [fkPanels, setFkPanels] = useState<FKPanelItem[]>([])
+  // FK panel stack (extracted to hook)
+  const { fkPanels, handleFKClick, handleFKOpenTab, handleCloseFKPanel, handleCloseAllFKPanels } =
+    useFkPanels(tabConnection)
 
-  // Execution plan state
-  const [executionPlan, setExecutionPlan] = useState<{
-    plan: unknown[]
-    durationMs: number
-  } | null>(null)
-  const [isExplaining, setIsExplaining] = useState(false)
-  const [executionPlanWidth, setExecutionPlanWidth] = useState(() => {
-    // Load from localStorage or default to 500
-    const saved = localStorage.getItem('execution-plan-width')
-    return saved ? parseInt(saved, 10) : 500
-  })
-  const isResizing = useRef(false)
+  // Column stats panel (extracted to hook)
+  const {
+    columnStatsData,
+    columnStatsLoading,
+    columnStatsError,
+    columnStatsPanelOpen,
+    handleColumnStatsClick,
+    closeColumnStatsPanel
+  } = useColumnStatsPanel(tab, tabConnection)
 
   // Save query dialog state
   const [saveDialogOpen, setSaveDialogOpen] = useState(false)
 
-  // Get the createForeignKeyTab action
-  const createForeignKeyTab = useTabStore((s) => s.createForeignKeyTab)
+  // Share query dialog state
+  const [shareDialogOpen, setShareDialogOpen] = useState(false)
 
-  // Handle execution plan panel resize
-  const handleExecutionPlanResize = useCallback((e: MouseEvent) => {
-    if (!isResizing.current) return
-    const newWidth = Math.max(300, Math.min(800, window.innerWidth - e.clientX))
-    setExecutionPlanWidth(newWidth)
-  }, [])
+  // Share results image dialog state
+  const [shareResultsOpen, setShareResultsOpen] = useState(false)
 
-  const stopResizing = useCallback(() => {
-    isResizing.current = false
-    document.body.style.cursor = ''
-    document.body.style.userSelect = ''
-    // Save to localStorage
-    localStorage.setItem('execution-plan-width', String(executionPlanWidth))
-  }, [executionPlanWidth])
+  // Cross-tab @name reference state: pill summary + heavy-run confirm gating.
+  const [refsSummary, setRefsSummary] = useState<ResolveForRunSummary | null>(null)
+  const [pendingHeavyRun, setPendingHeavyRun] = useState<{
+    summary: ResolveForRunSummary
+    sql: string
+    originalQuery: string
+  } | null>(null)
+  const skipHeavyConfirmRef = useRef(false)
 
-  useEffect(() => {
-    document.addEventListener('mousemove', handleExecutionPlanResize)
-    document.addEventListener('mouseup', stopResizing)
-    return () => {
-      document.removeEventListener('mousemove', handleExecutionPlanResize)
-      document.removeEventListener('mouseup', stopResizing)
-    }
-  }, [handleExecutionPlanResize, stopResizing])
+  // Result-set export with masked-column confirmation (extracted to hook)
+  const {
+    pendingExport,
+    setPendingExport,
+    buildMaskedExportData,
+    getCurrentExportData,
+    doExport,
+    handleExport
+  } = useResultExport(tabId, tab)
 
-  const handleRunQuery = useCallback(async () => {
-    if (
-      !tab ||
-      tab.type === 'erd' ||
-      tab.type === 'table-designer' ||
-      !tabConnection ||
-      tab.isExecuting ||
-      !tab.query.trim()
-    ) {
-      return
-    }
+  // Execution body for a query run. `sqlToExecute` is the resolved SQL actually sent to
+  // the database (with cross-tab @name references inlined). `originalQuery` is the user's
+  // typed text, used for history and stored-table checks so they reflect intent, not the
+  // expanded CTE payload. Reads fresh tab state from the store to avoid stale closures.
+  const executeSql = useCallback(
+    async (sqlToExecute: string, originalQuery: string) => {
+      const currentTab = useTabStore.getState().getTab(tabId)
+      if (!currentTab || !isExecutableTab(currentTab) || !tabConnection || currentTab.isExecuting)
+        return
 
-    updateTabExecuting(tabId, true)
+      // Generate unique execution ID for cancellation support
+      const executionId = crypto.randomUUID()
+      updateTabExecuting(tabId, true, executionId)
 
-    try {
-      const response = await window.api.db.query(tabConnection, tab.query)
+      // Running a query always returns the panel to the live result — leaving
+      // a Time Machine snapshot on screen would silently hide the fresh rows.
+      useTimeMachineStore.getState().backToLive(tabId)
 
-      if (response.success && response.data) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const data = response.data as any
+      // Drop any state writes from this execution if the tab has moved on (cancelled,
+      // re-run, or closed-and-reopened in the same session). Without this, a slow
+      // response from execution A can clobber the result of execution B that started
+      // after the user hit Stop or Run again.
+      const isStillCurrent = (): boolean => {
+        const t = useTabStore.getState().getTab(tabId)
+        return !!t && isExecutableTab(t) && t.executionId === executionId
+      }
 
-        // Check if we have multi-statement results
-        if (data.results && Array.isArray(data.results)) {
-          // Multi-statement result
-          const multiResult: MultiQueryResult = {
-            statements: data.results as StatementResult[],
-            totalDurationMs: data.totalDurationMs,
-            statementCount: data.statementCount
+      // Clear previous benchmark when running a new query
+      setBenchmark(null)
+
+      const targetSessionId = !autoCommit && tab?.id ? tab.id : undefined
+
+      try {
+        if (!autoCommit && !hasActiveTransaction && tab?.id) {
+          const beginRes = await window.api.db.beginTransaction(tabConnection, tab.id)
+          if (beginRes.success) {
+            setHasActiveTransaction(true)
+          } else {
+            // Abort the run — proceeding would hit the session map with no open
+            // transaction and surface a misleading "no active transaction" error.
+            throw new Error(`Failed to begin transaction: ${beginRes.error}`)
+          }
+        }
+
+        // Use telemetry-enabled query API with timeout from settings
+        const response = await window.api.db.queryWithTelemetry(
+          tabConnection,
+          sqlToExecute,
+          executionId,
+          queryTimeoutMs,
+          targetSessionId
+        )
+
+        if (!isStillCurrent()) return
+
+        if (response.success && response.data) {
+          const data = response.data as {
+            results: StatementResult[]
+            totalDurationMs: number
+            statementCount: number
+            telemetry?: import('@data-peek/shared').QueryTelemetry
+          } & IpcQueryResult
+
+          // Store telemetry data if available
+          if (data.telemetry) {
+            setTelemetry(data.telemetry)
+          } else {
+            setTelemetry(null)
           }
 
-          updateTabMultiResult(tabId, multiResult, null)
-          markTabSaved(tabId)
+          // Check if we have multi-statement results
+          if ('results' in data && Array.isArray(data.results)) {
+            // Multi-statement result
+            const multiResult: MultiQueryResult = {
+              statements: data.results as StatementResult[],
+              totalDurationMs: data.totalDurationMs,
+              statementCount: data.statementCount
+            }
 
-          // Add to global history with total row count
-          const totalRows = multiResult.statements.reduce((sum, s) => sum + s.rowCount, 0)
-          addToHistory({
-            query: tab.query,
-            durationMs: multiResult.totalDurationMs,
-            rowCount: totalRows,
-            status: 'success',
-            connectionId: tabConnection.id
-          })
+            updateTabMultiResult(tabId, multiResult, null)
+            markTabSaved(tabId)
+
+            // For table preview tabs, fetch total count for server-side pagination —
+            // but only if the executed SQL still queries the stored table. If the user
+            // rewrote the SQL to a different table, the stored table's count would be
+            // wrong and would mislead the pagination footer.
+            const previewSqlMatches =
+              currentTab.type === 'table-preview' &&
+              sqlMatchesStoredTable(
+                originalQuery,
+                { schema: currentTab.schemaName, table: currentTab.tableName },
+                tabConnection.dbType
+              )
+            if (currentTab.type === 'table-preview') {
+              if (previewSqlMatches) {
+                try {
+                  const countTableRef = buildQualifiedTableRef(
+                    currentTab.schemaName,
+                    currentTab.tableName,
+                    tabConnection.dbType
+                  )
+                  const countQuery = buildCountQuery(countTableRef)
+                  const countResponse = await window.api.db.query(tabConnection, countQuery)
+                  if (isStillCurrent() && countResponse.success && countResponse.data) {
+                    const countData = countResponse.data as IpcQueryResult
+                    if (countData.rows?.[0]) {
+                      const totalCount = Number(
+                        (countData.rows[0] as Record<string, unknown>).total
+                      )
+                      if (!isNaN(totalCount)) {
+                        setTablePreviewTotalCount(tabId, totalCount)
+                      }
+                    }
+                  } else if (isStillCurrent()) {
+                    // Count query failed — drop any stale total so the footer falls back
+                    // to client-side pagination over the result we did get.
+                    setTablePreviewTotalCount(tabId, null)
+                  }
+                } catch {
+                  if (isStillCurrent()) setTablePreviewTotalCount(tabId, null)
+                }
+              } else if (isStillCurrent()) {
+                // SQL diverged from the stored table — the previous totalRowCount was for
+                // a different row set; clear it so the UI exits server-side pagination
+                // mode rather than showing the wrong total.
+                setTablePreviewTotalCount(tabId, null)
+              }
+            }
+
+            // Add to global history with total row count
+            const totalRows = multiResult.statements.reduce((sum, s) => sum + s.rowCount, 0)
+            addToHistory({
+              query: originalQuery,
+              durationMs: multiResult.totalDurationMs,
+              rowCount: totalRows,
+              status: 'success',
+              connectionId: tabConnection.id
+            })
+
+            captureRun(tabId, {
+              enabled: useSettingsStore.getState().timeMachineEnabled,
+              tabType: currentTab.type,
+              connectionId: tabConnection.id,
+              sql: originalQuery,
+              statements: multiResult.statements,
+              explicitKeyColumns: resolveSelectKeyColumns(
+                originalQuery,
+                tabConnection.dbType,
+                useConnectionStore.getState().schemas
+              ),
+              maskedColumns: useMaskingStore
+                .getState()
+                .getEffectiveMaskedColumns(
+                  tabId,
+                  multiResult.statements
+                    .find((s) => s.isDataReturning)
+                    ?.fields.map((f) => f.name) ?? []
+                ),
+              capturedAt: Date.now()
+            })
+          } else {
+            // Legacy single result (fallback)
+            const singleResult = data as IpcQueryResult
+            const result = {
+              columns: singleResult.fields.map((f: { name: string; dataType: string }) => ({
+                name: f.name,
+                dataType: f.dataType
+              })),
+              rows: singleResult.rows,
+              rowCount: singleResult.rowCount ?? singleResult.rows.length,
+              durationMs: singleResult.durationMs
+            }
+
+            updateTabResult(tabId, result, null)
+            markTabSaved(tabId)
+
+            addToHistory({
+              query: originalQuery,
+              durationMs: singleResult.durationMs,
+              rowCount: result.rowCount,
+              status: 'success',
+              connectionId: tabConnection.id
+            })
+          }
         } else {
-          // Legacy single result (fallback)
-          const result = {
-            columns: data.fields.map((f: { name: string; dataType: string }) => ({
-              name: f.name,
-              dataType: f.dataType
-            })),
-            rows: data.rows,
-            rowCount: data.rowCount ?? data.rows.length,
-            durationMs: data.durationMs
-          }
-
-          updateTabResult(tabId, result, null)
-          markTabSaved(tabId)
+          const errorMessage = response.error ?? 'Query execution failed'
+          updateTabMultiResult(tabId, null, errorMessage)
+          setTelemetry(null)
 
           addToHistory({
-            query: tab.query,
-            durationMs: data.durationMs,
-            rowCount: result.rowCount,
-            status: 'success',
-            connectionId: tabConnection.id
+            query: originalQuery,
+            durationMs: 0,
+            rowCount: 0,
+            status: 'error',
+            connectionId: tabConnection.id,
+            errorMessage
           })
         }
-      } else {
-        const errorMessage = response.error ?? 'Query execution failed'
+      } catch (error) {
+        if (!isStillCurrent()) return
+        const errorMessage = error instanceof Error ? error.message : String(error)
         updateTabMultiResult(tabId, null, errorMessage)
+        setTelemetry(null)
+      } finally {
+        // CAS by executionId so a stale finally can't unset a newer execution's flag.
+        updateTabExecuting(tabId, false, undefined, executionId)
+      }
+    },
+    [
+      tabConnection,
+      tabId,
+      updateTabExecuting,
+      updateTabResult,
+      updateTabMultiResult,
+      markTabSaved,
+      addToHistory,
+      setTelemetry,
+      setBenchmark,
+      queryTimeoutMs,
+      setTablePreviewTotalCount,
+      autoCommit,
+      hasActiveTransaction,
+      tab?.id,
+      setHasActiveTransaction
+    ]
+  )
 
-        addToHistory({
-          query: tab.query,
-          durationMs: 0,
-          rowCount: 0,
-          status: 'error',
-          connectionId: tabConnection.id,
-          errorMessage
-        })
+  const handleRunQuery = useCallback(
+    async (selectedSql?: string) => {
+      // Read fresh tab state from store to avoid stale closure issues
+      // (important for server-side pagination where query is updated before this runs)
+      const currentTab = useTabStore.getState().getTab(tabId)
+
+      if (!currentTab || !isExecutableTab(currentTab) || !tabConnection || currentTab.isExecuting) {
+        return
+      }
+
+      const queryToRun = (selectedSql ?? currentTab.query).trim()
+      if (!queryToRun) return
+
+      // Resolve @name cross-tab references into VALUES-backed CTEs.
+      const resolved = resolveForRun(queryToRun, {
+        dbType: tabConnection.dbType,
+        connectionId: currentTab.connectionId,
+        currentTabId: tabId,
+        tabs: useTabStore.getState().tabs
+      })
+      if (!resolved.ok) {
+        setRefsSummary(null)
+        updateTabMultiResult(tabId, null, crossTabErrorMessage(resolved.error))
+        return
+      }
+
+      const summary = resolved.summary
+
+      // Heavy inlined payloads get a confirm dialog so the user knows what's about to run.
+      const isHeavy = isHeavyResolve(summary)
+      if (isHeavy && !skipHeavyConfirmRef.current) {
+        setPendingHeavyRun({ summary, sql: resolved.finalSql, originalQuery: queryToRun })
+        return
+      }
+
+      setRefsSummary(summary.refCount > 0 ? summary : null)
+      await executeSql(resolved.finalSql, queryToRun)
+    },
+    [tabId, tabConnection, executeSql, updateTabMultiResult]
+  )
+
+  const handleCancelQuery = useCallback(async () => {
+    if (!tab || !isExecutableTab(tab)) return
+    if (!tab.isExecuting || !tab.executionId) return
+
+    // Snapshot the executionId we're cancelling. If the user starts a new query before
+    // the cancel response comes back, we mustn't overwrite the new query's state with
+    // "Query cancelled by user".
+    const cancelledExecutionId = tab.executionId
+
+    try {
+      const response = await window.api.db.cancelQuery(cancelledExecutionId)
+      if (response.success) {
+        const current = useTabStore.getState().getTab(tabId)
+        if (current && isExecutableTab(current) && current.executionId === cancelledExecutionId) {
+          updateTabMultiResult(tabId, null, 'Query cancelled by user')
+          updateTabExecuting(tabId, false, null, cancelledExecutionId)
+        }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error)
-      updateTabMultiResult(tabId, null, errorMessage)
-    } finally {
-      updateTabExecuting(tabId, false)
+      console.error('Failed to cancel query:', error)
     }
-  }, [
-    tab,
-    tabConnection,
-    tabId,
-    updateTabExecuting,
-    updateTabResult,
-    updateTabMultiResult,
-    markTabSaved,
-    addToHistory
-  ])
+  }, [tab, tabId, updateTabMultiResult, updateTabExecuting])
+
+  // Handle server-side pagination for table preview tabs
+  const handleTablePreviewPaginationChange = useCallback(
+    async (page: number, pageSize: number) => {
+      // Read fresh state to check if we can proceed
+      const currentTab = useTabStore.getState().getTab(tabId)
+      if (
+        !currentTab ||
+        currentTab.type !== 'table-preview' ||
+        !tabConnection ||
+        currentTab.isExecuting
+      )
+        return
+
+      // If the user has rewritten the editor SQL to a different table, we cannot
+      // safely rebuild a server-side pagination query — that would silently replace
+      // their typed SQL with a SELECT against the stored table. Update pagination
+      // state only; rendering falls back to client-side over the existing result set.
+      const sqlStillMatches = sqlMatchesStoredTable(
+        currentTab.savedQuery ?? currentTab.query,
+        { schema: currentTab.schemaName, table: currentTab.tableName },
+        tabConnection.dbType
+      )
+
+      if (!sqlStillMatches) {
+        updateTablePreviewPagination(tabId, page, pageSize, null)
+        return
+      }
+
+      const offset = (page - 1) * pageSize
+      const sqlTableRef = buildQualifiedTableRef(
+        currentTab.schemaName,
+        currentTab.tableName,
+        tabConnection.dbType
+      )
+      const rebuiltQuery = buildSelectQuery(sqlTableRef, tabConnection.dbType, {
+        limit: pageSize,
+        offset
+      })
+
+      updateTablePreviewPagination(tabId, page, pageSize, rebuiltQuery)
+
+      // Re-run the query - handleRunQuery reads fresh state from store
+      handleRunQuery()
+    },
+    [tabConnection, tabId, updateTablePreviewPagination, handleRunQuery]
+  )
+
+  // Filters are read at execution time rather than depended on. The filter bar keeps its
+  // own Apply, so reacting to every keystroke here would send filters to the database
+  // ahead of it and make that button meaningless.
+  const tableFiltersRef = useRef(tableFilters)
+  tableFiltersRef.current = tableFilters
+
+  // Guards the sort effect against its own mount pass. On open there is nothing to
+  // re-sort, and firing anyway would run every table preview's query a second time.
+  const appliedSortRef = useRef<{ tabId: string; signature: string } | null>(null)
+
+  // A table-preview tab owns its own SQL, so a sort belongs in the database rather
+  // than in the renderer — a client sort would only reorder the loaded page. Debounced
+  // so flipping a direction twice costs one query, not two.
+  useEffect(() => {
+    const current = useTabStore.getState().getTab(tabId)
+    if (!current || current.type !== 'table-preview' || !tabConnection) return
+    if (
+      !sqlMatchesStoredTable(
+        current.savedQuery ?? current.query,
+        { schema: current.schemaName, table: current.tableName },
+        tabConnection.dbType
+      )
+    )
+      return
+
+    // A mode the ORDER BY clause cannot carry stays in the renderer — pushing it to the
+    // database would reorder by the bare column and lose what the user actually asked for.
+    if (!tableSorting.every(isServerExpressibleSort)) return
+
+    const signature = JSON.stringify(tableSorting)
+    const applied = appliedSortRef.current
+    if (!applied || applied.tabId !== tabId) {
+      // First pass for this tab — adopt whatever ordering it opened with, no round trip.
+      appliedSortRef.current = { tabId, signature }
+      return
+    }
+    if (applied.signature === signature) return
+    appliedSortRef.current = { tabId, signature }
+
+    setIsSortingOnServer(true)
+    const timer = setTimeout(() => {
+      const t = useTabStore.getState().getTab(tabId)
+      if (!t || t.type !== 'table-preview') {
+        setIsSortingOnServer(false)
+        return
+      }
+
+      const tableRef = buildQualifiedTableRef(t.schemaName, t.tableName, tabConnection.dbType)
+      // Order changed, so page N of the old ordering means nothing — go back to page 1.
+      const rebuilt = buildSelectQuery(tableRef, tabConnection.dbType, {
+        where: generateWhereClause(tableFiltersRef.current, tabConnection.dbType),
+        orderBy: generateOrderByClause(tableSorting, tabConnection.dbType),
+        limit: t.pageSize,
+        offset: 0
+      })
+
+      updateTablePreviewPagination(tabId, 1, t.pageSize, rebuilt)
+      handleRunQuery()
+      setIsSortingOnServer(false)
+    }, 250)
+
+    return () => {
+      clearTimeout(timer)
+      setIsSortingOnServer(false)
+    }
+  }, [tableSorting, tabConnection, tabId, updateTablePreviewPagination, handleRunQuery])
 
   const handleFormatQuery = () => {
-    if (!tab || tab.type === 'erd' || tab.type === 'table-designer' || !tab.query.trim()) return
+    if (!tab || !isExecutableTab(tab) || !tab.query.trim()) return
     const formatted = formatSQL(tab.query)
     updateTabQuery(tabId, formatted)
   }
-
-  const handleExplainQuery = useCallback(async () => {
-    if (
-      !tab ||
-      tab.type === 'erd' ||
-      tab.type === 'table-designer' ||
-      !tabConnection ||
-      isExplaining ||
-      !tab.query.trim()
-    ) {
-      return
-    }
-
-    setIsExplaining(true)
-    setExecutionPlan(null)
-
-    try {
-      const response = await window.api.db.explain(tabConnection, tab.query, true)
-
-      if (response.success && response.data) {
-        setExecutionPlan({
-          plan: response.data.plan as unknown[],
-          durationMs: response.data.durationMs
-        })
-      } else {
-        // Show error in the existing error display
-        updateTabResult(tabId, null, response.error ?? 'Failed to get execution plan')
-      }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error)
-      updateTabResult(tabId, null, errorMessage)
-    } finally {
-      setIsExplaining(false)
-    }
-  }, [tab, tabConnection, tabId, isExplaining, updateTabResult])
 
   const handleQueryChange = (value: string) => {
     updateTabQuery(tabId, value)
   }
 
-  // Helper: Look up column info from schema (for FK details)
-  const getColumnsWithFKInfo = useCallback((): DataTableColumn[] => {
-    if (!tab || tab.type === 'erd' || tab.type === 'table-designer' || !tab.result?.columns)
-      return []
+  const handleStartStep = useCallback(async () => {
+    if (!tab || tab.type !== 'query' || !tab.query.trim() || stepSession) return
+    await startStep(tabId, tab.query, inTransactionMode)
+  }, [tab, stepSession, startStep, tabId, inTransactionMode])
 
-    // For table-preview tabs, we can directly look up the columns from schema
-    if (tab.type === 'table-preview') {
-      const schema = schemas.find((s) => s.name === tab.schemaName)
-      const tableInfo = schema?.tables.find((t) => t.name === tab.tableName)
+  useEffect(() => {
+    const editor = editorRef.current
+    const monaco = monacoRef.current
+    if (!editor || !monaco || !editorMounted) return
+    if (tabConnection?.dbType !== 'postgresql') return
 
-      if (tableInfo) {
-        return tab.result.columns.map((col) => {
-          const schemaCol = tableInfo.columns.find((c) => c.name === col.name)
-          return {
-            name: col.name,
-            dataType: col.dataType,
-            foreignKey: schemaCol?.foreignKey
-          }
-        })
-      }
-    }
-
-    // For query tabs, try to match columns across all tables
-    // This is a simplified approach - won't work for aliased columns
-    return tab.result.columns.map((col) => {
-      // Search all schemas/tables for this column
-      for (const schema of schemas) {
-        for (const table of schema.tables) {
-          const schemaCol = table.columns.find((c) => c.name === col.name)
-          if (schemaCol?.foreignKey) {
-            return {
-              name: col.name,
-              dataType: col.dataType,
-              foreignKey: schemaCol.foreignKey
-            }
-          }
-        }
-      }
-      return { name: col.name, dataType: col.dataType }
-    })
-  }, [tab, schemas])
-
-  // Helper: Get columns with full info including isPrimaryKey (for editable table)
-  const getColumnsForEditing = useCallback((): EditableDataTableColumn[] => {
-    if (
-      !tab ||
-      tab.type === 'erd' ||
-      tab.type === 'table-designer' ||
-      !tab.result?.columns ||
-      tab.type !== 'table-preview'
-    )
-      return []
-
-    const schema = schemas.find((s) => s.name === tab.schemaName)
-    const tableInfo = schema?.tables.find((t) => t.name === tab.tableName)
-
-    if (!tableInfo) return []
-
-    return tab.result.columns.map((col) => {
-      const schemaCol = tableInfo.columns.find((c) => c.name === col.name)
-      return {
-        name: col.name,
-        dataType: col.dataType,
-        foreignKey: schemaCol?.foreignKey,
-        isPrimaryKey: schemaCol?.isPrimaryKey ?? false,
-        isNullable: schemaCol?.isNullable ?? true,
-        enumValues: getEnumValues(col.dataType)
+    const disposable = editor.addAction({
+      id: 'datapeek.start-step',
+      label: 'Start Step-Through',
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter],
+      run: () => {
+        handleStartStep()
       }
     })
-  }, [tab, schemas, getEnumValues])
 
-  // Helper: Build EditContext for table-preview tabs
-  const getEditContext = useCallback((): EditContext | null => {
-    if (!tab || tab.type !== 'table-preview') return null
+    return () => disposable.dispose()
+  }, [handleStartStep, editorMounted, tabConnection?.dbType])
 
-    const schema = schemas.find((s) => s.name === tab.schemaName)
-    const tableInfo = schema?.tables.find((t) => t.name === tab.tableName)
+  useEffect(() => {
+    const editor = editorRef.current
+    const monaco = monacoRef.current
+    if (!editor || !monaco || !editorMounted || !stepSession) return
 
-    if (!tableInfo) return null
+    const nextAction = editor.addAction({
+      id: 'datapeek.step-next',
+      label: 'Step: Next',
+      keybindings: [monaco.KeyMod.Shift | monaco.KeyCode.Enter],
+      run: () => {
+        const current = useStepStore.getState().sessions.get(tabId)
+        if (current?.state === 'paused') useStepStore.getState().nextStep(tabId)
+      }
+    })
 
-    const primaryKeyColumns = tableInfo.columns.filter((c) => c.isPrimaryKey).map((c) => c.name)
+    const stopAction = editor.addAction({
+      id: 'datapeek.step-stop',
+      label: 'Step: Stop',
+      keybindings: [monaco.KeyCode.Escape],
+      run: () => {
+        useStepStore.getState().stopStep(tabId)
+      }
+    })
 
-    return {
-      schema: tab.schemaName,
-      table: tab.tableName,
-      primaryKeyColumns,
-      columns: tableInfo.columns
+    return () => {
+      nextAction.dispose()
+      stopAction.dispose()
     }
-  }, [tab, schemas])
+  }, [stepSession, tabId, editorMounted])
 
-  // FK Panel: Fetch data for a referenced row
-  const fetchFKData = useCallback(
-    async (
-      fk: ForeignKeyInfo,
-      value: unknown
-    ): Promise<{ data?: Record<string, unknown>; columns?: ColumnInfo[]; error?: string }> => {
-      if (!tabConnection) return { error: 'No connection' }
+  // Active statement highlight
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor) return
 
-      // Build table reference (handle MSSQL's dbo schema)
-      const defaultSchema = tabConnection.dbType === 'mssql' ? 'dbo' : 'public'
-      const tableRef =
-        fk.referencedSchema === defaultSchema
-          ? fk.referencedTable
-          : `${fk.referencedSchema}.${fk.referencedTable}`
-
-      // Format value for SQL
-      let formattedValue: string
-      if (value === null || value === undefined) {
-        formattedValue = 'NULL'
-      } else if (typeof value === 'string') {
-        formattedValue = `'${value.replace(/'/g, "''")}'`
-      } else {
-        formattedValue = String(value)
-      }
-
-      const whereClause = `WHERE "${fk.referencedColumn}" = ${formattedValue}`
-      const query = buildSelectQuery(tableRef, tabConnection.dbType, {
-        where: whereClause,
-        limit: 1
-      })
-
-      try {
-        const response = await window.api.db.query(tabConnection, query)
-        if (response.success && response.data) {
-          const data = response.data as IpcQueryResult
-          const row = data.rows[0] as Record<string, unknown> | undefined
-
-          // Get column info with FK from schema
-          const schema = schemas.find((s) => s.name === fk.referencedSchema)
-          const tableInfo = schema?.tables.find((t) => t.name === fk.referencedTable)
-          const columns = tableInfo?.columns
-
-          return { data: row, columns }
-        }
-        return { error: response.error ?? 'Query failed' }
-      } catch (err) {
-        return { error: err instanceof Error ? err.message : String(err) }
-      }
-    },
-    [tabConnection, schemas]
-  )
-
-  // FK Panel: Handle click to open panel
-  const handleFKClick = useCallback(
-    async (fk: ForeignKeyInfo, value: unknown) => {
-      const panelId = crypto.randomUUID()
-
-      // Add loading panel
-      setFkPanels((prev) => [
-        ...prev,
-        {
-          id: panelId,
-          foreignKey: fk,
-          value,
-          isLoading: true
-        }
-      ])
-
-      // Fetch data
-      const result = await fetchFKData(fk, value)
-
-      // Update panel with result
-      setFkPanels((prev) =>
-        prev.map((p) =>
-          p.id === panelId
-            ? {
-                ...p,
-                isLoading: false,
-                data: result.data,
-                columns: result.columns,
-                error: result.error
+    if (stepSession && stepSession.state !== 'done') {
+      const current = stepSession.statements[stepSession.cursorIndex]
+      if (current) {
+        const updateDecorations = () => {
+          activeLineDecoIds.current = editor.deltaDecorations(activeLineDecoIds.current, [
+            {
+              range: {
+                startLineNumber: current.startLine,
+                startColumn: 1,
+                endLineNumber: current.endLine,
+                endColumn: 1
+              },
+              options: {
+                isWholeLine: true,
+                className: 'step-active-line',
+                linesDecorationsClassName: 'step-active-marker'
               }
-            : p
-        )
-      )
-    },
-    [fetchFKData]
-  )
+            }
+          ])
+        }
 
-  // FK Panel: Handle Cmd+Click to open in new tab
-  const handleFKOpenTab = useCallback(
-    (fk: ForeignKeyInfo, value: unknown) => {
-      if (!tabConnection) return
-      createForeignKeyTab(
-        tabConnection.id,
-        fk.referencedSchema,
-        fk.referencedTable,
-        fk.referencedColumn,
-        value
-      )
-    },
-    [tabConnection, createForeignKeyTab]
-  )
+        const globalDoc =
+          typeof document !== 'undefined'
+            ? (document as Document & { startViewTransition?: (cb: () => void) => void })
+            : null
+        if (globalDoc?.startViewTransition) {
+          globalDoc.startViewTransition(() => {
+            updateDecorations()
+          })
+        } else {
+          updateDecorations()
+        }
+      }
+    } else {
+      activeLineDecoIds.current = editor.deltaDecorations(activeLineDecoIds.current, [])
+    }
+  }, [stepSession?.cursorIndex, stepSession?.state, stepSession?.statements])
 
-  // FK Panel: Handle drill-down (click FK in panel)
-  const handleFKDrillDown = useCallback(
-    async (fk: ForeignKeyInfo, value: unknown) => {
-      await handleFKClick(fk, value)
-    },
-    [handleFKClick]
-  )
+  // Breakpoint decorations
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor) return
 
-  // FK Panel: Close a specific panel
-  const handleCloseFKPanel = useCallback((panelId: string) => {
-    setFkPanels((prev) => {
-      const index = prev.findIndex((p) => p.id === panelId)
-      if (index === -1) return prev
-      // Close this panel and all panels after it
-      return prev.slice(0, index)
-    })
-  }, [])
+    if (!stepSession) {
+      breakpointDecoIds.current = editor.deltaDecorations(breakpointDecoIds.current, [])
+      return
+    }
 
-  // FK Panel: Close all panels
-  const handleCloseAllFKPanels = useCallback(() => {
-    setFkPanels([])
-  }, [])
-
-  // Generate SQL WHERE clause from filters
-  const generateWhereClause = (filters: DataTableFilter[]): string => {
-    if (filters.length === 0) return ''
-    const conditions = filters.map((f) => {
-      // Escape single quotes in value
-      const escapedValue = f.value.replace(/'/g, "''")
-      return `"${f.column}" ILIKE '%${escapedValue}%'`
-    })
-    return `WHERE ${conditions.join(' AND ')}`
-  }
-
-  // Generate SQL ORDER BY clause from sorting
-  const generateOrderByClause = (sorting: DataTableSort[]): string => {
-    if (sorting.length === 0) return ''
-    const orders = sorting.map((s) => `"${s.column}" ${s.direction.toUpperCase()}`)
-    return `ORDER BY ${orders.join(', ')}`
-  }
-
-  // Build a new query with filters/sorting applied
-  const buildQueryWithFilters = (): string => {
-    if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return ''
-
-    // For table preview tabs, rebuild from scratch
-    if (tab.type === 'table-preview') {
-      // Build table reference (handle MSSQL's dbo schema)
-      const defaultSchema = tabConnection?.dbType === 'mssql' ? 'dbo' : 'public'
-      const tableRef =
-        tab.schemaName === defaultSchema ? tab.tableName : `${tab.schemaName}.${tab.tableName}`
-      const wherePart = generateWhereClause(tableFilters)
-      const orderPart = generateOrderByClause(tableSorting)
-      return buildSelectQuery(tableRef, tabConnection?.dbType, {
-        where: wherePart,
-        orderBy: orderPart,
-        limit: 100
+    const decorations = [...stepSession.breakpoints]
+      .map((stmtIdx) => {
+        const stmt = stepSession.statements[stmtIdx]
+        if (!stmt) return null
+        return {
+          range: {
+            startLineNumber: stmt.startLine,
+            startColumn: 1,
+            endLineNumber: stmt.startLine,
+            endColumn: 1
+          },
+          options: { glyphMarginClassName: 'step-breakpoint' }
+        }
       })
-        .replace(/\s+/g, ' ')
-        .trim()
-    }
+      .filter(Boolean) as Parameters<typeof editor.deltaDecorations>[1]
 
-    // For query tabs, try to inject WHERE/ORDER BY
-    // This is simplified - a full implementation would parse the SQL AST
-    let baseQuery = tab.query.trim()
+    breakpointDecoIds.current = editor.deltaDecorations(breakpointDecoIds.current, decorations)
+  }, [stepSession?.breakpoints, stepSession?.statements, stepSession])
 
-    // Remove trailing semicolon
-    if (baseQuery.endsWith(';')) {
-      baseQuery = baseQuery.slice(0, -1)
-    }
+  // Breakpoint gutter click handler
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor || !stepSession) return
 
-    // Remove existing LIMIT for re-adding at the end
-    const limitMatch = baseQuery.match(/\s+LIMIT\s+\d+\s*$/i)
-    let limitClause = ''
-    if (limitMatch) {
-      limitClause = limitMatch[0]
-      baseQuery = baseQuery.slice(0, -limitMatch[0].length)
-    }
+    const disposable = editor.onMouseDown((e) => {
+      if (e.target.type !== 2) return
+      const line = e.target.position?.lineNumber
+      if (!line) return
 
-    const wherePart = generateWhereClause(tableFilters)
-    const orderPart = generateOrderByClause(tableSorting)
+      const stmt = stepSession.statements.find((s) => s.startLine === line)
+      if (!stmt) return
 
-    // Append clauses (simplified - assumes no existing WHERE/ORDER BY)
-    return `${baseQuery} ${wherePart} ${orderPart}${limitClause};`.replace(/\s+/g, ' ').trim()
-  }
+      toggleBreakpoint(tabId, stmt.index)
+    })
 
-  const handleApplyToQuery = () => {
-    if (!tab || (tableFilters.length === 0 && tableSorting.length === 0)) return
-    const newQuery = buildQueryWithFilters()
-    updateTabQuery(tabId, formatSQL(newQuery))
-    // Automatically run the new query
-    setTimeout(() => handleRunQuery(), 100)
-  }
+    return () => disposable.dispose()
+  }, [stepSession, tabId, toggleBreakpoint])
+
+  const { getColumnsWithFKInfo, getColumnsForEditing, getEditContext } = useEditableResult({
+    tab,
+    schemas,
+    tabConnection,
+    getEnumValues
+  })
+
+  // Rewrite the editor SQL from the current filter/sort chips and re-run it. The SQL is
+  // changed in place rather than run behind the user's back, so what is on screen always
+  // explains the rows below it.
+  const applyTableStateToQuery = useCallback(
+    (opts: { offerUndo: boolean }) => {
+      if (!tab || !isExecutableTab(tab)) return
+      if (tableFilters.length === 0 && tableSorting.length === 0) return
+      const previous = tab.query
+      const newQuery = buildQueryWithFilters({
+        tab,
+        dbType: tabConnection?.dbType,
+        filters: tableFilters,
+        sorting: tableSorting,
+        limit: tab.pageSize
+      })
+      updateTabQuery(tabId, formatSQL(newQuery))
+      setTimeout(() => handleRunQuery(), 100)
+
+      if (!opts.offerUndo) return
+      notify.success('ORDER BY replaced', 'The query now sorts every row.', {
+        action: {
+          label: 'Undo',
+          onClick: () => {
+            updateTabQuery(tabId, previous)
+            setTimeout(() => handleRunQuery(), 100)
+          }
+        }
+      })
+    },
+    [tab, tabConnection?.dbType, tableFilters, tableSorting, tabId, updateTabQuery, handleRunQuery]
+  )
+
+  const handleApplyToQuery = useCallback(
+    () => applyTableStateToQuery({ offerUndo: false }),
+    [applyTableStateToQuery]
+  )
+
+  // Push the sort into ORDER BY so it covers rows the client never loaded.
+  const handleSortWholeSet = useCallback(
+    () => applyTableStateToQuery({ offerUndo: true }),
+    [applyTableStateToQuery]
+  )
 
   const hasActiveFiltersOrSorting = tableFilters.length > 0 || tableSorting.length > 0
 
@@ -587,7 +864,30 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
     }
   }, [handleRunQuery, tab, tabConnection])
 
-  if (!tab) {
+  // Watch Mode runner + toggle (extracted to hook; the hook also subscribes
+  // the native-menu accelerator)
+  const { watchRunner } = useWatchRunner(tabId, tabConnection)
+
+  // ⌘⇧H — same menu-accelerator wiring as Watch Mode (menu wins over
+  // renderer keybindings on Electron).
+  const handleToggleTimeMachine = useCallback(() => {
+    const t = useTabStore.getState().getTab(tabId)
+    if (!t || t.type !== 'query') return
+    if (!useSettingsStore.getState().timeMachineEnabled) return
+    const tm = useTimeMachineStore.getState()
+    if (tm.getState(tabId)?.open) {
+      tm.closeStrip(tabId)
+    } else {
+      tm.openStrip(tabId)
+    }
+  }, [tabId])
+
+  useEffect(
+    () => window.api.menu.onToggleTimeMachine(handleToggleTimeMachine),
+    [handleToggleTimeMachine]
+  )
+
+  if (!tab || tab.type === 'notebook') {
     return null
   }
 
@@ -636,6 +936,26 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
     return <TableDesigner tabId={tabId} />
   }
 
+  // Render Data Generator for data-generator tabs
+  if (tab.type === 'data-generator') {
+    return <DataGenerator tabId={tabId} />
+  }
+
+  // Render PG Notifications panel
+  if (tab.type === 'pg-notifications') {
+    return <PgNotificationsPanel tabId={tabId} />
+  }
+
+  // Render Health Monitor dashboard
+  if (tab.type === 'health-monitor') {
+    return <HealthMonitor tabId={tabId} />
+  }
+
+  // Render Schema Intel / diagnostics panel
+  if (tab.type === 'schema-intel') {
+    return <SchemaIntelPanel tabId={tabId} />
+  }
+
   // Get statement results for multi-statement queries
   const statementResults = getAllStatementResults(tabId)
   const activeStatementResult = getActiveStatementResult(tabId)
@@ -643,10 +963,43 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
   // At this point, tab is guaranteed to be query or table-preview (not erd or table-designer)
   const activeResultIndex = tab.activeResultIndex ?? 0
 
-  // Use multi-result pagination when available, fallback to legacy
+  // For query tabs, pass all rows and let DataTable handle client-side pagination
+  // For table-preview tabs with server-side pagination, rows are already limited by SQL
+  const getAllRows = (): Record<string, unknown>[] => {
+    if (hasMultipleResults) {
+      const statement = tab.multiResult?.statements?.[tab.activeResultIndex]
+      return (statement?.rows ?? []) as Record<string, unknown>[]
+    }
+    return (tab.result?.rows ?? []) as Record<string, unknown>[]
+  }
+
+  // Only use store pagination for table-preview with server-side pagination (for backward compat display)
   const paginatedRows = hasMultipleResults
     ? getActiveResultPaginatedRows(tabId)
     : getTabPaginatedRows(tabId)
+
+  // How many rows a client-side sort would actually cover. The read-only grid receives
+  // the whole result set, while an editable grid on a query tab receives just the page —
+  // mirrors the branch that picks `data` in query-results.tsx. Counting the page in both
+  // cases would understate the scope and label a full sort as covering 100 of 646 rows.
+  const clientSortedRowCount = (() => {
+    const isTablePreview = tab?.type === 'table-preview'
+    const usesEditableGrid = getEditContext() && (isTablePreview ? !hasMultipleResults : true)
+    if (usesEditableGrid && !isTablePreview) return paginatedRows.length
+    return getAllRows().length
+  })()
+
+  // Computed rather than memoised: this sits below an early return, so a hook here
+  // would break hook ordering. getSortScope is two regex matches — cheap enough.
+  // `tab` can be undefined when a tab is closed while its query is still in flight.
+  const sortScope: SortScope = tab
+    ? getSortScope({
+        tab,
+        dbType: tabConnection?.dbType,
+        loadedRows: clientSortedRowCount,
+        sorting: tableSorting
+      })
+    : { kind: 'complete', rows: 0 }
 
   // Get columns from active statement result (for multi-statement) or legacy result
   const getActiveResultColumns = () => {
@@ -680,374 +1033,131 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
               height={isResultsCollapsed ? '100%' : 160}
               placeholder="SELECT * FROM your_table LIMIT 100;"
               schemas={schemas}
+              snippets={allSnippets}
+              readOnly={!!stepSession}
+              glyphMargin={!!stepSession}
+              crossTabRefs={crossTabRefs}
+              crossTabDialect={tabConnection?.dbType}
+              onMount={(editor, monaco) => {
+                editorRef.current = editor
+                monacoRef.current = monaco
+                setEditorMounted(true)
+              }}
             />
           </div>
         )}
 
-        {/* Editor Toolbar */}
-        <div className="flex items-center justify-between bg-muted/20 px-3 py-2">
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 w-7 p-0"
-              onClick={() => setIsEditorCollapsed(!isEditorCollapsed)}
-              title={isEditorCollapsed ? 'Show query editor' : 'Hide query editor'}
-            >
-              {isEditorCollapsed ? (
-                <PanelTop className="size-3.5" />
-              ) : (
-                <PanelTopClose className="size-3.5" />
-              )}
-            </Button>
-            <Button
-              size="sm"
-              className="gap-1.5 h-7"
-              disabled={tab.isExecuting || !tab.query.trim()}
-              onClick={handleRunQuery}
-            >
-              {tab.isExecuting ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Play className="size-3.5" />
-              )}
-              Run
-              <kbd className="ml-1.5 rounded bg-primary-foreground/20 px-1.5 py-0.5 text-[10px] font-medium text-primary-foreground">
-                ⌘↵
-              </kbd>
-            </Button>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="gap-1.5 h-7"
-                    disabled={tab.isExecuting || isExplaining || !tab.query.trim()}
-                    onClick={handleExplainQuery}
-                  >
-                    {isExplaining ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <BarChart3 className="size-3.5" />
-                    )}
-                    Explain
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">
-                  <p className="text-xs">Analyze query execution plan (EXPLAIN ANALYZE)</p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-            {!isEditorCollapsed && (
-              <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="gap-1.5 h-7"
-                  disabled={!tab.query.trim()}
-                  onClick={handleFormatQuery}
-                >
-                  <Wand2 className="size-3.5" />
-                  Format
-                  <kbd className="ml-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
-                    ⌘⇧F
-                  </kbd>
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="gap-1.5 h-7"
-                  disabled={!tab.query.trim()}
-                  onClick={() => setSaveDialogOpen(true)}
-                >
-                  <Bookmark className="size-3.5" />
-                  Save
-                </Button>
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className={`gap-1.5 h-7 ${isResultsCollapsed ? 'text-primary' : ''}`}
-                        onClick={() => setIsResultsCollapsed(!isResultsCollapsed)}
-                      >
-                        <Maximize2 className="size-3.5" />
-                        {isResultsCollapsed ? 'Restore' : 'Focus'}
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom">
-                      <p className="text-xs">
-                        {isResultsCollapsed
-                          ? 'Restore results panel'
-                          : 'Collapse results to focus on query writing'}
-                      </p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              </>
-            )}
-          </div>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            {isEditorCollapsed && (
-              <code className="text-[10px] bg-muted/50 px-2 py-0.5 rounded max-w-[300px] truncate">
-                {tab.query.replace(/\s+/g, ' ').slice(0, 60)}
-                {tab.query.length > 60 ? '...' : ''}
+        <EditorToolbar
+          tab={tab}
+          tabConnection={tabConnection}
+          isEditorCollapsed={isEditorCollapsed}
+          setIsEditorCollapsed={setIsEditorCollapsed}
+          isResultsCollapsed={isResultsCollapsed}
+          setIsResultsCollapsed={setIsResultsCollapsed}
+          handleCancelQuery={handleCancelQuery}
+          handleRunQuery={handleRunQuery}
+          handleStartStep={handleStartStep}
+          inTransactionMode={inTransactionMode}
+          setInTransactionMode={setInTransactionMode}
+          stepSession={stepSession}
+          autoCommit={autoCommit}
+          setAutoCommit={setAutoCommit}
+          hasActiveTransaction={hasActiveTransaction}
+          handleCommit={handleCommit}
+          handleRollback={handleRollback}
+          handleExplainQuery={handleExplainQuery}
+          isExplaining={isExplaining}
+          handleAnalyzePerformance={handleAnalyzePerformance}
+          isPerfAnalyzing={isPerfAnalyzing}
+          handleBenchmark={handleBenchmark}
+          isRunningBenchmark={isRunningBenchmark}
+          handleFormatQuery={handleFormatQuery}
+          setSaveDialogOpen={setSaveDialogOpen}
+          setShareDialogOpen={setShareDialogOpen}
+          watchSlot={
+            <WatchButton
+              tabId={tabId}
+              query={tabQuery}
+              runner={watchRunner}
+              disabled={!tabConnection}
+            />
+          }
+          timeMachineSlot={
+            tab.type === 'query' ? (
+              <TimeMachineButton tabId={tabId} disabled={!tabConnection} />
+            ) : undefined
+          }
+          refsSlot={
+            refsSummary ? (
+              <code className="text-[10px] bg-muted/50 px-2 py-0.5 rounded">
+                {refsSummary.refCount} {refsSummary.refCount === 1 ? 'ref' : 'refs'} ·{' '}
+                {refsSummary.rowsInlined.toLocaleString()} rows inlined
               </code>
-            )}
-            <span className="flex items-center gap-1.5">
-              <span
-                className={`size-1.5 rounded-full ${tabConnection.isConnected ? 'bg-green-500' : 'bg-yellow-500'}`}
-              />
-              {tabConnection.name}
-            </span>
-          </div>
-        </div>
+            ) : undefined
+          }
+        />
       </div>
 
-      {/* Results Section */}
-      <div
-        className={`flex flex-col overflow-hidden transition-all duration-200 ${isResultsCollapsed ? 'h-10 shrink-0' : 'flex-1'}`}
-      >
-        {/* Collapsed Results Bar */}
-        {isResultsCollapsed ? (
-          <div className="flex items-center justify-between h-10 border-t border-border/40 bg-muted/30 px-3">
-            <div className="flex items-center gap-3">
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 w-7 p-0"
-                onClick={() => setIsResultsCollapsed(false)}
-                title="Show results panel"
-              >
-                <PanelBottom className="size-3.5" />
-              </Button>
-              {tab.error ? (
-                <span className="flex items-center gap-1.5 text-xs text-red-400">
-                  <AlertCircle className="size-3" />
-                  Query Error
-                </span>
-              ) : tab.result || tab.multiResult ? (
-                <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                  {hasMultipleResults ? (
-                    <>
-                      <span className="flex items-center gap-1.5">
-                        <span className="size-1.5 rounded-full bg-green-500" />
-                        {statementResults.length} statements
-                      </span>
-                      <span className="text-muted-foreground/60">
-                        {tab.multiResult?.totalDurationMs}ms
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="flex items-center gap-1.5">
-                        <span className="size-1.5 rounded-full bg-green-500" />
-                        {tab.result?.rowCount ?? 0} rows
-                      </span>
-                      <span className="text-muted-foreground/60">{tab.result?.durationMs}ms</span>
-                    </>
-                  )}
-                </div>
-              ) : (
-                <span className="text-xs text-muted-foreground">No results</span>
-              )}
-            </div>
-            <span className="text-[10px] text-muted-foreground/50">Results collapsed</span>
-          </div>
-        ) : (
-          <>
-            {tab.error ? (
-              <div className="flex-1 flex items-center justify-center p-4">
-                <div className="max-w-md text-center space-y-2">
-                  <AlertCircle className="size-8 text-red-400 mx-auto" />
-                  <h3 className="font-medium text-red-400">Query Error</h3>
-                  <p className="text-sm text-muted-foreground">{tab.error}</p>
-                </div>
-              </div>
-            ) : tab.result || tab.multiResult ? (
-              <>
-                {/* Result Set Tabs - shown when there are multiple statements */}
-                {hasMultipleResults && (
-                  <div className="flex items-center gap-1 border-b border-border/40 bg-muted/10 px-3 py-1.5 shrink-0 overflow-x-auto">
-                    {statementResults.map((stmt, idx) => {
-                      const isActive = idx === activeResultIndex
-                      const label = stmt.isDataReturning
-                        ? `Result ${idx + 1} (${stmt.rowCount} rows)`
-                        : `Statement ${idx + 1} (${stmt.rowCount} affected)`
+      <QueryResults
+        tabId={tabId}
+        tab={tab}
+        tabConnection={tabConnection}
+        isResultsCollapsed={isResultsCollapsed}
+        setIsResultsCollapsed={setIsResultsCollapsed}
+        hasMultipleResults={hasMultipleResults}
+        statementResults={statementResults}
+        activeStatementResult={activeStatementResult}
+        activeResultIndex={activeResultIndex}
+        setActiveResultIndex={setActiveResultIndex}
+        getEditContext={getEditContext}
+        getColumnsForEditing={getColumnsForEditing}
+        paginatedRows={paginatedRows}
+        setTableFilters={setTableFilters}
+        setTableSorting={setTableSorting}
+        hasActiveFiltersOrSorting={hasActiveFiltersOrSorting}
+        handleApplyToQuery={handleApplyToQuery}
+        sortScope={sortScope}
+        isSortingOnServer={isSortingOnServer}
+        handleSortWholeSet={handleSortWholeSet}
+        handleFKClick={handleFKClick}
+        handleFKOpenTab={handleFKOpenTab}
+        handleColumnStatsClick={handleColumnStatsClick}
+        handleRunQuery={handleRunQuery}
+        handleTablePreviewPaginationChange={handleTablePreviewPaginationChange}
+        getActiveResultColumns={getActiveResultColumns}
+        getColumnsWithFKInfo={getColumnsWithFKInfo}
+        getAllRows={getAllRows}
+        telemetry={telemetry}
+        benchmark={benchmark}
+        autoCommit={autoCommit}
+        hasActiveTransaction={hasActiveTransaction}
+        onTransactionStart={() => setHasActiveTransaction(true)}
+        showTelemetryPanel={showTelemetryPanel}
+        setShowTelemetryPanel={setShowTelemetryPanel}
+        showConnectionOverhead={showConnectionOverhead}
+        setShowConnectionOverhead={setShowConnectionOverhead}
+        selectedPercentile={selectedPercentile}
+        setSelectedPercentile={setSelectedPercentile}
+        viewMode={viewMode}
+        setViewMode={setViewMode}
+        perfAnalysis={perfAnalysis}
+        showPerfPanel={showPerfPanel}
+        setShowPerfPanel={setShowPerfPanel}
+        handleAnalyzePerformance={handleAnalyzePerformance}
+        isPerfAnalyzing={isPerfAnalyzing}
+        showCritical={showCritical}
+        showWarning={showWarning}
+        showInfo={showInfo}
+        toggleSeverityFilter={toggleSeverityFilter}
+        setShareResultsOpen={setShareResultsOpen}
+        getCurrentExportData={getCurrentExportData}
+        handleExport={handleExport}
+        generateExportFilename={generateExportFilename}
+      />
 
-                      return (
-                        <button
-                          key={stmt.statementIndex}
-                          onClick={() => setActiveResultIndex(tabId, idx)}
-                          className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md transition-colors whitespace-nowrap ${
-                            isActive
-                              ? 'bg-primary text-primary-foreground'
-                              : 'hover:bg-muted text-muted-foreground hover:text-foreground'
-                          }`}
-                          title={stmt.statement.slice(0, 100)}
-                        >
-                          <span
-                            className={`size-1.5 rounded-full ${
-                              stmt.isDataReturning ? 'bg-green-500' : 'bg-blue-500'
-                            } ${isActive ? 'opacity-80' : ''}`}
-                          />
-                          {label}
-                          <span className={`text-[10px] ${isActive ? 'opacity-70' : 'opacity-50'}`}>
-                            {stmt.durationMs}ms
-                          </span>
-                        </button>
-                      )
-                    })}
-                  </div>
-                )}
+      {stepSession && <StepResultsTabs tabId={tabId} />}
 
-                {/* Results Table */}
-                <div className="flex-1 overflow-hidden p-3">
-                  {tab.type === 'table-preview' ? (
-                    <EditableDataTable
-                      tabId={tabId}
-                      columns={getColumnsForEditing()}
-                      data={paginatedRows as Record<string, unknown>[]}
-                      pageSize={tab.pageSize}
-                      canEdit={true}
-                      editContext={getEditContext()}
-                      connection={tabConnection}
-                      onFiltersChange={setTableFilters}
-                      onSortingChange={setTableSorting}
-                      onForeignKeyClick={handleFKClick}
-                      onForeignKeyOpenTab={handleFKOpenTab}
-                      onChangesCommitted={handleRunQuery}
-                    />
-                  ) : (
-                    <DataTable
-                      columns={
-                        hasMultipleResults
-                          ? getActiveResultColumns().map((col) => ({
-                              name: col.name,
-                              dataType: col.dataType
-                            }))
-                          : getColumnsWithFKInfo()
-                      }
-                      data={paginatedRows as Record<string, unknown>[]}
-                      pageSize={tab.pageSize}
-                      onFiltersChange={setTableFilters}
-                      onSortingChange={setTableSorting}
-                      onForeignKeyClick={handleFKClick}
-                      onForeignKeyOpenTab={handleFKOpenTab}
-                    />
-                  )}
-                </div>
-
-                {/* Results Footer */}
-                <div className="flex items-center justify-between border-t border-border/40 bg-muted/20 px-3 py-1.5 shrink-0">
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 w-7 p-0"
-                      onClick={() => setIsResultsCollapsed(true)}
-                      title="Collapse results panel"
-                    >
-                      <PanelBottomClose className="size-3.5" />
-                    </Button>
-                    <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                      {hasMultipleResults ? (
-                        <>
-                          <span className="flex items-center gap-1.5">
-                            <span className="size-1.5 rounded-full bg-green-500" />
-                            {activeStatementResult?.rowCount ?? 0}{' '}
-                            {activeStatementResult?.isDataReturning ? 'rows' : 'affected'}
-                          </span>
-                          <span className="text-muted-foreground/60">
-                            {statementResults.length} statements
-                          </span>
-                          <span>{tab.multiResult?.totalDurationMs}ms total</span>
-                        </>
-                      ) : (
-                        <>
-                          <span className="flex items-center gap-1.5">
-                            <span className="size-1.5 rounded-full bg-green-500" />
-                            {tab.result?.rowCount ?? 0} rows returned
-                          </span>
-                          <span>{tab.result?.durationMs}ms</span>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {hasActiveFiltersOrSorting && (
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="gap-1.5 h-7 text-primary border-primary/50 hover:bg-primary/10"
-                              onClick={handleApplyToQuery}
-                            >
-                              <DatabaseZap className="size-3.5" />
-                              Apply to Query
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent side="top" className="max-w-xs">
-                            <p className="text-xs">
-                              Convert your current filters and sorting to SQL WHERE/ORDER BY clauses
-                              and re-run the query against the database.
-                            </p>
-                          </TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                    )}
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="outline" size="sm" className="gap-1.5 h-7">
-                          <Download className="size-3.5" />
-                          Export
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onClick={() => {
-                            if (!tab.result) return
-                            const filename = generateExportFilename(
-                              tab.type === 'table-preview' ? tab.tableName : undefined
-                            )
-                            downloadCSV(tab.result, filename)
-                          }}
-                        >
-                          <FileSpreadsheet className="size-4 text-muted-foreground" />
-                          Export as CSV
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => {
-                            if (!tab.result) return
-                            const filename = generateExportFilename(
-                              tab.type === 'table-preview' ? tab.tableName : undefined
-                            )
-                            downloadJSON(tab.result, filename)
-                          }}
-                        >
-                          <FileJson className="size-4 text-muted-foreground" />
-                          Export as JSON
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                </div>
-              </>
-            ) : (
-              <div className="flex-1 flex items-center justify-center">
-                <div className="text-center space-y-2">
-                  <p className="text-muted-foreground">Run a query to see results</p>
-                  <p className="text-xs text-muted-foreground/70">Press ⌘+Enter to execute</p>
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+      {stepSession && <StepRibbon tabId={tabId} />}
 
       {/* FK Panel Stack */}
       <FKPanelStack
@@ -1055,36 +1165,112 @@ export function TabQueryEditor({ tabId }: TabQueryEditorProps) {
         connection={tabConnection}
         onClose={handleCloseFKPanel}
         onCloseAll={handleCloseAllFKPanels}
-        onDrillDown={handleFKDrillDown}
+        onDrillDown={handleFKClick}
         onOpenInTab={handleFKOpenTab}
       />
 
       {/* Execution Plan Panel */}
       {executionPlan && (
-        <div
-          className="fixed inset-y-0 right-0 z-50 shadow-xl"
-          style={{ width: executionPlanWidth }}
-        >
-          {/* Resize handle */}
+        <>
+          {/* Backdrop overlay */}
           <div
-            className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-primary/50 transition-colors z-10"
-            onMouseDown={(e) => {
-              e.preventDefault()
-              isResizing.current = true
-              document.body.style.cursor = 'ew-resize'
-              document.body.style.userSelect = 'none'
-            }}
+            role="presentation"
+            className="fixed inset-0 z-40 bg-black/30"
+            onClick={() => setExecutionPlan(null)}
           />
-          <ExecutionPlanViewer
-            plan={executionPlan.plan as Parameters<typeof ExecutionPlanViewer>[0]['plan']}
-            durationMs={executionPlan.durationMs}
-            onClose={() => setExecutionPlan(null)}
-          />
-        </div>
+          <div
+            className="fixed top-0 bottom-0 right-0 z-50 shadow-xl bg-background"
+            style={{ width: executionPlanWidth }}
+          >
+            {/* Resize handle */}
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize execution plan panel"
+              className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-primary/50 transition-colors z-10"
+              onMouseDown={(e) => {
+                e.preventDefault()
+                startResizing()
+              }}
+            />
+            <ExecutionPlanViewer
+              plan={executionPlan.plan as Parameters<typeof ExecutionPlanViewer>[0]['plan']}
+              durationMs={executionPlan.durationMs}
+              onClose={() => setExecutionPlan(null)}
+            />
+          </div>
+        </>
       )}
+
+      {/* Column Stats Panel */}
+      {columnStatsPanelOpen && (
+        <>
+          <div role="presentation" className="fixed inset-0 z-40" onClick={closeColumnStatsPanel} />
+          <div className="fixed top-0 bottom-0 right-0 z-50 shadow-xl flex flex-col">
+            <ColumnStatsPanel
+              stats={columnStatsData}
+              isLoading={columnStatsLoading}
+              error={columnStatsError}
+              onClose={closeColumnStatsPanel}
+            />
+          </div>
+        </>
+      )}
+
+      {/* Cross-tab heavy-run confirm dialog */}
+      <CrossTabSubmitDialog
+        open={pendingHeavyRun !== null}
+        onOpenChange={(o) => {
+          if (!o) setPendingHeavyRun(null)
+        }}
+        summary={pendingHeavyRun?.summary ?? null}
+        onConfirm={(dontAskAgain) => {
+          const run = pendingHeavyRun
+          setPendingHeavyRun(null)
+          if (dontAskAgain) skipHeavyConfirmRef.current = true
+          if (run) {
+            setRefsSummary(run.summary.refCount > 0 ? run.summary : null)
+            void executeSql(run.sql, run.originalQuery)
+          }
+        }}
+      />
 
       {/* Save Query Dialog */}
       <SaveQueryDialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen} query={tab.query} />
+
+      {/* Share Query Dialog */}
+      <ShareQueryDialog
+        open={shareDialogOpen}
+        onOpenChange={setShareDialogOpen}
+        query={tab.query}
+        connectionType={tabConnection?.dbType}
+        connectionName={tabConnection?.name}
+      />
+
+      {/* Share Results Image Dialog */}
+      <ShareResultsImage
+        open={shareResultsOpen}
+        onOpenChange={setShareResultsOpen}
+        result={tab.result}
+        connection={tabConnection}
+      />
+
+      {/* Export with masked columns confirmation */}
+      <MaskedExportDialog
+        pendingExport={pendingExport}
+        onOpenChange={(open) => !open && setPendingExport(null)}
+        onConfirm={() => {
+          if (!pendingExport) return
+          const maskedData = buildMaskedExportData(pendingExport.data)
+          void doExport(
+            pendingExport.format,
+            pendingExport.destination,
+            maskedData,
+            pendingExport.filename
+          )
+          setPendingExport(null)
+        }}
+      />
     </div>
   )
 }

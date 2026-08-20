@@ -5,13 +5,17 @@
  * Uses AI SDK's generateObject for typed JSON output.
  */
 
-import { safeStorage } from 'electron'
-import { createOpenAI } from '@ai-sdk/openai'
-import { createAnthropic } from '@ai-sdk/anthropic'
-import { createGoogleGenerativeAI } from '@ai-sdk/google'
-import { createGroq } from '@ai-sdk/groq'
 import { generateObject, generateText } from 'ai'
-import { z } from 'zod'
+import { createProviderClient } from './ai-providers'
+import {
+  responseSchema,
+  normalizeStructuredResponse,
+  buildSystemPrompt,
+  providerNeedsKey,
+  buildDashboardPrompt,
+  dashboardSpecSchema,
+  type DashboardSpec
+} from './ai-schema'
 import type {
   SchemaInfo,
   AIProvider,
@@ -19,8 +23,13 @@ import type {
   AIMessage,
   AIStructuredResponse,
   StoredChatMessage,
-  ChatSession
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig,
+  AIChatStreamEvent
 } from '@shared/index'
+import { DEFAULT_MODELS, isHarnessProvider } from '@shared/index'
+import { randomUUID } from 'crypto'
 
 // Re-export types for main process consumers
 export type {
@@ -29,78 +38,44 @@ export type {
   AIMessage,
   AIStructuredResponse,
   StoredChatMessage,
-  ChatSession
+  ChatSession,
+  AIMultiProviderConfig,
+  AIProviderConfig
 }
 
-/**
- * Generate a machine-specific encryption key using Electron's safeStorage.
- * Falls back to a static key if safeStorage is not available.
- */
-function getEncryptionKey(): string {
-  const baseKey = 'data-peek-ai-v1'
-  if (safeStorage.isEncryptionAvailable()) {
-    return safeStorage.encryptString(baseKey).toString('base64')
-  }
-  return baseKey
-}
+import { DpStorage } from './storage'
+import { createLogger } from './lib/logger'
 
-// Zod schema for structured output
-const responseSchema = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('query'),
-    message: z.string().describe('A brief explanation of what the query does'),
-    sql: z.string().describe('The complete, valid SQL query'),
-    explanation: z.string().describe('Detailed explanation of the query'),
-    warning: z.string().optional().describe('Warning for mutations or potential issues')
-  }),
-  z.object({
-    type: z.literal('chart'),
-    message: z.string().describe('Brief description of the visualization'),
-    title: z.string().describe('Chart title'),
-    description: z.string().optional().describe('Chart description'),
-    chartType: z.enum(['bar', 'line', 'pie', 'area']).describe('Chart type based on data nature'),
-    sql: z.string().describe('SQL query to fetch chart data'),
-    xKey: z.string().describe('Column name for X-axis'),
-    yKeys: z.array(z.string()).describe('Column name(s) for Y-axis values')
-  }),
-  z.object({
-    type: z.literal('metric'),
-    message: z.string().describe('Brief description of the metric'),
-    label: z.string().describe('Metric label'),
-    sql: z.string().describe('SQL query that returns a single value'),
-    format: z.enum(['number', 'currency', 'percent', 'duration']).describe('Value format')
-  }),
-  z.object({
-    type: z.literal('schema'),
-    message: z.string().describe('Explanation of the schema'),
-    tables: z.array(z.string()).describe('Table names to display')
-  }),
-  z.object({
-    type: z.literal('message'),
-    message: z.string().describe('The response message')
-  })
-])
-
-import { DpSecureStorage, DpStorage } from './storage'
+const log = createLogger('ai-service')
 
 // Chat history store structure: map of connectionId -> sessions
 type ChatHistoryStore = Record<string, ChatSession[]>
 
-let aiStore: DpSecureStorage<{ aiConfig: AIConfig | null }> | null = null
+// Store types
+interface AIStoreData {
+  // Legacy single-provider config (for migration)
+  aiConfig?: AIConfig | null
+  // New multi-provider config
+  multiProviderConfig?: AIMultiProviderConfig | null
+}
+
+let aiStore: DpStorage<AIStoreData> | null = null
 let chatStore: DpStorage<{ chatHistory: ChatHistoryStore }> | null = null
 
 /**
  * Initialize the AI config and chat stores
- * Handles migration from old encryption key to new safeStorage-based key
  */
 export async function initAIStore(): Promise<void> {
-  aiStore = await DpSecureStorage.create<{ aiConfig: AIConfig | null }>({
+  aiStore = await DpStorage.create<AIStoreData>({
     name: 'data-peek-ai-config',
-    encryptionKey: getEncryptionKey(),
     defaults: {
-      aiConfig: null
+      aiConfig: null,
+      multiProviderConfig: null
     }
   })
+
+  // Migrate legacy config to multi-provider format
+  migrateLegacyConfig()
 
   chatStore = await DpStorage.create<{ chatHistory: ChatHistoryStore }>({
     name: 'data-peek-ai-chat-history',
@@ -111,19 +86,170 @@ export async function initAIStore(): Promise<void> {
 }
 
 /**
- * Get the current AI configuration
+ * Migrate legacy single-provider config to multi-provider format
  */
-export function getAIConfig(): AIConfig | null {
-  if (!aiStore) return null
-  return aiStore.get('aiConfig', null)
+function migrateLegacyConfig(): void {
+  if (!aiStore) return
+
+  const legacyConfig = aiStore.get('aiConfig', null)
+  const multiConfig = aiStore.get('multiProviderConfig', null)
+
+  // If there's a legacy config but no multi-provider config, migrate it
+  if (legacyConfig && !multiConfig) {
+    const newConfig: AIMultiProviderConfig = {
+      providers: {
+        [legacyConfig.provider]: {
+          apiKey: legacyConfig.apiKey,
+          baseUrl: legacyConfig.baseUrl
+        }
+      },
+      activeProvider: legacyConfig.provider,
+      activeModels: {
+        [legacyConfig.provider]: legacyConfig.model
+      }
+    }
+    aiStore.set('multiProviderConfig', newConfig)
+    // Clear legacy config after migration
+    aiStore.set('aiConfig', null)
+    log.info('Migrated legacy AI config to multi-provider format')
+  }
 }
 
 /**
- * Save AI configuration
+ * Get the multi-provider AI configuration
+ */
+export function getMultiProviderConfig(): AIMultiProviderConfig | null {
+  if (!aiStore) return null
+  return aiStore.get('multiProviderConfig', null) ?? null
+}
+
+/**
+ * Save multi-provider AI configuration
+ */
+export function setMultiProviderConfig(config: AIMultiProviderConfig | null): void {
+  if (!aiStore) return
+  aiStore.set('multiProviderConfig', config)
+}
+
+/**
+ * Get configuration for a specific provider
+ */
+export function getProviderConfig(provider: AIProvider): AIProviderConfig | null {
+  const config = getMultiProviderConfig()
+  if (!config) return null
+  return config.providers[provider] || null
+}
+
+/**
+ * Set configuration for a specific provider
+ */
+export function setProviderConfig(provider: AIProvider, providerConfig: AIProviderConfig): void {
+  const config = getMultiProviderConfig() || {
+    providers: {},
+    activeProvider: provider,
+    activeModels: {}
+  }
+
+  config.providers[provider] = providerConfig
+
+  // If this is the first provider being configured, make it active
+  if (!config.providers[config.activeProvider]?.apiKey && providerNeedsKey(provider)) {
+    config.activeProvider = provider
+  }
+
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Remove configuration for a specific provider
+ */
+export function removeProviderConfig(provider: AIProvider): void {
+  const config = getMultiProviderConfig()
+  if (!config) return
+
+  delete config.providers[provider]
+  delete config.activeModels[provider]
+
+  // If we removed the active provider, switch to another configured one
+  if (config.activeProvider === provider) {
+    const configuredProviders = Object.keys(config.providers) as AIProvider[]
+    config.activeProvider = configuredProviders[0] || 'openai'
+  }
+
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Set the active provider
+ */
+export function setActiveProvider(provider: AIProvider): void {
+  const config = getMultiProviderConfig()
+  if (!config) return
+
+  config.activeProvider = provider
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Set the active model for a provider
+ */
+export function setActiveModel(provider: AIProvider, model: string): void {
+  const config = getMultiProviderConfig()
+  if (!config) return
+
+  config.activeModels[provider] = model
+  setMultiProviderConfig(config)
+}
+
+/**
+ * Get the current AI configuration (legacy format for backward compatibility)
+ * Converts multi-provider config to single AIConfig
+ */
+export function getAIConfig(): AIConfig | null {
+  const multiConfig = getMultiProviderConfig()
+  if (!multiConfig) return null
+
+  const provider = multiConfig.activeProvider
+  const providerConfig = multiConfig.providers[provider]
+
+  // Keyless providers (ollama, claude-cli) run locally without a stored key.
+  if (providerNeedsKey(provider) && !providerConfig?.apiKey) {
+    return null
+  }
+
+  return {
+    provider,
+    apiKey: providerConfig?.apiKey,
+    model: multiConfig.activeModels[provider] || DEFAULT_MODELS[provider],
+    baseUrl: providerConfig?.baseUrl
+  }
+}
+
+/**
+ * Save AI configuration (legacy format for backward compatibility)
+ * Converts single AIConfig to multi-provider format
  */
 export function setAIConfig(config: AIConfig | null): void {
-  if (!aiStore) return
-  aiStore.set('aiConfig', config)
+  if (!config) {
+    // Don't clear everything when null is passed - use clearAIConfig() for that
+    log.debug('setAIConfig called with null, ignoring. Use clearAIConfig() to clear.')
+    return
+  }
+
+  const multiConfig = getMultiProviderConfig() || {
+    providers: {},
+    activeProvider: config.provider,
+    activeModels: {}
+  }
+
+  multiConfig.providers[config.provider] = {
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl
+  }
+  multiConfig.activeProvider = config.provider
+  multiConfig.activeModels[config.provider] = config.model
+
+  setMultiProviderConfig(multiConfig)
 }
 
 /**
@@ -131,119 +257,16 @@ export function setAIConfig(config: AIConfig | null): void {
  */
 export function clearAIConfig(): void {
   if (!aiStore) return
-  aiStore.set('aiConfig', null)
+  aiStore.set('multiProviderConfig', null)
 }
 
 /**
- * Get the AI model instance based on provider
+ * Get the AI model instance based on provider.
+ * Thin wrapper around the pure factory in ai-providers.ts (kept as a
+ * separate module so it can be unit-tested without Electron).
  */
 function getModel(config: AIConfig) {
-  switch (config.provider) {
-    case 'openai': {
-      const openai = createOpenAI({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl
-      })
-      return openai(config.model)
-    }
-
-    case 'anthropic': {
-      const anthropic = createAnthropic({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl
-      })
-      return anthropic(config.model)
-    }
-
-    case 'google': {
-      const google = createGoogleGenerativeAI({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl
-      })
-      return google(config.model)
-    }
-
-    case 'groq': {
-      const groq = createGroq({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl
-      })
-      return groq(config.model)
-    }
-
-    case 'ollama': {
-      // Ollama uses OpenAI-compatible API
-      const ollama = createOpenAI({
-        baseURL: config.baseUrl || 'http://localhost:11434/v1',
-        apiKey: 'ollama' // Ollama doesn't need a real key
-      })
-      return ollama(config.model)
-    }
-
-    default:
-      throw new Error(`Unknown provider: ${config.provider}`)
-  }
-}
-
-/**
- * Build the system prompt with schema context
- */
-function buildSystemPrompt(schemas: SchemaInfo[], dbType: string): string {
-  // Build a concise schema representation
-  const schemaContext = schemas
-    .map((schema) => {
-      const tables = schema.tables
-        .map((table) => {
-          const columns = table.columns
-            .map((col) => {
-              let colDef = `${col.name}: ${col.dataType}`
-              if (col.isPrimaryKey) colDef += ' (PK)'
-              if (col.foreignKey) {
-                colDef += ` -> ${col.foreignKey.referencedTable}.${col.foreignKey.referencedColumn}`
-              }
-              return colDef
-            })
-            .join(', ')
-          return `  ${table.name}: [${columns}]`
-        })
-        .join('\n')
-      return `Schema "${schema.name}":\n${tables}`
-    })
-    .join('\n\n')
-
-  return `You are a helpful database assistant for a ${dbType} database.
-
-## Database Schema
-
-${schemaContext}
-
-## Response Guidelines
-
-Based on the user's request, respond with ONE of these types:
-
-1. **query** - When user asks for data or wants to run a query
-   - Generate valid ${dbType} SQL
-   - Include LIMIT 100 for SELECT queries unless specified
-   - Add warning for mutations (INSERT/UPDATE/DELETE)
-
-2. **chart** - When user asks to visualize, chart, graph, or plot data
-   - Choose appropriate chartType: bar (comparisons), line (time trends), pie (proportions ≤8 items), area (cumulative)
-   - SQL must return columns matching xKey and yKeys
-
-3. **metric** - When user asks for a single KPI/number (total, count, average)
-   - SQL must return exactly one value
-   - Choose format: number, currency, percent, or duration
-
-4. **schema** - When user asks about table structure or columns
-   - List the relevant table names
-
-5. **message** - For general questions, clarifications, or when no SQL is needed
-
-## SQL Guidelines
-- Use proper ${dbType} syntax
-- Use table aliases for readability
-- Quote identifiers if they contain special characters
-- Be precise with JOINs based on foreign key relationships`
+  return createProviderClient(config)
 }
 
 /**
@@ -259,7 +282,7 @@ export async function validateAPIKey(
     await generateText({
       model,
       prompt: 'Say "ok"',
-      maxTokens: 5
+      maxOutputTokens: 5
     })
 
     return { valid: true }
@@ -285,18 +308,61 @@ export async function validateAPIKey(
 }
 
 /**
+ * Generate a whole dashboard spec from a prompt. BYOH harness providers ground
+ * it against the live DB via the harness; other providers use generateObject
+ * (from schema).
+ */
+export async function generateDashboard(
+  config: AIConfig,
+  prompt: string,
+  schemas: SchemaInfo[],
+  dbType: string,
+  connectionId?: string
+): Promise<{ success: boolean; spec?: DashboardSpec; error?: string }> {
+  if (isHarnessProvider(config.provider)) {
+    if (!connectionId) return { success: false, error: 'No connection selected.' }
+    const { generateDashboardViaHarness } = await import('./harness/service')
+    return generateDashboardViaHarness(config.provider, prompt, schemas, dbType, connectionId)
+  }
+  try {
+    const model = getModel(config)
+    const result = await generateObject({
+      model,
+      schema: dashboardSpecSchema,
+      system: buildDashboardPrompt(schemas, dbType),
+      prompt: prompt || 'Design a useful overview dashboard for this database.',
+      temperature: 0.2
+    })
+    return { success: true, spec: result.object }
+  } catch (error: unknown) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
  * Generate a structured chat response using AI SDK's generateObject
  */
 export async function generateChatResponse(
   config: AIConfig,
   messages: AIMessage[],
   schemas: SchemaInfo[],
-  dbType: string
+  dbType: string,
+  connectionId?: string
 ): Promise<{
   success: boolean
   data?: AIStructuredResponse
   error?: string
+  meta?: { grounded: boolean; agentic: boolean; turns?: number }
 }> {
+  // Bring-your-own-harness: BYOH providers aren't AI SDK models, so they get
+  // their own code path (spawn + parse) rather than generateObject. Given the
+  // connection id + a running MCP server they can query the live DB to ground
+  // their answer.
+  if (isHarnessProvider(config.provider)) {
+    const { generateChatResponseViaHarness } = await import('./harness/service')
+    return generateChatResponseViaHarness(config, messages, schemas, dbType, connectionId)
+  }
+
   try {
     const model = getModel(config)
     const systemPrompt = buildSystemPrompt(schemas, dbType)
@@ -322,13 +388,53 @@ export async function generateChatResponse(
 
     return {
       success: true,
-      data: result.object as AIStructuredResponse
+      data: normalizeStructuredResponse(result.object)
     }
-  } catch (error) {
+  } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Unknown error'
-    console.error('[ai-service] generateChatResponse error:', error)
+    log.error('generateChatResponse error:', message)
+
     return { success: false, error: message }
   }
+}
+
+/**
+ * Streaming chat: for BYOH harness providers, drives the CLI in stream-json
+ * mode and forwards incremental events through `onEvent`. Other (AI SDK)
+ * providers don't stream here — they run normally and emit their final
+ * message as one event so the caller's rendering path stays uniform.
+ */
+export async function generateChatResponseStream(
+  config: AIConfig,
+  messages: AIMessage[],
+  schemas: SchemaInfo[],
+  dbType: string,
+  connectionId: string | undefined,
+  resumeSessionId: string | undefined,
+  onEvent: (event: AIChatStreamEvent) => void
+): Promise<{
+  success: boolean
+  data?: AIStructuredResponse
+  error?: string
+  meta?: { grounded: boolean; agentic: boolean; turns?: number; sessionId?: string }
+}> {
+  if (isHarnessProvider(config.provider)) {
+    const { generateChatResponseViaHarnessStream } = await import('./harness/service')
+    return generateChatResponseViaHarnessStream(
+      config,
+      messages,
+      schemas,
+      dbType,
+      connectionId,
+      resumeSessionId,
+      onEvent
+    )
+  }
+
+  // Non-CLI providers have no CLI session to resume; ignore resumeSessionId.
+  const result = await generateChatResponse(config, messages, schemas, dbType, connectionId)
+  if (result.success && result.data) onEvent({ type: 'message', text: result.data.message })
+  return result
 }
 
 /**
@@ -362,7 +468,7 @@ function migrateLegacyToSessions(messages: StoredChatMessage[]): ChatSession[] {
 
   const now = new Date().toISOString()
   const session: ChatSession = {
-    id: crypto.randomUUID(),
+    id: randomUUID(),
     title: generateSessionTitle(messages),
     messages,
     createdAt: messages[0]?.createdAt || now,
@@ -383,7 +489,7 @@ export function getChatSessions(connectionId: string): ChatSession[] {
 
   // Check for legacy format and migrate if needed
   if (isLegacyFormat(data)) {
-    const sessions = migrateLegacyToSessions(data as StoredChatMessage[])
+    const sessions = migrateLegacyToSessions(data)
     // Save migrated data
     history[connectionId] = sessions
     chatStore.set('chatHistory', history)
@@ -407,7 +513,7 @@ export function getChatSession(connectionId: string, sessionId: string): ChatSes
 export function createChatSession(connectionId: string, title?: string): ChatSession {
   const now = new Date().toISOString()
   const session: ChatSession = {
-    id: crypto.randomUUID(),
+    id: randomUUID(),
     title: title || 'New Chat',
     messages: [],
     createdAt: now,

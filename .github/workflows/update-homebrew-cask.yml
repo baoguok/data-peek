@@ -1,0 +1,88 @@
+name: Update Homebrew Cask
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sync the cask to (e.g. v0.26.0)"
+        required: true
+
+jobs:
+  update-cask:
+    runs-on: ubuntu-latest
+    if: "github.event_name == 'workflow_dispatch' || !github.event.release.prerelease"
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Get release version
+        id: version
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS DMG and compute SHA256
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # mac builds are arm64-only (see apps/desktop/electron-builder.yml) — the
+          # cask is Apple Silicon only, so there is no x64 DMG to fetch.
+          echo "Downloading arm64 DMG..."
+          gh release download "$RELEASE_TAG" \
+            --repo Rohithgilla12/data-peek \
+            --pattern "data-peek-${VERSION}-arm64.dmg" \
+            --dir /tmp/release
+
+          ARM64_SHA=$(sha256sum "/tmp/release/data-peek-${VERSION}-arm64.dmg" | cut -d' ' -f1)
+
+          echo "arm64_sha=${ARM64_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Update tap repo
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARM64_SHA="${{ steps.sha.outputs.arm64_sha }}"
+
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/Rohithgilla12/homebrew-tap.git /tmp/tap
+          cd /tmp/tap
+
+          cat > Casks/data-peek.rb << CASK_EOF
+          cask "data-peek" do
+            version "${VERSION}"
+            sha256 "${ARM64_SHA}"
+
+            url "https://github.com/Rohithgilla12/data-peek/releases/download/v#{version}/data-peek-#{version}-arm64.dmg",
+                verified: "github.com/Rohithgilla12/data-peek/"
+            name "Data Peek"
+            desc "Minimal, fast SQL client desktop application"
+            homepage "https://github.com/Rohithgilla12/data-peek"
+
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
+            depends_on arch: :arm64
+            depends_on macos: ">= :catalina"
+
+            app "data-peek.app"
+
+            zap trash: [
+              "~/Library/Application Support/data-peek",
+              "~/Library/Preferences/dev.datapeek.app.plist",
+              "~/Library/Saved Application State/dev.datapeek.app.savedState",
+            ]
+          end
+          CASK_EOF
+
+          sed -i 's/^          //' Casks/data-peek.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/data-peek.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update Data Peek cask to v${VERSION}"
+          git push

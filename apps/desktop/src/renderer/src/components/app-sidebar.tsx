@@ -1,14 +1,22 @@
-'use client'
-
-import { MessageCircleQuestion, Settings2 } from 'lucide-react'
+import { Activity, Bell, MessageCircleQuestion, SearchCode, Settings2 } from 'lucide-react'
 import { Link } from '@tanstack/react-router'
 
 import { ConnectionSwitcher } from '@/components/connection-switcher'
+import { Dashboards } from '@/components/dashboard'
 import { QueryHistory } from '@/components/query-history'
 import { SavedQueries } from '@/components/saved-queries'
+import { ScheduledQueries } from '@/components/scheduled-queries'
 import { SchemaExplorer } from '@/components/schema-explorer'
+import { SidebarOmnibar } from '@/components/sidebar-omnibar'
 import { SidebarQuickQuery } from '@/components/sidebar-quick-query'
+import { Snippets } from '@/components/snippets'
+import { NotebookSidebar } from '@/components/notebook-sidebar'
+import { FunAnalytics } from '@/components/fun-analytics'
+
+import { useConnectionStore, useTabStore } from '@/stores'
+import { useSettingsStore } from '@/stores/settings-store'
 import {
+  cn,
   Sidebar,
   SidebarContent,
   SidebarGroup,
@@ -19,17 +27,57 @@ import {
   SidebarMenuItem,
   SidebarRail,
   SidebarSeparator
-} from '@/components/ui/sidebar'
+} from '@data-peek/ui'
 
+/**
+ * Render the application's multi-section sidebar with connection switching, query tools, schema access, history, saved and scheduled queries, dashboards, and secondary navigation.
+ *
+ * The component forwards all received props to the underlying Sidebar root and applies a small macOS-specific top padding to the header when running on Darwin platforms.
+ *
+ * @param props - Props forwarded to the underlying Sidebar component
+ * @returns A React element containing the assembled application sidebar
+ */
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+  const platform = window.electron.process.platform
+  const activeConnectionId = useConnectionStore((s) => s.activeConnectionId)
+  const activeConnection = useConnectionStore((s) =>
+    s.connections.find((c) => c.id === activeConnectionId)
+  )
+  const createPgNotificationsTab = useTabStore((s) => s.createPgNotificationsTab)
+  const createHealthMonitorTab = useTabStore((s) => s.createHealthMonitorTab)
+  const createSchemaIntelTab = useTabStore((s) => s.createSchemaIntelTab)
+  const isPostgres = activeConnection?.dbType === 'postgresql'
+  const pokemonBuddyEnabled = useSettingsStore((s) => s.pokemonBuddyEnabled)
+
+  const handleOpenNotifications = () => {
+    if (activeConnectionId) {
+      createPgNotificationsTab(activeConnectionId)
+    }
+  }
+
+  const handleOpenHealthMonitor = () => {
+    if (activeConnectionId) {
+      createHealthMonitorTab(activeConnectionId)
+    }
+  }
+
+  const handleOpenSchemaIntel = () => {
+    if (activeConnectionId) {
+      createSchemaIntelTab(activeConnectionId)
+    }
+  }
+
   return (
-    <Sidebar className="border-r-0 bg-sidebar/80 backdrop-blur-xl" {...props}>
+    <Sidebar className="border-r-0 bg-sidebar" {...props}>
       {/* Header - Connection Switcher */}
-      <SidebarHeader className="pt-10">
+      <SidebarHeader className={cn(platform === 'darwin' && 'pt-10')}>
         <ConnectionSwitcher />
       </SidebarHeader>
 
       <SidebarContent className="gap-0">
+        {/* Omnibar - unified search across everything */}
+        <SidebarOmnibar />
+
         {/* Quick Query Panel */}
         <SidebarQuickQuery />
 
@@ -38,15 +86,59 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         {/* Schema Explorer */}
         <SchemaExplorer />
 
-        <SidebarSeparator className="mx-3" />
+        {activeConnectionId && (
+          <>
+            <SidebarSeparator className="mx-3" />
 
-        {/* Query History */}
-        <QueryHistory />
+            {/* Query Tools: History, Saved, Snippets */}
+            <QueryHistory />
+            <SavedQueries />
+            <Snippets />
+            <NotebookSidebar />
 
-        <SidebarSeparator className="mx-3" />
+            <SidebarSeparator className="mx-3" />
 
-        {/* Saved Queries */}
-        <SavedQueries />
+            {/* Automation & Monitoring */}
+            <ScheduledQueries />
+            <Dashboards />
+
+            {(isPostgres || activeConnectionId) && (
+              <SidebarGroup>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {isPostgres && (
+                      <SidebarMenuItem>
+                        <SidebarMenuButton onClick={handleOpenNotifications}>
+                          <Bell className="size-4" />
+                          <span>Notifications</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    )}
+                    <SidebarMenuItem>
+                      <SidebarMenuButton onClick={handleOpenHealthMonitor}>
+                        <Activity className="size-4" />
+                        <span>Health Monitor</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton onClick={handleOpenSchemaIntel}>
+                        <SearchCode className="size-4" />
+                        <span>Schema Intel</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            )}
+          </>
+        )}
+
+        {pokemonBuddyEnabled && (
+          <>
+            <SidebarSeparator className="mx-3" />
+            <FunAnalytics />
+          </>
+        )}
 
         {/* Secondary Navigation - Settings & Help */}
         <SidebarGroup className="mt-auto">

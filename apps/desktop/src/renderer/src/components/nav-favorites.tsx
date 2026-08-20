@@ -1,5 +1,3 @@
-'use client'
-
 import { ArrowUpRight, Link, MoreHorizontal, StarOff, Trash2 } from 'lucide-react'
 
 import {
@@ -7,9 +5,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
-import {
+  DropdownMenuTrigger,
   SidebarGroup,
   SidebarGroupLabel,
   SidebarMenu,
@@ -17,7 +13,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   useSidebar
-} from '@/components/ui/sidebar'
+} from '@data-peek/ui'
 
 export function NavFavorites({
   favorites

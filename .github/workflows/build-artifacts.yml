@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: 'Platform to build'
+        description: "Platform to build"
         required: true
-        default: 'all'
+        default: "all"
         type: choice
         options:
           - all
@@ -15,23 +15,50 @@ on:
           - linux
 
 jobs:
+  # Gate every manual artifact build behind tests + typecheck. No more
+  # shipping a bad dep split into an artifact that ends up on someone's
+  # machine.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      # Reuse the pnpm store between runs so the verify gate doesn't re-download
+      # every dependency on a cold runner before the platform builds can start.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @data-peek/desktop test
+      - run: pnpm --filter @data-peek/desktop typecheck
+
   build-mac:
+    needs: verify
     if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'mac' }}
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
 
+      # Pin Python 3.11 so node-gyp 9.x (used by @electron/rebuild) still has
+      # `distutils` available. Python 3.12 removed it.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build for macOS
         working-directory: apps/desktop
@@ -39,8 +66,36 @@ jobs:
           pnpm exec electron-vite build
           pnpm exec electron-builder --mac --publish never
 
+      - name: Verify native module architectures in DMGs
+        working-directory: apps/desktop/dist
+        run: |
+          set -euxo pipefail
+          for dmg in *.dmg; do
+            expected_arch=$(echo "$dmg" | grep -oE 'arm64|x64')
+            if [ -z "$expected_arch" ]; then
+              echo "Skipping $dmg (no arch in name)"
+              continue
+            fi
+            mount=$(mktemp -d)
+            hdiutil attach "$dmg" -mountpoint "$mount" -nobrowse -readonly
+            app=$(find "$mount" -maxdepth 2 -name '*.app' | head -1)
+            while IFS= read -r node; do
+              info=$(file "$node")
+              case "$expected_arch" in
+                x64)   needle="x86_64" ;;
+                arm64) needle="arm64"  ;;
+              esac
+              if ! echo "$info" | grep -q "$needle"; then
+                echo "ARCH MISMATCH in $dmg: $node -> $info"
+                hdiutil detach "$mount" || true
+                exit 1
+              fi
+            done < <(find "$app" -name '*.node')
+            hdiutil detach "$mount"
+          done
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: data-peek-mac
           path: |
@@ -49,22 +104,28 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    needs: verify
     if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows' }}
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build for Windows
         working-directory: apps/desktop
@@ -73,7 +134,7 @@ jobs:
           pnpm exec electron-builder --win --publish never
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: data-peek-windows
           path: |
@@ -81,22 +142,28 @@ jobs:
           if-no-files-found: error
 
   build-linux:
+    needs: verify
     if: ${{ github.event.inputs.platform == 'all' || github.event.inputs.platform == 'linux' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build for Linux
         working-directory: apps/desktop
@@ -109,7 +176,7 @@ jobs:
         run: pnpm exec electron-builder --linux deb --publish never
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: data-peek-linux
           path: |

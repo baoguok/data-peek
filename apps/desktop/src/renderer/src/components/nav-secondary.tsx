@@ -8,7 +8,7 @@ import {
   SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem
-} from '@/components/ui/sidebar'
+} from '@data-peek/ui'
 
 export function NavSecondary({
   items,

@@ -1,89 +1,118 @@
-import Link from 'next/link'
-import { Database, Github, Twitter } from 'lucide-react'
+import Link from "next/link";
 
-const footerLinks = {
-  Product: [
-    { label: 'Features', href: '#features' },
-    { label: 'Pricing', href: '#pricing' },
-    { label: 'Download', href: '/download' },
-    { label: 'Changelog', href: '/changelog' },
-  ],
-  Resources: [
-    { label: 'Documentation', href: '/docs' },
-    { label: 'FAQ', href: '#faq' },
-    { label: 'Blog', href: '/blog' },
-    { label: 'Support', href: '/support' },
-  ],
-  Legal: [
-    { label: 'Privacy Policy', href: '/privacy' },
-    { label: 'Terms of Service', href: '/terms' },
-    { label: 'License', href: '/license' },
-  ],
-}
+const cols: {
+  title: string;
+  links: { label: string; href: string; external?: boolean }[];
+}[] = [
+  {
+    title: "Product",
+    links: [
+      { label: "Features", href: "/#features" },
+      { label: "Pricing", href: "/#pricing" },
+      { label: "Download", href: "/download" },
+      { label: "Compare", href: "/compare" },
+    ],
+  },
+  {
+    title: "Databases",
+    links: [
+      { label: "PostgreSQL", href: "/databases/postgresql" },
+      { label: "MySQL", href: "/databases/mysql" },
+      { label: "SQL Server", href: "/databases/sql-server" },
+      { label: "SQLite", href: "/databases/sqlite" },
+    ],
+  },
+  {
+    title: "Resources",
+    links: [
+      {
+        label: "Documentation",
+        href: "https://docs.datapeek.dev/docs",
+        external: true,
+      },
+      { label: "Changelog", href: "/blog" },
+      { label: "FAQ", href: "/#faq" },
+      { label: "Students & OSS", href: "/community" },
+    ],
+  },
+  {
+    title: "Legal",
+    links: [
+      { label: "Privacy", href: "/privacy" },
+      { label: "Terms", href: "/terms" },
+      {
+        label: "License (MIT)",
+        href: "https://github.com/Rohithgilla12/data-peek/blob/main/LICENSE",
+        external: true,
+      },
+    ],
+  },
+];
 
 export function Footer() {
+  const year = new Date().getFullYear();
   return (
-    <footer className="relative border-t border-[--color-border] bg-[--color-surface]/50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 py-10 sm:py-16">
-        <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-5 gap-8 sm:gap-12">
-          {/* Brand */}
+    <footer
+      className="neat relative"
+      style={{
+        borderTop: "1px solid var(--n-line)",
+        background: "var(--n-bg-sunken)",
+      }}
+    >
+      <div className="mx-auto max-w-[1240px] px-5 sm:px-8 py-16">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-10">
           <div className="col-span-2">
-            <Link href="/" className="flex items-center gap-2 mb-3 sm:mb-4">
-              <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[--color-accent] flex items-center justify-center">
-                <Database className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[--color-background]" />
-              </div>
+            <Link href="/" className="flex items-center gap-2 text-[14px]">
               <span
-                className="text-base sm:text-lg font-semibold tracking-tight"
-                style={{ fontFamily: 'var(--font-display)' }}
-              >
-                data-peek
-              </span>
+                aria-hidden
+                className="inline-block h-[10px] w-[10px]"
+                style={{ background: "var(--n-accent)" }}
+              />
+              <span className="text-[var(--n-fg)] font-medium">data-peek</span>
             </Link>
-            <p
-              className="text-xs sm:text-sm text-[--color-text-secondary] max-w-xs mb-4 sm:mb-6"
-              style={{ fontFamily: 'var(--font-body)' }}
-            >
-              A fast, beautiful PostgreSQL client for developers who value simplicity.
+            <p className="mt-4 max-w-[40ch] text-[12.5px] leading-[1.6] text-[var(--n-fg-muted)]">
+              A minimal SQL client that opens fast, edits inline, and never
+              phones home. Built by one person who was tired of the
+              alternatives.
             </p>
-
-            {/* Social Links */}
-            <div className="flex items-center gap-3 sm:gap-4">
+            <div className="mt-5 flex gap-2 text-[11px]">
               <Link
                 href="https://github.com/Rohithgilla12/data-peek"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg bg-[--color-surface] border border-[--color-border] flex items-center justify-center text-[--color-text-muted] hover:text-[--color-text-primary] hover:border-[--color-text-muted] transition-colors"
+                className="h-8 px-3 inline-flex items-center gap-2 text-[var(--n-fg-muted)] hover:text-[var(--n-fg)]"
+                style={{ border: "1px solid var(--n-line-soft)" }}
               >
-                <Github className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <span aria-hidden>★</span> GitHub
               </Link>
               <Link
                 href="https://x.com/gillarohith"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg bg-[--color-surface] border border-[--color-border] flex items-center justify-center text-[--color-text-muted] hover:text-[--color-text-primary] hover:border-[--color-text-muted] transition-colors"
+                className="h-8 px-3 inline-flex items-center gap-2 text-[var(--n-fg-muted)] hover:text-[var(--n-fg)]"
+                style={{ border: "1px solid var(--n-line-soft)" }}
               >
-                <Twitter className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                X · @gillarohith
               </Link>
             </div>
           </div>
 
-          {/* Links */}
-          {Object.entries(footerLinks).map(([category, links]) => (
-            <div key={category}>
-              <h4
-                className="text-[10px] sm:text-xs uppercase tracking-[0.15em] text-[--color-text-muted] mb-3 sm:mb-4"
-                style={{ fontFamily: 'var(--font-mono)' }}
-              >
-                {category}
+          {cols.map((c) => (
+            <div key={c.title}>
+              <h4 className="text-[10.5px] uppercase tracking-[0.16em] text-[var(--n-fg-faint)] mb-4">
+                {c.title}
               </h4>
-              <ul className="space-y-2 sm:space-y-3">
-                {links.map((link) => (
-                  <li key={link.label}>
+              <ul className="space-y-2.5">
+                {c.links.map((l) => (
+                  <li key={l.label}>
                     <Link
-                      href={link.href}
-                      className="text-xs sm:text-sm text-[--color-text-secondary] hover:text-[--color-text-primary] transition-colors"
+                      href={l.href}
+                      {...(l.external
+                        ? { target: "_blank", rel: "noopener noreferrer" }
+                        : {})}
+                      className="text-[12.5px] text-[var(--n-fg-muted)] hover:text-[var(--n-fg)] transition-colors"
                     >
-                      {link.label}
+                      {l.label}
                     </Link>
                   </li>
                 ))}
@@ -92,20 +121,23 @@ export function Footer() {
           ))}
         </div>
 
-        {/* Bottom Bar */}
-        <div className="mt-10 sm:mt-16 pt-6 sm:pt-8 border-t border-[--color-border] flex flex-col md:flex-row items-center justify-between gap-3 sm:gap-4">
-          <p
-            className="text-xs sm:text-sm text-[--color-text-muted]"
-            style={{ fontFamily: 'var(--font-mono)' }}
-          >
-            © {new Date().getFullYear()} data-peek. All rights reserved.
-          </p>
-          <p className="text-xs sm:text-sm text-[--color-text-muted]">
-            Made with{' '}
-            <span className="text-[--color-error]">♥</span> for developers
-          </p>
+        <div
+          className="mt-14 pt-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-[11px] text-[var(--n-fg-faint)] tabular-nums"
+          style={{ borderTop: "1px solid var(--n-line-soft)" }}
+        >
+          <span>© {year} data-peek · MIT Licensed</span>
+          <span>
+            Built by{" "}
+            <Link
+              href="https://x.com/gillarohith"
+              target="_blank"
+              className="text-[var(--n-fg-muted)] hover:text-[var(--n-fg)]"
+            >
+              @gillarohith
+            </Link>
+          </span>
         </div>
       </div>
     </footer>
-  )
+  );
 }

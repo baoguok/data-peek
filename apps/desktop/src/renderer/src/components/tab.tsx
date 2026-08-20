@@ -1,17 +1,34 @@
-'use client'
-
+import { useState } from 'react'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { FileCode, Table2, Pin, X, Network } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import type { Tab as TabType } from '@/stores/tab-store'
+import { FileCode, Table2, Pin, X, Network, SearchCode } from 'lucide-react'
 import {
+  cn,
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
   ContextMenuTrigger
-} from '@/components/ui/context-menu'
+} from '@data-peek/ui'
+import type { Tab as TabType } from '@/stores/tab-store'
+import { useTabStore } from '@/stores/tab-store'
+import { useWatchStore } from '@/stores/watch-store'
+import type { RefNameValidationError } from '@/lib/cross-tab-types'
+
+function refNameErrorMessage(error: RefNameValidationError): string {
+  switch (error.kind) {
+    case 'empty':
+      return 'Enter a name'
+    case 'too_long':
+      return `Too long (max ${error.max})`
+    case 'invalid_chars':
+      return error.detail
+    case 'reserved_word':
+      return `"${error.word}" is a reserved word`
+    case 'duplicate':
+      return 'Already used on this connection'
+  }
+}
 
 interface TabProps {
   tab: TabType
@@ -41,13 +58,31 @@ export function Tab({
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: tab.id
   })
+  const watchState = useWatchStore((s) => s.states[tab.id])
+  const isWatching = !!watchState?.enabled
+  const isPaused = !!watchState?.paused
+
+  const setTabName = useTabStore((s) => s.setTabName)
+  const clearTabName = useTabStore((s) => s.clearTabName)
+  const isQuery = tab.type === 'query'
+  const refName = isQuery ? tab.name : undefined
+  const [renaming, setRenaming] = useState(false)
+  const [nameDraft, setNameDraft] = useState('')
+  const [nameError, setNameError] = useState<string | null>(null)
 
   const style = {
     transform: CSS.Transform.toString(transform),
     transition
   }
 
-  const Icon = tab.type === 'query' ? FileCode : tab.type === 'erd' ? Network : Table2
+  const Icon =
+    tab.type === 'query'
+      ? FileCode
+      : tab.type === 'erd'
+        ? Network
+        : tab.type === 'schema-intel'
+          ? SearchCode
+          : Table2
 
   return (
     <ContextMenu>
@@ -85,12 +120,69 @@ export function Tab({
           {/* Dirty indicator */}
           {isDirty && <span className="size-2 shrink-0 rounded-full bg-yellow-500" />}
 
+          {/* Watching indicator — pulses while polling, dimmed when paused */}
+          {isWatching && (
+            <span
+              aria-label={isPaused ? 'Watch paused' : 'Watching'}
+              className={cn(
+                'relative inline-flex size-2 shrink-0 items-center justify-center',
+                isPaused && 'opacity-50'
+              )}
+            >
+              {!isPaused && (
+                <span className="absolute inline-flex size-2 rounded-full bg-amber-500/40 motion-safe:animate-ping" />
+              )}
+              <span className="relative inline-flex size-1.5 rounded-full bg-amber-500" />
+            </span>
+          )}
+
           {/* Title */}
-          <span className="truncate text-sm">{tab.title}</span>
+          {renaming ? (
+            <input
+              autoFocus
+              value={nameDraft}
+              onChange={(e) => {
+                setNameDraft(e.target.value)
+                setNameError(null)
+              }}
+              onClick={(e) => e.stopPropagation()}
+              onPointerDown={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                e.stopPropagation()
+                if (e.key === 'Enter') {
+                  const res = setTabName(tab.id, nameDraft)
+                  if (res.ok) {
+                    setRenaming(false)
+                  } else if (res.error.kind === 'not_a_query_tab') {
+                    setNameError('Only query tabs can be named')
+                  } else {
+                    setNameError(refNameErrorMessage(res.error))
+                  }
+                } else if (e.key === 'Escape') {
+                  setRenaming(false)
+                }
+              }}
+              onBlur={() => setRenaming(false)}
+              placeholder="name"
+              title={nameError ?? undefined}
+              className={cn(
+                'w-24 bg-transparent text-sm outline-none border-b',
+                nameError ? 'border-red-500' : 'border-primary/50'
+              )}
+            />
+          ) : refName ? (
+            <span className="truncate text-sm">
+              <span className="text-primary">@{refName}</span>
+            </span>
+          ) : (
+            <span className="truncate text-sm">{tab.title}</span>
+          )}
 
           {/* Close button (hidden for pinned tabs) */}
           {!tab.isPinned && (
             <button
+              type="button"
+              aria-label="Close tab"
               onClick={(e) => {
                 e.stopPropagation()
                 onClose()
@@ -115,6 +207,21 @@ export function Tab({
           </ContextMenuItem>
         )}
         <ContextMenuSeparator />
+        {isQuery && (
+          <ContextMenuItem
+            onClick={() => {
+              setNameDraft(refName ?? '')
+              setNameError(null)
+              setRenaming(true)
+            }}
+          >
+            Name as @…
+          </ContextMenuItem>
+        )}
+        {isQuery && refName && (
+          <ContextMenuItem onClick={() => clearTabName(tab.id)}>Clear @name</ContextMenuItem>
+        )}
+        {isQuery && <ContextMenuSeparator />}
         {!tab.isPinned && (
           <ContextMenuItem onClick={onClose}>
             <X className="mr-2 size-4" />

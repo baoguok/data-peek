@@ -1,9 +1,6 @@
-'use client'
-
 import * as React from 'react'
 import { ExternalLink, Clock, Table2, ChevronDown, ChevronUp } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
+import { Button, cn } from '@data-peek/ui'
 
 interface AIQueryResultProps {
   columns: Array<{ name: string; type: string }>
@@ -64,6 +61,7 @@ export function AIQueryResult({
         <div className="flex items-center gap-2">
           {displayRows.length > 3 && (
             <button
+              type="button"
               onClick={() => setIsExpanded(!isExpanded)}
               className="flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
             >

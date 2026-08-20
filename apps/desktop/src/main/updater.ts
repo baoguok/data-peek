@@ -1,22 +1,36 @@
 import { autoUpdater } from 'electron-updater'
-import { app, dialog } from 'electron'
+import { app, dialog, ipcMain } from 'electron'
+import { createLogger } from './lib/logger'
+import { setForceQuit } from './app-state'
+import { windowManager } from './window-manager'
+
+const log = createLogger('updater')
 
 let isUpdaterInitialized = false
 let isManualCheck = false
+let periodicCheckInterval: ReturnType<typeof setInterval> | null = null
+
+// Check interval: 4 hours in milliseconds
+const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000
+
+// Send event to all renderer processes
+function sendToAllRenderers(channel: string, ...args: unknown[]): void {
+  windowManager.broadcastToAll(channel, ...args)
+}
 
 export function initAutoUpdater(): void {
   // Only check for updates in production
   if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
-    console.log('[updater] Skipping auto-update check in development mode')
+    log.debug('Skipping auto-update check in development mode')
     return
   }
 
-  // Configure logging
+  // Configure logging - use our logger
   autoUpdater.logger = {
-    info: (message) => console.log('[updater]', message),
-    warn: (message) => console.warn('[updater]', message),
-    error: (message) => console.error('[updater]', message),
-    debug: (message) => console.log('[updater:debug]', message)
+    info: (message) => log.info(String(message)),
+    warn: (message) => log.warn(String(message)),
+    error: (message) => log.error(String(message)),
+    debug: (message) => log.debug(String(message))
   }
 
   // Disable auto-download - download silently on automatic checks, ask on manual checks
@@ -25,11 +39,14 @@ export function initAutoUpdater(): void {
 
   // Event handlers
   autoUpdater.on('checking-for-update', () => {
-    console.log('[updater] Checking for update...')
+    log.debug('Checking for update...')
   })
 
   autoUpdater.on('update-available', (info) => {
-    console.log('[updater] Update available:', info.version)
+    log.info('Update available:', info.version)
+
+    // Notify all renderers about available update
+    sendToAllRenderers('updater:update-available', info.version)
 
     if (isManualCheck) {
       // Manual check: ask user if they want to download
@@ -53,7 +70,7 @@ export function initAutoUpdater(): void {
   })
 
   autoUpdater.on('update-not-available', () => {
-    console.log('[updater] No update available')
+    log.debug('No update available')
     if (isManualCheck) {
       dialog.showMessageBox({
         type: 'info',
@@ -66,16 +83,19 @@ export function initAutoUpdater(): void {
   })
 
   autoUpdater.on('download-progress', (progress) => {
-    console.log(`[updater] Download progress: ${progress.percent.toFixed(1)}%`)
+    log.debug(`Download progress: ${progress.percent.toFixed(1)}%`)
+    sendToAllRenderers('updater:download-progress', progress.percent)
   })
 
   autoUpdater.on('update-downloaded', (info) => {
-    console.log('[updater] Update downloaded:', info.version)
-    // The update will be installed on quit
+    log.info('Update downloaded:', info.version)
+    // Notify all renderers that update is ready to install
+    sendToAllRenderers('updater:update-downloaded', info.version)
   })
 
   autoUpdater.on('error', (err) => {
-    console.error('[updater] Error:', err.message)
+    log.error('Update error:', err.message)
+    sendToAllRenderers('updater:error', err.message)
     if (isManualCheck) {
       dialog.showMessageBox({
         type: 'error',
@@ -87,10 +107,50 @@ export function initAutoUpdater(): void {
     }
   })
 
+  // Handle quit-and-install request from renderer
+  ipcMain.on('updater:quit-and-install', () => {
+    log.info('Quit and install requested')
+
+    // On macOS, we need to force the app to actually quit (not hide)
+    // The main window has a 'close' handler that hides instead of closes unless forceQuit is true
+    setForceQuit(true)
+
+    // isSilent: true = no installation UI (cleaner UX)
+    // isForceRunAfter: true = ensure app restarts after install (critical for macOS)
+    autoUpdater.quitAndInstall(true, true)
+  })
+
   isUpdaterInitialized = true
 
   // Check for updates silently on startup
   autoUpdater.checkForUpdatesAndNotify()
+
+  // Set up periodic update checks
+  startPeriodicChecks()
+}
+
+// Start periodic update checks
+function startPeriodicChecks(): void {
+  if (periodicCheckInterval) {
+    clearInterval(periodicCheckInterval)
+  }
+
+  periodicCheckInterval = setInterval(() => {
+    log.debug('Running periodic update check...')
+    autoUpdater.checkForUpdates().catch((err) => {
+      log.error('Periodic check failed:', err.message)
+    })
+  }, CHECK_INTERVAL_MS)
+
+  log.debug(`Periodic checks scheduled every ${CHECK_INTERVAL_MS / 1000 / 60 / 60} hours`)
+}
+
+// Stop periodic checks (call this on app quit)
+export function stopPeriodicChecks(): void {
+  if (periodicCheckInterval) {
+    clearInterval(periodicCheckInterval)
+    periodicCheckInterval = null
+  }
 }
 
 export async function checkForUpdates(): Promise<void> {
@@ -115,7 +175,7 @@ export async function checkForUpdates(): Promise<void> {
     await autoUpdater.checkForUpdates()
     // The event handlers will show appropriate dialogs
   } catch (error) {
-    console.error('[updater] Manual check failed:', error)
+    log.error('Manual check failed:', error)
     dialog.showMessageBox({
       type: 'error',
       title: 'Update Check Failed',

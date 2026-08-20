@@ -1,5 +1,3 @@
-'use client'
-
 import * as React from 'react'
 import { ChevronDown, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -24,8 +22,9 @@ interface SelectProps {
 }
 
 function Select({ value, onValueChange, children }: SelectProps) {
+  const contextValue = React.useMemo(() => ({ value, onValueChange }), [value, onValueChange])
   return (
-    <SelectContext.Provider value={{ value, onValueChange }}>
+    <SelectContext.Provider value={contextValue}>
       <DropdownMenu>{children}</DropdownMenu>
     </SelectContext.Provider>
   )

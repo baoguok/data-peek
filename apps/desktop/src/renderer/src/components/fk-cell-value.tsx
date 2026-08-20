@@ -1,9 +1,7 @@
-'use client'
-
 import * as React from 'react'
 import { ExternalLink } from 'lucide-react'
 import type { ForeignKeyInfo } from '@data-peek/shared'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger, keys } from '@data-peek/ui'
 
 interface FKCellValueProps {
   value: unknown
@@ -42,6 +40,7 @@ export function FKCellValue({
       <Tooltip>
         <TooltipTrigger asChild>
           <button
+            type="button"
             onClick={handleClick}
             className="group flex items-center gap-1 text-left text-blue-400 hover:text-blue-300 hover:underline cursor-pointer font-mono text-xs px-1 -mx-1 rounded transition-colors"
           >
@@ -53,7 +52,7 @@ export function FKCellValue({
           <div className="space-y-1">
             <p className="text-xs font-medium">View in {foreignKey.referencedTable}</p>
             <p className="text-[10px] text-muted-foreground">
-              Click to open panel, ⌘+Click for new tab
+              Click to open panel, {keys.mod}+Click for new tab
             </p>
             <pre className="text-xs text-muted-foreground font-mono mt-1">{stringValue}</pre>
           </div>

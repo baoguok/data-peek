@@ -1,11 +1,94 @@
-// ============================================
-// AI Types - Shared across main and renderer
-// ============================================
+export type {
+  Notebook,
+  NotebookCell,
+  PinnedResult,
+  NotebookWithCells,
+  CreateNotebookInput,
+  UpdateNotebookInput,
+  AddCellInput,
+  UpdateCellInput,
+} from "./notebook-types";
+export { MAX_PINNED_ROWS } from "./notebook-types";
+export { PG_TYPE_MAP, resolvePostgresType } from "./type-maps";
+export {
+  escapeSQLValue,
+  escapeSQLIdentifier,
+  isSQLKeyword,
+  type SQLDialect,
+} from "./sql-escape";
+
+/**
+ * Base URL for the data-peek website
+ */
+export const DATAPEEK_BASE_URL = "https://www.datapeek.dev";
+
+/**
+ * Marketing-site path for purchasing a license.
+ * Must match a real page in apps/web — shipped desktop builds link here directly.
+ */
+export const LICENSE_PURCHASE_PATH = "/pricing";
+
+/**
+ * Marketing-site path for managing an existing license.
+ * There is no standalone dashboard page yet; the site redirects this to the home page.
+ */
+export const LICENSE_DASHBOARD_PATH = "/dashboard";
+
+/**
+ * UTM parameters for tracking
+ */
+export interface UTMParams {
+  source?: string;
+  medium?: string;
+  campaign?: string;
+  content?: string;
+}
+
+/**
+ * Build a URL with UTM tracking parameters
+ */
+export function buildTrackingUrl(path: string, utm: UTMParams = {}): string {
+  const params = new URLSearchParams();
+
+  if (utm.source) params.set("utm_source", utm.source);
+  if (utm.medium) params.set("utm_medium", utm.medium);
+  if (utm.campaign) params.set("utm_campaign", utm.campaign);
+  if (utm.content) params.set("utm_content", utm.content);
+
+  const queryString = params.toString();
+
+  // Query params must be inserted before any hash fragment:
+  // "/#pricing" → "/?utm_source=…#pricing", not "/#pricing?utm_source=…"
+  const hashIndex = path.indexOf("#");
+  const basePath = hashIndex === -1 ? path : path.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : path.slice(hashIndex);
+  const separator = basePath.includes("?") ? "&" : "?";
+
+  return `${DATAPEEK_BASE_URL}${basePath}${queryString ? separator + queryString : ""}${hash}`;
+}
 
 /**
  * Supported AI providers
  */
-export type AIProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'ollama';
+export type AIProvider =
+  | "openai"
+  | "anthropic"
+  | "google"
+  | "groq"
+  | "deepseek"
+  | "mistral"
+  | "xai"
+  | "glm"
+  | "ollama"
+  // Bring-your-own-harness: drives the user's locally installed `claude` CLI,
+  // which owns its own auth (subscription or key). No API key stored by data-peek.
+  | "claude-cli"
+  // Bring-your-own-harness: drives the user's locally installed `codex` CLI,
+  // which owns its own auth (ChatGPT sign-in or key). No API key stored by data-peek.
+  | "codex-cli"
+  // Bring-your-own-harness: drives the user's locally installed `agy` CLI
+  // (Google Antigravity), which owns its own auth. No API key stored by data-peek.
+  | "antigravity-cli";
 
 /**
  * Configuration for AI service
@@ -18,85 +101,479 @@ export interface AIConfig {
 }
 
 /**
+ * Configuration for a single AI provider (API key and optional base URL)
+ */
+export interface AIProviderConfig {
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+/**
+ * Map of provider ID to provider configuration
+ */
+export type AIProviderConfigs = Partial<Record<AIProvider, AIProviderConfig>>;
+
+/**
+ * Multi-provider AI configuration
+ * Stores API keys for all providers and tracks active provider/model
+ */
+export interface AIMultiProviderConfig {
+  /** API keys and base URLs for each provider */
+  providers: AIProviderConfigs;
+  /** Currently active provider */
+  activeProvider: AIProvider;
+  /** Currently selected model for each provider */
+  activeModels: Partial<Record<AIProvider, string>>;
+}
+
+/**
+ * Provider model information for UI display
+ */
+export interface ProviderModel {
+  id: string;
+  name: string;
+  recommended?: boolean;
+  description?: string;
+}
+
+/**
+ * Provider configuration for UI display
+ */
+export interface ProviderInfo {
+  id: AIProvider;
+  name: string;
+  description: string;
+  keyPrefix: string | null;
+  keyUrl: string;
+  models: ProviderModel[];
+}
+
+/**
+ * Available AI providers with their models
+ * This is the single source of truth for provider and model information
+ */
+export const AI_PROVIDERS: readonly ProviderInfo[] = [
+  {
+    id: "openai",
+    name: "OpenAI",
+    description: "GPT-5.1 Codex, GPT-5.1 Mini/Nano, GPT-4o",
+    keyPrefix: "sk-",
+    keyUrl: "https://platform.openai.com/api-keys",
+    models: [
+      {
+        id: "gpt-5.1-codex",
+        name: "GPT-5.1 Codex",
+        recommended: true,
+        description: "Best for SQL & code",
+      },
+      { id: "gpt-5.1", name: "GPT-5.1", description: "Most capable" },
+      {
+        id: "gpt-5.1-codex-mini",
+        name: "GPT-5.1 Codex Mini",
+        description: "Balanced",
+      },
+      { id: "gpt-5-nano", name: "GPT-5 Nano", description: "Fast & efficient" },
+      { id: "gpt-4o", name: "GPT-4o", description: "Previous gen" },
+      {
+        id: "gpt-4o-mini",
+        name: "GPT-4o Mini",
+        description: "Faster & cheaper",
+      },
+    ],
+  },
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    description: "Claude Sonnet 4.5, Claude Opus 4.5",
+    keyPrefix: "sk-ant-",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+    models: [
+      {
+        id: "claude-sonnet-4-5",
+        name: "Claude Sonnet 4.5",
+        recommended: true,
+        description: "Balanced",
+      },
+      {
+        id: "claude-opus-4-5",
+        name: "Claude Opus 4.5",
+        description: "Best for coding",
+      },
+      {
+        id: "claude-haiku-4-5",
+        name: "Claude 4.5 Haiku",
+        description: "Faster & cheaper",
+      },
+    ],
+  },
+  {
+    id: "google",
+    name: "Google",
+    description: "Gemini 3, Gemini 2.5",
+    keyPrefix: "AI",
+    keyUrl: "https://aistudio.google.com/app/apikey",
+    models: [
+      {
+        id: "gemini-3-pro-preview",
+        name: "Gemini 3 Pro",
+        recommended: true,
+        description: "Most capable",
+      },
+      { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", description: "Balanced" },
+      {
+        id: "gemini-2.5-flash",
+        name: "Gemini 2.5 Flash",
+        description: "Faster",
+      },
+      {
+        id: "gemini-2.0-flash",
+        name: "Gemini 2.0 Flash",
+        description: "Previous gen",
+      },
+    ],
+  },
+  {
+    id: "groq",
+    name: "Groq",
+    description: "Llama 3.3, Mixtral (Ultra Fast)",
+    keyPrefix: "gsk_",
+    keyUrl: "https://console.groq.com/keys",
+    models: [
+      {
+        id: "llama-3.3-70b-versatile",
+        name: "Llama 3.3 70B",
+        recommended: true,
+      },
+      {
+        id: "llama-3.1-8b-instant",
+        name: "Llama 3.1 8B",
+        description: "Fastest",
+      },
+      { id: "mixtral-8x7b-32768", name: "Mixtral 8x7B" },
+      { id: "qwen-qwq-32b", name: "Qwen QwQ 32B", description: "Reasoning" },
+    ],
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    description: "DeepSeek V3, DeepSeek R1 (Reasoning)",
+    keyPrefix: "sk-",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+    models: [
+      {
+        id: "deepseek-chat",
+        name: "DeepSeek V3",
+        recommended: true,
+        description: "Best for SQL & code",
+      },
+      {
+        id: "deepseek-reasoner",
+        name: "DeepSeek R1",
+        description: "Reasoning model",
+      },
+    ],
+  },
+  {
+    id: "mistral",
+    name: "Mistral",
+    description: "Mistral Large, Codestral",
+    keyPrefix: null,
+    keyUrl: "https://console.mistral.ai/api-keys",
+    models: [
+      {
+        id: "mistral-large-latest",
+        name: "Mistral Large",
+        recommended: true,
+        description: "Most capable",
+      },
+      {
+        id: "codestral-latest",
+        name: "Codestral",
+        description: "Best for code",
+      },
+      {
+        id: "mistral-small-latest",
+        name: "Mistral Small",
+        description: "Fast & efficient",
+      },
+    ],
+  },
+  {
+    id: "xai",
+    name: "xAI",
+    description: "Grok-3, Grok-3 Mini",
+    keyPrefix: "xai-",
+    keyUrl: "https://console.x.ai",
+    models: [
+      {
+        id: "grok-3",
+        name: "Grok-3",
+        recommended: true,
+        description: "Most capable",
+      },
+      {
+        id: "grok-3-mini",
+        name: "Grok-3 Mini",
+        description: "Fast & efficient",
+      },
+      { id: "grok-2", name: "Grok-2", description: "Previous gen" },
+    ],
+  },
+  {
+    id: "glm",
+    name: "GLM",
+    description: "ChatGLM-4 Plus, Flash (Zhipu AI)",
+    keyPrefix: null,
+    keyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
+    models: [
+      {
+        id: "glm-4-plus",
+        name: "GLM-4 Plus",
+        recommended: true,
+        description: "Most capable",
+      },
+      {
+        id: "glm-4-flash",
+        name: "GLM-4 Flash",
+        description: "Fast & efficient",
+      },
+      {
+        id: "glm-4-long",
+        name: "GLM-4 Long",
+        description: "Long context",
+      },
+    ],
+  },
+  {
+    id: "ollama",
+    name: "Ollama",
+    description: "Local models (no API key)",
+    keyPrefix: null,
+    keyUrl: "https://ollama.ai",
+    models: [
+      { id: "llama3.2", name: "Llama 3.2", recommended: true },
+      {
+        id: "qwen2.5-coder:32b",
+        name: "Qwen 2.5 Coder 32B",
+        description: "Best for SQL",
+      },
+      { id: "codellama", name: "Code Llama" },
+      { id: "mistral", name: "Mistral" },
+      { id: "deepseek-coder-v2", name: "DeepSeek Coder V2" },
+    ],
+  },
+  {
+    id: "claude-cli",
+    name: "Claude Code (local CLI)",
+    description: "Uses your installed `claude` CLI — no API key stored here",
+    keyPrefix: null,
+    keyUrl: "https://docs.claude.com/en/docs/claude-code/setup",
+    models: [
+      { id: "sonnet", name: "Claude Sonnet", recommended: true },
+      { id: "opus", name: "Claude Opus", description: "Most capable" },
+      { id: "haiku", name: "Claude Haiku", description: "Fast & cheap" },
+    ],
+  },
+  {
+    id: "codex-cli",
+    name: "Codex (local CLI)",
+    description: "Uses your installed `codex` CLI — no API key stored here",
+    keyPrefix: null,
+    keyUrl: "https://developers.openai.com/codex/cli",
+    models: [
+      {
+        id: "default",
+        name: "Codex CLI default",
+        recommended: true,
+        description: "Whatever your codex config uses",
+      },
+      { id: "gpt-5.1-codex", name: "GPT-5.1 Codex" },
+      { id: "gpt-5.1-codex-mini", name: "GPT-5.1 Codex Mini", description: "Fast & cheap" },
+    ],
+  },
+  {
+    id: "antigravity-cli",
+    name: "Antigravity (local CLI)",
+    description: "Uses your installed `agy` CLI — no API key stored here",
+    keyPrefix: null,
+    keyUrl: "https://antigravity.google",
+    models: [
+      {
+        id: "default",
+        name: "Antigravity CLI default",
+        recommended: true,
+        description: "Whatever your agy config uses",
+      },
+    ],
+  },
+] as const;
+
+/**
+ * Helper function to get the recommended model ID for a provider
+ * Falls back to the first model if no recommended model is found
+ */
+function getRecommendedModel(providerId: AIProvider): string {
+  const provider = AI_PROVIDERS.find((p) => p.id === providerId);
+  if (!provider) {
+    throw new Error(`Provider ${providerId} not found in AI_PROVIDERS`);
+  }
+  // Prefer recommended model, fall back to first model
+  const recommendedModel =
+    provider.models.find((m) => m.recommended) || provider.models[0];
+  if (!recommendedModel) {
+    throw new Error(`No models found for provider ${providerId}`);
+  }
+  return recommendedModel.id;
+}
+
+/**
+ * Default model for each AI provider
+ * Derived from AI_PROVIDERS - uses the recommended model for each provider
+ */
+export const DEFAULT_MODELS: Record<AIProvider, string> = {
+  openai: getRecommendedModel("openai"),
+  anthropic: getRecommendedModel("anthropic"),
+  google: getRecommendedModel("google"),
+  groq: getRecommendedModel("groq"),
+  deepseek: getRecommendedModel("deepseek"),
+  mistral: getRecommendedModel("mistral"),
+  xai: getRecommendedModel("xai"),
+  glm: getRecommendedModel("glm"),
+  ollama: getRecommendedModel("ollama"),
+  "claude-cli": getRecommendedModel("claude-cli"),
+  "codex-cli": getRecommendedModel("codex-cli"),
+  "antigravity-cli": getRecommendedModel("antigravity-cli"),
+};
+
+/**
+ * Providers that run locally and need no API key stored by data-peek:
+ * ollama talks to localhost; the BYOH harnesses drive the user's own authed CLIs.
+ */
+const KEYLESS_AI_PROVIDERS: ReadonlySet<AIProvider> = new Set([
+  "ollama",
+  "claude-cli",
+  "codex-cli",
+  "antigravity-cli",
+]);
+
+export function providerNeedsKey(provider: AIProvider): boolean {
+  return !KEYLESS_AI_PROVIDERS.has(provider);
+}
+
+/**
+ * BYOH providers: instead of an AI SDK client, data-peek shells out to the
+ * user's own locally installed, locally authenticated CLI.
+ */
+const HARNESS_AI_PROVIDERS: ReadonlySet<AIProvider> = new Set([
+  "claude-cli",
+  "codex-cli",
+  "antigravity-cli",
+]);
+
+export function isHarnessProvider(provider: AIProvider): boolean {
+  return HARNESS_AI_PROVIDERS.has(provider);
+}
+
+// Verbs that mutate data/schema or have side effects. Word-boundary matched, so
+// substrings like "lock_events" or "created_at" don't trip it.
+const SQL_WRITE_KEYWORDS =
+  /\b(insert|update|delete|merge|upsert|drop|alter|create|truncate|grant|revoke|vacuum|analyze|reindex|cluster|refresh|lock|comment|rename|exec|execute|call|do|copy|into|set|reset|discard|prepare|deallocate|listen|unlisten|notify|checkpoint|begin|commit|rollback|savepoint|security)\b/i;
+const SQL_READ_FIRST = /^\(*\s*(select|with|show|explain|describe|desc|table|values)\b/i;
+
+/**
+ * Conservative "is this a single read-only statement?" check used before the app
+ * auto-runs or pins AI-generated SQL. Strips comments and string/identifier
+ * literals, rejects anything with more than one statement (so `SELECT 1; DROP …`
+ * can't slip through), requires a leading read keyword, and rejects any write /
+ * DDL / side-effecting verb. Deliberately errs toward false (better to make the
+ * user click Run than to auto-execute something mutating).
+ */
+export function isReadOnlySql(sql: string): boolean {
+  const stripped = sql
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/"(?:[^"]|"")*"/g, '""');
+  // Single statement only — drop a lone trailing semicolon, then reject any more.
+  const body = stripped.trim().replace(/;\s*$/, "");
+  if (!body || body.includes(";")) return false;
+  return SQL_READ_FIRST.test(body) && !SQL_WRITE_KEYWORDS.test(body);
+}
+
+/**
  * AI message for chat conversations
  */
 export interface AIMessage {
-  role: 'user' | 'assistant' | 'system';
+  role: "user" | "assistant" | "system";
   content: string;
 }
 
 /**
  * AI response types for structured output
  */
-export type AIResponseType = 'message' | 'query' | 'chart' | 'metric' | 'schema';
+export type AIResponseType =
+  | "message"
+  | "query"
+  | "chart"
+  | "metric"
+  | "schema"
+  | "report";
 
-/**
- * AI response for SQL queries
- */
-export interface AIQueryResponse {
-  type: 'query';
-  message: string;
-  sql: string;
-  explanation: string;
-  warning?: string;
-}
-
-/**
- * AI response for chart visualizations
- */
-export interface AIChartResponse {
-  type: 'chart';
-  message: string;
+/** One widget in a multi-widget chat "report" (a mini inline dashboard). */
+export interface AIReportWidget {
   title: string;
-  description?: string;
-  chartType: 'bar' | 'line' | 'pie' | 'area';
+  kind: "kpi" | "chart" | "table";
   sql: string;
-  xKey: string;
-  yKeys: string[];
+  chartType?: "bar" | "line" | "pie" | "area" | null;
+  format?: "number" | "currency" | "percent" | "duration" | null;
+  xKey?: string | null;
+  yKeys?: string[] | null;
 }
 
 /**
- * AI response for metric cards
+ * AI structured response - flat object with nullable fields.
+ * Using flat structure instead of discriminated union for AI provider compatibility.
+ * Check the 'type' field to determine which fields are populated.
  */
-export interface AIMetricResponse {
-  type: 'metric';
+export interface AIStructuredResponse {
+  type: AIResponseType;
   message: string;
-  label: string;
-  sql: string;
-  format: 'number' | 'currency' | 'percent' | 'duration';
+  // Query fields (null when type is not query)
+  sql: string | null;
+  explanation: string | null;
+  warning: string | null;
+  /** If true, query should NOT be auto-executed (UPDATE/DELETE operations) */
+  requiresConfirmation: boolean | null;
+  // Chart fields (null when type is not chart)
+  title: string | null;
+  description: string | null;
+  chartType: "bar" | "line" | "pie" | "area" | null;
+  xKey: string | null;
+  yKeys: string[] | null;
+  // Metric fields (null when type is not metric)
+  label: string | null;
+  format: "number" | "currency" | "percent" | "duration" | null;
+  // Schema fields (null when type is not schema)
+  tables: string[] | null;
+  // Report fields (null when type is not report): a small set of widgets.
+  widgets: AIReportWidget[] | null;
+  // 2–3 short follow-up prompts the user might ask next (any type). null when none.
+  suggestions: string[] | null;
 }
-
-/**
- * AI response for schema explanations
- */
-export interface AISchemaResponse {
-  type: 'schema';
-  message: string;
-  tables: string[];
-}
-
-/**
- * AI response for general messages
- */
-export interface AIMessageResponse {
-  type: 'message';
-  message: string;
-}
-
-/**
- * Union type for all AI structured responses
- */
-export type AIStructuredResponse =
-  | AIQueryResponse
-  | AIChartResponse
-  | AIMetricResponse
-  | AISchemaResponse
-  | AIMessageResponse;
 
 /**
  * Alias for AIChatResponse (same as AIStructuredResponse)
  */
 export type AIChatResponse = AIStructuredResponse;
+
+/**
+ * Incremental event pushed from a streaming chat run (BYOH `stream-json`).
+ * `message` carries the assistant's prose as it is written; `activity` is a
+ * short human label for a live grounding/tool step (e.g. "Running query…").
+ */
+export type AIChatStreamEvent =
+  | { type: "message"; text: string }
+  | { type: "activity"; label: string };
 
 // Stored response data types (without message field since it's in content)
 
@@ -104,7 +581,7 @@ export type AIChatResponse = AIStructuredResponse;
  * Stored query data for persistence
  */
 export interface StoredQueryData {
-  type: 'query';
+  type: "query";
   sql: string;
   explanation: string;
   warning?: string;
@@ -114,10 +591,10 @@ export interface StoredQueryData {
  * Stored chart data for persistence
  */
 export interface StoredChartData {
-  type: 'chart';
+  type: "chart";
   title: string;
   description?: string;
-  chartType: 'bar' | 'line' | 'pie' | 'area';
+  chartType: "bar" | "line" | "pie" | "area";
   sql: string;
   xKey: string;
   yKeys: string[];
@@ -127,17 +604,17 @@ export interface StoredChartData {
  * Stored metric data for persistence
  */
 export interface StoredMetricData {
-  type: 'metric';
+  type: "metric";
   label: string;
   sql: string;
-  format: 'number' | 'currency' | 'percent' | 'duration';
+  format: "number" | "currency" | "percent" | "duration";
 }
 
 /**
  * Stored schema data for persistence
  */
 export interface StoredSchemaData {
-  type: 'schema';
+  type: "schema";
   tables: string[];
 }
 
@@ -156,7 +633,7 @@ export type StoredResponseData =
  */
 export interface StoredChatMessage {
   id: string;
-  role: 'user' | 'assistant' | 'system';
+  role: "user" | "assistant" | "system";
   content: string;
   responseData?: StoredResponseData;
   createdAt: string; // ISO string for storage
@@ -173,15 +650,48 @@ export interface ChatSession {
   updatedAt: string; // ISO string
 }
 
-// ============================================
-// Connection Types
-// ============================================
+/**
+ * SQLite connection mode (local file only)
+ */
+export type SQLiteMode = "local";
+
+/**
+ * SQLite-specific connection options
+ */
+export interface SQLiteConnectionOptions {
+  /** Connection mode: local file */
+  mode: SQLiteMode;
+}
+
+/**
+ * SSL/TLS connection options for PostgreSQL and MySQL
+ * Allows configuration of certificate verification behavior
+ */
+export interface SSLConnectionOptions {
+  /**
+   * If true, the server certificate is verified against the list of supplied CAs.
+   * Set to false to allow connections to servers with self-signed certificates
+   * or when connecting through VPN to cloud databases (like AWS RDS).
+   * Default: true
+   */
+  rejectUnauthorized?: boolean;
+  /**
+   * Optional path to CA certificate file (PEM format)
+   * Use this when connecting to a server with a certificate signed by a private CA
+   */
+  ca?: string;
+}
 
 /**
  * MSSQL-specific connection options
  */
 export interface MSSQLConnectionOptions {
-  authentication?: 'SQL Server Authentication' | 'ActiveDirectoryIntegrated' | 'ActiveDirectoryPassword' | 'ActiveDirectoryServicePrincipal' | 'ActiveDirectoryDeviceCodeFlow';
+  authentication?:
+    | "SQL Server Authentication"
+    | "ActiveDirectoryIntegrated"
+    | "ActiveDirectoryPassword"
+    | "ActiveDirectoryServicePrincipal"
+    | "ActiveDirectoryDeviceCodeFlow";
   encrypt?: boolean;
   trustServerCertificate?: boolean;
   enableArithAbort?: boolean;
@@ -194,24 +704,61 @@ export interface MSSQLConnectionOptions {
   };
 }
 
+export type EnvironmentPreset =
+  | "production"
+  | "staging"
+  | "uat"
+  | "development"
+  | "local";
+
+export type ConnectionEnvironment =
+  | { preset: EnvironmentPreset }
+  | { preset: "custom"; customLabel: string; customColor: string };
+
 export interface ConnectionConfig {
   id: string;
   name: string;
   host: string;
   port: number;
   database: string;
+  /**
+   * Default schema (PostgreSQL only). Pins `search_path` for every connection
+   * in the pool and pre-focuses the schema explorer. Accepts a comma-separated
+   * list to set a fallback chain (e.g. `"bbl, public"`). Empty/absent leaves the
+   * server default (`"$user", public`) untouched.
+   */
+  schema?: string;
   user?: string; // Optional for MSSQL with Azure AD authentication
   password?: string;
   ssl?: boolean;
+  ssh?: boolean;
   dbType: DatabaseType;
+  dstPort: number;
+  sshConfig?: SSHConfig;
+  /** SSL/TLS options for PostgreSQL and MySQL (only used when ssl is true) */
+  sslOptions?: SSLConnectionOptions;
   /** MSSQL-specific connection options (only used when dbType is 'mssql') */
   mssqlOptions?: MSSQLConnectionOptions;
+  /** SQLite-specific connection options (only used when dbType is 'sqlite') */
+  sqliteOptions?: SQLiteConnectionOptions;
+  environment?: ConnectionEnvironment;
+}
+
+export interface SSHConfig {
+  host: string;
+  port: number;
+  user: string;
+  password?: string;
+  passphrase?: string;
+  localport?: number;
+  authMethod: SSHAuthenticationMethod;
+  privateKeyPath: string;
 }
 
 /**
  * Supported database types
  */
-export type DatabaseType = 'postgresql' | 'mysql' | 'sqlite' | 'mssql';
+export type DatabaseType = "postgresql" | "mysql" | "sqlite" | "mssql";
 
 /**
  * Field metadata from query results
@@ -272,10 +819,6 @@ export interface IpcResponse<T> {
   error?: string;
 }
 
-// ============================================
-// Schema Types - Shared across all DB adapters
-// ============================================
-
 /**
  * Foreign key relationship metadata
  */
@@ -304,6 +847,8 @@ export interface ColumnInfo {
   ordinalPosition: number;
   /** Foreign key relationship (if this column references another table) */
   foreignKey?: ForeignKeyInfo;
+  /** Enum values (if this column is an enum type) */
+  enumValues?: string[];
 }
 
 /**
@@ -311,10 +856,67 @@ export interface ColumnInfo {
  */
 export interface TableInfo {
   name: string;
-  type: 'table' | 'view';
+  type: "table" | "view" | "materialized_view";
   columns: ColumnInfo[];
   /** Estimated row count (if available) */
   estimatedRowCount?: number;
+}
+
+/**
+ * Parameter metadata for a routine (function/procedure)
+ */
+export interface RoutineParameterInfo {
+  name: string;
+  dataType: string;
+  /** Parameter mode: IN, OUT, INOUT */
+  mode: "IN" | "OUT" | "INOUT";
+  /** Default value (if any) */
+  defaultValue?: string;
+  /** Position in parameter list (1-indexed) */
+  ordinalPosition: number;
+}
+
+/**
+ * Stored procedure or function metadata
+ */
+export interface RoutineInfo {
+  name: string;
+  type: "function" | "procedure";
+  /** Return type (for functions) */
+  returnType?: string;
+  /** Parameters */
+  parameters: RoutineParameterInfo[];
+  /** Language the routine is written in (e.g., 'plpgsql', 'sql') */
+  language?: string;
+  /** Whether the function is deterministic (IMMUTABLE/STABLE/VOLATILE) */
+  volatility?: "IMMUTABLE" | "STABLE" | "VOLATILE";
+  /** Brief description/comment */
+  comment?: string;
+}
+
+/**
+ * Database trigger metadata
+ */
+export interface TriggerInfo {
+  name: string;
+  /** Schema of the table the trigger belongs to */
+  schema: string;
+  /** Table the trigger is attached to */
+  table: string;
+  /** When the trigger fires relative to the event */
+  timing: "BEFORE" | "AFTER" | "INSTEAD OF";
+  /** Events that fire the trigger (INSERT, UPDATE, DELETE, TRUNCATE) */
+  events: string[];
+  /** Whether the trigger fires per row or per statement */
+  orientation?: "ROW" | "STATEMENT";
+  /** Whether the trigger is currently enabled */
+  enabled: boolean;
+  /** Function/procedure invoked by the trigger (PostgreSQL) */
+  functionName?: string;
+  /** Optional WHEN condition that gates the trigger */
+  condition?: string;
+  /** Full CREATE TRIGGER definition (for viewing and altering) */
+  definition: string;
 }
 
 /**
@@ -324,6 +926,10 @@ export interface TableInfo {
 export interface SchemaInfo {
   name: string;
   tables: TableInfo[];
+  /** Stored procedures and functions */
+  routines?: RoutineInfo[];
+  /** Table triggers */
+  triggers?: TriggerInfo[];
 }
 
 /**
@@ -335,9 +941,20 @@ export interface DatabaseSchema {
   fetchedAt: number;
 }
 
-// ============================================
-// Edit Operation Types - Database Agnostic
-// ============================================
+/**
+ * Extended database schema response with cache metadata
+ * Used for IPC communication between main and renderer processes
+ */
+export interface DatabaseSchemaResponse extends DatabaseSchema {
+  /** Custom database types (enums, composites, etc.) */
+  customTypes?: CustomTypeInfo[];
+  /** Whether the response was served from cache */
+  fromCache?: boolean;
+  /** Whether the cached data is stale (past TTL but still usable) */
+  stale?: boolean;
+  /** Error message if background refresh failed */
+  refreshError?: string;
+}
 
 /**
  * Represents a single cell change
@@ -363,7 +980,7 @@ export interface PrimaryKeyValue {
  * Represents a row modification (UPDATE)
  */
 export interface RowUpdate {
-  type: 'update';
+  type: "update";
   /** Unique identifier for this change (client-side) */
   id: string;
   /** Primary key(s) to identify the row */
@@ -378,7 +995,7 @@ export interface RowUpdate {
  * Represents a row insertion (INSERT)
  */
 export interface RowInsert {
-  type: 'insert';
+  type: "insert";
   /** Unique identifier for this change (client-side) */
   id: string;
   /** New row data */
@@ -391,7 +1008,7 @@ export interface RowInsert {
  * Represents a row deletion (DELETE)
  */
 export interface RowDelete {
-  type: 'delete';
+  type: "delete";
   /** Unique identifier for this change (client-side) */
   id: string;
   /** Primary key(s) to identify the row */
@@ -423,6 +1040,7 @@ export interface EditContext {
 export interface EditBatch {
   context: EditContext;
   operations: EditOperation[];
+  sessionId?: string;
 }
 
 /**
@@ -449,54 +1067,50 @@ export interface ParameterizedQuery {
   params: unknown[];
 }
 
-// ============================================
-// DDL Types - Table Designer
-// ============================================
-
 /**
  * PostgreSQL data types for the type selector dropdown
  */
 export type PostgresDataType =
-  | 'smallint'
-  | 'integer'
-  | 'bigint'
-  | 'serial'
-  | 'bigserial'
-  | 'numeric'
-  | 'real'
-  | 'double precision'
-  | 'money'
-  | 'char'
-  | 'varchar'
-  | 'text'
-  | 'bytea'
-  | 'timestamp'
-  | 'timestamptz'
-  | 'date'
-  | 'time'
-  | 'timetz'
-  | 'interval'
-  | 'boolean'
-  | 'uuid'
-  | 'json'
-  | 'jsonb'
-  | 'xml'
-  | 'point'
-  | 'line'
-  | 'lseg'
-  | 'box'
-  | 'path'
-  | 'polygon'
-  | 'circle'
-  | 'cidr'
-  | 'inet'
-  | 'macaddr'
-  | 'int4range'
-  | 'int8range'
-  | 'numrange'
-  | 'tsrange'
-  | 'tstzrange'
-  | 'daterange';
+  | "smallint"
+  | "integer"
+  | "bigint"
+  | "serial"
+  | "bigserial"
+  | "numeric"
+  | "real"
+  | "double precision"
+  | "money"
+  | "char"
+  | "varchar"
+  | "text"
+  | "bytea"
+  | "timestamp"
+  | "timestamptz"
+  | "date"
+  | "time"
+  | "timetz"
+  | "interval"
+  | "boolean"
+  | "uuid"
+  | "json"
+  | "jsonb"
+  | "xml"
+  | "point"
+  | "line"
+  | "lseg"
+  | "box"
+  | "path"
+  | "polygon"
+  | "circle"
+  | "cidr"
+  | "inet"
+  | "macaddr"
+  | "int4range"
+  | "int8range"
+  | "numrange"
+  | "tsrange"
+  | "tstzrange"
+  | "daterange";
 
 /**
  * Column definition for table designer
@@ -524,7 +1138,7 @@ export interface ColumnDefinition {
   /** Default value expression */
   defaultValue?: string;
   /** Type of default value */
-  defaultType?: 'value' | 'expression' | 'sequence';
+  defaultType?: "value" | "expression" | "sequence";
   /** Sequence name for nextval('sequence') */
   sequenceName?: string;
   /** Column-level CHECK constraint expression */
@@ -541,26 +1155,26 @@ export interface ColumnDefinition {
  * Constraint types supported by PostgreSQL
  */
 export type ConstraintType =
-  | 'primary_key'
-  | 'foreign_key'
-  | 'unique'
-  | 'check'
-  | 'exclude';
+  | "primary_key"
+  | "foreign_key"
+  | "unique"
+  | "check"
+  | "exclude";
 
 /**
  * Foreign key referential actions
  */
 export type ReferentialAction =
-  | 'NO ACTION'
-  | 'RESTRICT'
-  | 'CASCADE'
-  | 'SET NULL'
-  | 'SET DEFAULT';
+  | "NO ACTION"
+  | "RESTRICT"
+  | "CASCADE"
+  | "SET NULL"
+  | "SET DEFAULT";
 
 /**
  * Index access methods
  */
-export type IndexMethod = 'btree' | 'hash' | 'gist' | 'gin' | 'spgist' | 'brin';
+export type IndexMethod = "btree" | "hash" | "gist" | "gin" | "spgist" | "brin";
 
 /**
  * Constraint definition for table designer
@@ -602,9 +1216,9 @@ export interface IndexColumn {
   /** Column name or expression */
   name: string;
   /** Sort order */
-  order?: 'ASC' | 'DESC';
+  order?: "ASC" | "DESC";
   /** NULLS position */
-  nullsPosition?: 'FIRST' | 'LAST';
+  nullsPosition?: "FIRST" | "LAST";
 }
 
 /**
@@ -632,7 +1246,7 @@ export interface IndexDefinition {
 /**
  * Table partitioning strategy
  */
-export type PartitionType = 'RANGE' | 'LIST' | 'HASH';
+export type PartitionType = "RANGE" | "LIST" | "HASH";
 
 /**
  * Partition definition for partitioned tables
@@ -672,38 +1286,39 @@ export interface TableDefinition {
   unlogged?: boolean;
 }
 
-// ============================================
-// ALTER TABLE Operation Types
-// ============================================
-
 /**
  * Column-level ALTER TABLE operations
  */
 export type AlterColumnOperation =
-  | { type: 'add'; column: ColumnDefinition }
-  | { type: 'drop'; columnName: string; cascade?: boolean }
-  | { type: 'rename'; oldName: string; newName: string }
-  | { type: 'set_type'; columnName: string; newType: string; using?: string }
-  | { type: 'set_nullable'; columnName: string; nullable: boolean }
-  | { type: 'set_default'; columnName: string; defaultValue: string | null }
-  | { type: 'set_comment'; columnName: string; comment: string | null };
+  | { type: "add"; column: ColumnDefinition }
+  | { type: "drop"; columnName: string; cascade?: boolean }
+  | { type: "rename"; oldName: string; newName: string }
+  | { type: "set_type"; columnName: string; newType: string; using?: string }
+  | { type: "set_nullable"; columnName: string; nullable: boolean }
+  | { type: "set_default"; columnName: string; defaultValue: string | null }
+  | { type: "set_comment"; columnName: string; comment: string | null };
 
 /**
  * Constraint-level ALTER TABLE operations
  */
 export type AlterConstraintOperation =
-  | { type: 'add_constraint'; constraint: ConstraintDefinition }
-  | { type: 'drop_constraint'; name: string; cascade?: boolean }
-  | { type: 'rename_constraint'; oldName: string; newName: string };
+  | { type: "add_constraint"; constraint: ConstraintDefinition }
+  | { type: "drop_constraint"; name: string; cascade?: boolean }
+  | { type: "rename_constraint"; oldName: string; newName: string };
 
 /**
  * Index ALTER operations
  */
 export type AlterIndexOperation =
-  | { type: 'create_index'; index: IndexDefinition }
-  | { type: 'drop_index'; name: string; cascade?: boolean; concurrent?: boolean }
-  | { type: 'rename_index'; oldName: string; newName: string }
-  | { type: 'reindex'; name: string; concurrent?: boolean };
+  | { type: "create_index"; index: IndexDefinition }
+  | {
+      type: "drop_index";
+      name: string;
+      cascade?: boolean;
+      concurrent?: boolean;
+    }
+  | { type: "rename_index"; oldName: string; newName: string }
+  | { type: "reindex"; name: string; concurrent?: boolean };
 
 /**
  * Batch of ALTER TABLE operations to execute
@@ -728,6 +1343,214 @@ export interface AlterTableBatch {
 }
 
 /**
+ * Format a column's SQL data type with length / precision / scale / array
+ * modifiers. Shared by CREATE (ddl-builder) and the ALTER diff below so both
+ * agree on exactly what a column's type string looks like.
+ */
+export function formatColumnType(column: ColumnDefinition): string {
+  let dataType = column.dataType;
+  if (
+    (dataType === "varchar" || dataType === "char") &&
+    column.length !== undefined
+  ) {
+    dataType = `${dataType}(${column.length})`;
+  }
+  if (dataType === "numeric" && column.precision !== undefined) {
+    dataType =
+      column.scale !== undefined
+        ? `numeric(${column.precision},${column.scale})`
+        : `numeric(${column.precision})`;
+  }
+  if (column.isArray) dataType = `${dataType}[]`;
+  return dataType;
+}
+
+// Stable signature of a column's default so an unchanged default never produces
+// a spurious ALTER — compares the raw fields, not a rendered SQL string.
+function columnDefaultSignature(c: ColumnDefinition): string {
+  return JSON.stringify([
+    c.defaultValue ?? null,
+    c.defaultType ?? null,
+    c.sequenceName ?? null
+  ]);
+}
+
+// The SQL expression to feed a SET DEFAULT, or null for DROP DEFAULT.
+function columnDefaultSql(c: ColumnDefinition): string | null {
+  if (c.defaultValue === undefined || c.defaultValue === "") return null;
+  if (c.defaultType === "sequence" && c.sequenceName) {
+    return `nextval('${c.sequenceName}')`;
+  }
+  return c.defaultValue;
+}
+
+function normalizedComment(comment?: string): string | null {
+  return comment && comment.length > 0 ? comment : null;
+}
+
+/**
+ * Result of diffing an edited table definition against its original.
+ * - `noop`: nothing to apply.
+ * - `batch`: an ALTER batch to execute.
+ * - `unsupported`: the edit contains a change the visual editor can't safely
+ *   express as an in-place ALTER; the caller should surface `reason` and NOT
+ *   fall back to any other DDL (silently doing the wrong thing loses edits).
+ */
+export type TableDiffResult =
+  | { kind: "noop" }
+  | { kind: "batch"; batch: AlterTableBatch }
+  | { kind: "unsupported"; reason: string };
+
+/**
+ * Diff an edited table definition against the original loaded from the database
+ * and produce the ALTER operations needed to reconcile them.
+ *
+ * Columns are matched by their stable client-side `id` (assigned when the
+ * definition is loaded and preserved through edits), so a rename is detected
+ * unambiguously rather than guessed from a name heuristic. Anything the batch
+ * model can't safely express in place — table rename/schema move, primary-key
+ * or unique changes, constraint or index edits — returns `unsupported` so the
+ * caller refuses the save with guidance instead of mis-applying it.
+ */
+export function diffTableDefinitions(
+  original: TableDefinition,
+  edited: TableDefinition
+): TableDiffResult {
+  if (edited.name !== original.name) {
+    return {
+      kind: "unsupported",
+      reason:
+        "Renaming a table isn't supported in the visual editor yet — rename it with a SQL query (ALTER TABLE … RENAME TO …)."
+    };
+  }
+  if (edited.schema !== original.schema) {
+    return {
+      kind: "unsupported",
+      reason:
+        "Moving a table to another schema isn't supported in the visual editor yet — use a SQL query (ALTER TABLE … SET SCHEMA …)."
+    };
+  }
+  if (!!edited.unlogged !== !!original.unlogged) {
+    return {
+      kind: "unsupported",
+      reason:
+        "Changing whether a table is UNLOGGED isn't supported in the visual editor yet — use a SQL query."
+    };
+  }
+  if (
+    JSON.stringify(original.constraints) !== JSON.stringify(edited.constraints)
+  ) {
+    return {
+      kind: "unsupported",
+      reason:
+        "Editing constraints isn't supported in the visual editor yet — apply constraint changes with a SQL query."
+    };
+  }
+  if (JSON.stringify(original.indexes) !== JSON.stringify(edited.indexes)) {
+    return {
+      kind: "unsupported",
+      reason:
+        "Editing indexes isn't supported in the visual editor yet — apply index changes with a SQL query."
+    };
+  }
+
+  const columnOperations: AlterColumnOperation[] = [];
+  const editById = new Map(edited.columns.map((c) => [c.id, c]));
+  const origById = new Map(original.columns.map((c) => [c.id, c]));
+
+  // Dropped columns (present originally, gone from the edited set).
+  for (const orig of original.columns) {
+    if (!editById.has(orig.id)) {
+      columnOperations.push({ type: "drop", columnName: orig.name });
+    }
+  }
+
+  for (const edit of edited.columns) {
+    const orig = origById.get(edit.id);
+    if (!orig) {
+      columnOperations.push({ type: "add", column: edit });
+      continue;
+    }
+
+    // Structural per-column changes the batch model can't express as a plain
+    // column op (PK/UNIQUE are also constraints; collation/CHECK have no op).
+    if (
+      !!edit.isPrimaryKey !== !!orig.isPrimaryKey ||
+      !!edit.isUnique !== !!orig.isUnique
+    ) {
+      return {
+        kind: "unsupported",
+        reason: `Changing the primary key or unique flag on "${edit.name}" isn't supported in the visual editor yet — use a SQL query.`
+      };
+    }
+    if ((edit.collation ?? "") !== (orig.collation ?? "")) {
+      return {
+        kind: "unsupported",
+        reason: `Changing the collation on "${edit.name}" isn't supported in the visual editor yet — use a SQL query.`
+      };
+    }
+    if ((edit.checkConstraint ?? "") !== (orig.checkConstraint ?? "")) {
+      return {
+        kind: "unsupported",
+        reason: `Changing the CHECK constraint on "${edit.name}" isn't supported in the visual editor yet — use a SQL query.`
+      };
+    }
+
+    // Rename first so subsequent ops reference the new name.
+    if (edit.name !== orig.name) {
+      columnOperations.push({
+        type: "rename",
+        oldName: orig.name,
+        newName: edit.name
+      });
+    }
+    if (formatColumnType(orig) !== formatColumnType(edit)) {
+      columnOperations.push({
+        type: "set_type",
+        columnName: edit.name,
+        newType: formatColumnType(edit)
+      });
+    }
+    if (!!orig.isNullable !== !!edit.isNullable) {
+      columnOperations.push({
+        type: "set_nullable",
+        columnName: edit.name,
+        nullable: edit.isNullable
+      });
+    }
+    if (columnDefaultSignature(orig) !== columnDefaultSignature(edit)) {
+      columnOperations.push({
+        type: "set_default",
+        columnName: edit.name,
+        defaultValue: columnDefaultSql(edit)
+      });
+    }
+    if ((orig.comment ?? "") !== (edit.comment ?? "")) {
+      columnOperations.push({
+        type: "set_comment",
+        columnName: edit.name,
+        comment: normalizedComment(edit.comment)
+      });
+    }
+  }
+
+  const commentChanged = (original.comment ?? "") !== (edited.comment ?? "");
+  if (columnOperations.length === 0 && !commentChanged) {
+    return { kind: "noop" };
+  }
+
+  const batch: AlterTableBatch = {
+    schema: original.schema,
+    table: original.name,
+    columnOperations,
+    constraintOperations: [],
+    indexOperations: []
+  };
+  if (commentChanged) batch.comment = normalizedComment(edited.comment);
+  return { kind: "batch", batch };
+}
+
+/**
  * Result of DDL operations
  */
 export interface DDLResult {
@@ -738,10 +1561,6 @@ export interface DDLResult {
   /** Errors encountered during execution */
   errors?: string[];
 }
-
-// ============================================
-// Database Metadata Types
-// ============================================
 
 /**
  * Sequence information for default value picker
@@ -768,31 +1587,27 @@ export interface CustomTypeInfo {
   /** Type name */
   name: string;
   /** Type category */
-  type: 'enum' | 'composite' | 'range' | 'domain';
+  type: "enum" | "composite" | "range" | "domain";
   /** Enum values (for enum types) */
   values?: string[];
 }
 
-// ============================================
-// License Types
-// ============================================
-
 /**
  * License type enumeration
  */
-export type LicenseType = 'personal' | 'individual' | 'team';
+export type LicenseType = "personal" | "individual" | "team";
 
 /**
  * Stored license data (encrypted locally)
  */
 export interface LicenseData {
-  /** License key */
+  /** License key (from Dodo Payments) */
   key: string;
   /** Type of license */
   type: LicenseType;
   /** Email address of license owner */
   email: string;
-  /** Subscription expiry date (ISO string) */
+  /** Subscription expiry date / updates_until (ISO string) */
   expiresAt: string;
   /** Last version the user is entitled to use perpetually */
   perpetualVersion: string;
@@ -800,6 +1615,8 @@ export interface LicenseData {
   activatedAt: string;
   /** Last time the license was validated online (ISO string) */
   lastValidated: string;
+  /** Dodo instance ID for this activation (needed for deactivation) */
+  instanceId?: string;
 }
 
 /**
@@ -857,10 +1674,6 @@ export interface LicenseDeactivationResponse {
   error?: string;
 }
 
-// ============================================
-// Saved Queries Types
-// ============================================
-
 /**
  * A saved query/snippet that can be bookmarked and reused
  */
@@ -879,6 +1692,8 @@ export interface SavedQuery {
   tags: string[];
   /** Folder path for grouping (e.g., "Reports/Monthly") */
   folder?: string;
+  /** Whether this query is pinned (favorites) */
+  isPinned?: boolean;
   /** Number of times this query has been used */
   usageCount: number;
   /** Last time the query was used (Unix timestamp) */
@@ -887,4 +1702,1303 @@ export interface SavedQuery {
   createdAt: number;
   /** When the query was last updated (Unix timestamp) */
   updatedAt: number;
+}
+
+/**
+ * Category for SQL snippets
+ */
+export type SnippetCategory =
+  | "select"
+  | "insert"
+  | "update"
+  | "delete"
+  | "ddl"
+  | "aggregate"
+  | "join"
+  | "other";
+
+/**
+ * A reusable SQL snippet/template
+ */
+export interface Snippet {
+  /** Unique identifier */
+  id: string;
+  /** Display name for the snippet */
+  name: string;
+  /** Description of what the snippet does */
+  description: string;
+  /** SQL template with Monaco placeholders: ${1:table}, $2, etc. */
+  template: string;
+  /** Category for organization */
+  category: SnippetCategory;
+  /** Whether this is a built-in snippet (cannot be deleted) */
+  isBuiltIn: boolean;
+  /** Optional trigger prefix for autocomplete (e.g., "sel" for SELECT) */
+  triggerPrefix?: string;
+  /** When the snippet was created (Unix timestamp) */
+  createdAt: number;
+  /** When the snippet was last updated (Unix timestamp) */
+  updatedAt: number;
+}
+
+export type SSHAuthenticationMethod = "Password" | "Public Key";
+
+/**
+ * Individual timing phase within query execution
+ */
+export interface TimingPhase {
+  /** Phase name (e.g., 'tcp_handshake', 'execution') */
+  name: string;
+  /** Duration in milliseconds */
+  durationMs: number;
+  /** Offset from query start in milliseconds */
+  startOffset: number;
+}
+
+/**
+ * Comprehensive telemetry data for a single query execution
+ */
+export interface QueryTelemetry {
+  /** Unique identifier for this execution */
+  executionId: string;
+  /** Total execution time in milliseconds */
+  totalDurationMs: number;
+  /** All timing phases */
+  phases: TimingPhase[];
+
+  // Individual phase durations (convenience accessors)
+  /** TCP connection establishment time */
+  tcpHandshakeMs?: number;
+  /** Database authentication/protocol handshake time */
+  dbHandshakeMs?: number;
+  /** Network round-trip latency */
+  networkLatencyMs?: number;
+  /** Query plan generation time (from EXPLAIN) */
+  planningMs?: number;
+  /** Server-side query execution time */
+  executionMs?: number;
+  /** Data transfer time from server */
+  downloadMs?: number;
+  /** Client-side result parsing time */
+  parseMs?: number;
+
+  // Metadata
+  /** Whether an existing connection was reused */
+  connectionReused: boolean;
+  /** Number of rows returned */
+  rowCount: number;
+  /** Bytes received from server */
+  bytesReceived?: number;
+  /** Unix timestamp when telemetry was recorded */
+  timestamp: number;
+}
+
+/**
+ * Statistical aggregations for benchmark runs
+ */
+export interface TelemetryStats {
+  avg: number;
+  min: number;
+  max: number;
+  p90: number;
+  p95: number;
+  p99: number;
+  stdDev: number;
+}
+
+/**
+ * Calculate percentile from a sorted array of numbers
+ * @param sorted - Array of numbers sorted in ascending order
+ * @param p - Percentile to calculate (0-100)
+ */
+export function calcPercentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0];
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
+}
+
+/**
+ * Calculate standard deviation of an array of numbers
+ * @param values - Array of numbers
+ * @param mean - Pre-calculated mean of the values
+ */
+export function calcStdDev(values: number[], mean: number): number {
+  if (values.length === 0) return 0;
+  const variance =
+    values.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) /
+    values.length;
+  return Math.sqrt(variance);
+}
+
+/**
+ * Per-phase statistics for benchmark analysis
+ */
+export interface PhaseStats {
+  avg: number;
+  p90: number;
+  p95: number;
+  p99: number;
+}
+
+/**
+ * Results from running a query multiple times (benchmark mode)
+ */
+export interface BenchmarkResult {
+  /** Number of iterations completed */
+  runCount: number;
+  /** Individual telemetry data for each run */
+  telemetryRuns: QueryTelemetry[];
+  /** Aggregated statistics across all runs */
+  stats: TelemetryStats;
+  /** Per-phase statistics (keyed by phase name) */
+  phaseStats: Record<string, PhaseStats>;
+}
+
+/**
+ * Extended query options with telemetry support
+ */
+export interface TelemetryQueryOptions {
+  /** Unique execution ID for cancellation support */
+  executionId?: string;
+  /** Whether to collect detailed telemetry */
+  collectTelemetry?: boolean;
+  /** Number of times to run query for benchmarking */
+  benchmarkRuns?: number;
+}
+
+/**
+ * Multi-statement result extended with telemetry data
+ */
+export interface MultiStatementResultWithTelemetry extends MultiStatementResult {
+  /** Telemetry data for this execution */
+  telemetry?: QueryTelemetry;
+  /** Benchmark results (when benchmarkRuns > 1) */
+  benchmark?: BenchmarkResult;
+}
+
+/**
+ * Severity levels for performance issues
+ */
+export type PerformanceIssueSeverity = "critical" | "warning" | "info";
+
+/**
+ * Categories of performance issues detected during analysis
+ */
+export type PerformanceIssueType =
+  | "missing_index"
+  | "n_plus_one"
+  | "slow_query"
+  | "high_filter_ratio"
+  | "row_estimate_off"
+  | "disk_spill";
+
+/**
+ * A single performance issue detected during query analysis
+ */
+export interface PerformanceIssue {
+  /** Unique identifier for this issue */
+  id: string;
+  /** Type of performance issue */
+  type: PerformanceIssueType;
+  /** Severity level */
+  severity: PerformanceIssueSeverity;
+  /** Short title describing the issue */
+  title: string;
+  /** Detailed description of the issue */
+  message: string;
+  /** Actionable suggestion to fix the issue */
+  suggestion: string;
+  /** Table name if applicable */
+  tableName?: string;
+  /** Column name if applicable */
+  columnName?: string;
+  /** Suggested CREATE INDEX statement */
+  indexSuggestion?: string;
+  /** Related queries for N+1 patterns */
+  relatedQueries?: string[];
+  /** Threshold that was exceeded (for slow queries) */
+  threshold?: number;
+  /** Actual value that exceeded the threshold */
+  actualValue?: number;
+  /** Plan node type from EXPLAIN (e.g., 'Seq Scan') */
+  planNodeType?: string;
+  /** Additional details from the plan node */
+  planNodeDetails?: Record<string, unknown>;
+}
+
+/**
+ * Detected N+1 query pattern from history analysis
+ */
+export interface NplusOnePattern {
+  /** Normalized query fingerprint */
+  fingerprint: string;
+  /** Query template with placeholders */
+  queryTemplate: string;
+  /** Number of occurrences detected */
+  occurrences: number;
+  /** Sample queries (limited to 3) */
+  querySamples: string[];
+  /** Table name extracted from query */
+  tableName?: string;
+  /** Column name in WHERE clause */
+  columnName?: string;
+  /** Time window in which these occurred (ms) */
+  timeWindowMs: number;
+}
+
+/**
+ * Complete result of performance analysis
+ */
+export interface PerformanceAnalysisResult {
+  /** Unique identifier for this analysis */
+  queryId: string;
+  /** Original query that was analyzed */
+  query: string;
+  /** Unix timestamp when analysis was performed */
+  analyzedAt: number;
+  /** Time taken to perform analysis (ms) */
+  durationMs: number;
+  /** Issue counts by severity */
+  issueCount: {
+    critical: number;
+    warning: number;
+    info: number;
+  };
+  /** Detected performance issues */
+  issues: PerformanceIssue[];
+  /** Detected N+1 patterns */
+  nplusOnePatterns: NplusOnePattern[];
+  /** Raw EXPLAIN plan for reference */
+  explainPlan?: unknown;
+  /** Database type */
+  dbType: "postgresql";
+  /** Connection identifier */
+  connectionId: string;
+}
+
+/**
+ * Configuration options for performance analysis
+ */
+export interface PerformanceAnalysisConfig {
+  /** Threshold for slow query warning (default: 1000ms) */
+  slowQueryThresholdMs: number;
+  /** Time window for N+1 detection (default: 5000ms) */
+  nplusOneWindowMs: number;
+  /** Minimum occurrences to flag N+1 (default: 3) */
+  nplusOneMinOccurrences: number;
+  /** Number of recent queries to analyze for N+1 (default: 50) */
+  historyLookbackCount: number;
+}
+
+/**
+ * Query history item for N+1 detection
+ */
+export interface QueryHistoryItemForAnalysis {
+  /** The SQL query */
+  query: string;
+  /** Unix timestamp when executed */
+  timestamp: number;
+  /** Connection ID */
+  connectionId: string;
+}
+
+/**
+ * A persisted query history entry.
+ *
+ * This is the shape stored on disk and sent over IPC. Timestamps are stored as
+ * Unix epoch milliseconds (numbers) rather than `Date` objects so they survive
+ * JSON serialisation cleanly; the renderer converts to/from `Date` at its edge.
+ */
+export interface QueryHistoryEntry {
+  /** Unique identifier */
+  id: string;
+  /** The SQL query text */
+  query: string;
+  /** When the query was executed (Unix timestamp, ms) */
+  timestamp: number;
+  /** Execution duration in milliseconds */
+  durationMs: number;
+  /** Number of rows returned/affected */
+  rowCount: number;
+  /** Whether the query succeeded or errored */
+  status: "success" | "error";
+  /** Connection the query was run against */
+  connectionId: string;
+  /** Error message, present when status is "error" */
+  errorMessage?: string;
+}
+
+/**
+ * Maximum number of history entries retained per connection.
+ *
+ * History is capped per connection (rather than globally) so that a single busy
+ * connection cannot evict the history of others.
+ */
+export const MAX_QUERY_HISTORY_PER_CONNECTION = 100;
+
+/**
+ * Trim a newest-first history list so each connection keeps at most `max` entries.
+ *
+ * Assumes `history` is already ordered newest-first; the oldest entries for a
+ * connection are the ones dropped once its cap is exceeded. Order is preserved.
+ */
+export function capQueryHistoryPerConnection<
+  T extends { connectionId: string },
+>(history: T[], max: number = MAX_QUERY_HISTORY_PER_CONNECTION): T[] {
+  const counts = new Map<string, number>();
+  return history.filter((item) => {
+    const next = (counts.get(item.connectionId) ?? 0) + 1;
+    counts.set(item.connectionId, next);
+    return next <= max;
+  });
+}
+
+/**
+ * Cron schedule expression or preset
+ */
+export type SchedulePreset =
+  | "every_minute"
+  | "every_5_minutes"
+  | "every_15_minutes"
+  | "every_30_minutes"
+  | "every_hour"
+  | "every_6_hours"
+  | "every_12_hours"
+  | "daily"
+  | "weekly"
+  | "monthly"
+  | "custom";
+
+/**
+ * Maps schedule presets to human-readable labels and cron expressions
+ */
+export const SCHEDULE_PRESETS: Record<
+  Exclude<SchedulePreset, "custom">,
+  { label: string; cron: string }
+> = {
+  every_minute: { label: "Every minute", cron: "* * * * *" },
+  every_5_minutes: { label: "Every 5 minutes", cron: "*/5 * * * *" },
+  every_15_minutes: { label: "Every 15 minutes", cron: "*/15 * * * *" },
+  every_30_minutes: { label: "Every 30 minutes", cron: "*/30 * * * *" },
+  every_hour: { label: "Every hour", cron: "0 * * * *" },
+  every_6_hours: { label: "Every 6 hours", cron: "0 */6 * * *" },
+  every_12_hours: { label: "Every 12 hours", cron: "0 */12 * * *" },
+  daily: { label: "Daily at midnight", cron: "0 0 * * *" },
+  weekly: { label: "Weekly on Sunday", cron: "0 0 * * 0" },
+  monthly: { label: "Monthly on 1st", cron: "0 0 1 * *" },
+};
+
+/**
+ * Schedule configuration for a scheduled query
+ */
+export interface ScheduleConfig {
+  /** Preset schedule type */
+  preset: SchedulePreset;
+  /** Custom cron expression (when preset is 'custom') */
+  cronExpression?: string;
+  /** Timezone for schedule (default: local) */
+  timezone?: string;
+}
+
+/**
+ * Status of a scheduled query
+ */
+export type ScheduledQueryStatus = "active" | "paused" | "error";
+
+/**
+ * Result of a scheduled query execution
+ */
+export interface ScheduledQueryRun {
+  /** Unique run identifier */
+  id: string;
+  /** Scheduled query ID */
+  scheduledQueryId: string;
+  /** When the run started (Unix timestamp) */
+  startedAt: number;
+  /** When the run completed (Unix timestamp) */
+  completedAt?: number;
+  /** Duration in milliseconds */
+  durationMs?: number;
+  /** Whether the run succeeded */
+  success: boolean;
+  /** Error message if failed */
+  error?: string;
+  /** Number of rows returned/affected */
+  rowCount?: number;
+  /** Truncated preview of results (first few rows) */
+  resultPreview?: Record<string, unknown>[];
+}
+
+/**
+ * A scheduled query that runs on a cron-like schedule
+ */
+export interface ScheduledQuery {
+  /** Unique identifier */
+  id: string;
+  /** Display name for the scheduled query */
+  name: string;
+  /** The SQL query to execute */
+  query: string;
+  /** Optional description */
+  description?: string;
+  /** Connection ID to run against (required) */
+  connectionId: string;
+  /** Schedule configuration */
+  schedule: ScheduleConfig;
+  /** Current status */
+  status: ScheduledQueryStatus;
+  /** Whether to show desktop notifications on completion */
+  notifyOnComplete: boolean;
+  /** Whether to show desktop notifications on failure */
+  notifyOnError: boolean;
+  /** Maximum number of runs to keep in history */
+  maxHistoryRuns: number;
+  /** Last error message (if status is 'error') */
+  lastError?: string;
+  /** Next scheduled run time (Unix timestamp) */
+  nextRunAt?: number;
+  /** Last run time (Unix timestamp) */
+  lastRunAt?: number;
+  /** When the scheduled query was created (Unix timestamp) */
+  createdAt: number;
+  /** When the scheduled query was last updated (Unix timestamp) */
+  updatedAt: number;
+}
+
+/**
+ * Input for creating a new scheduled query
+ */
+export type CreateScheduledQueryInput = Omit<
+  ScheduledQuery,
+  | "id"
+  | "status"
+  | "lastError"
+  | "nextRunAt"
+  | "lastRunAt"
+  | "createdAt"
+  | "updatedAt"
+>;
+
+/**
+ * Input for updating a scheduled query
+ */
+export type UpdateScheduledQueryInput = Partial<
+  Omit<ScheduledQuery, "id" | "createdAt" | "updatedAt">
+>;
+
+export type WidgetType = "chart" | "kpi" | "table";
+export type ChartWidgetType = "bar" | "line" | "area" | "pie";
+export type KPIFormat = "number" | "currency" | "percent" | "duration";
+
+/**
+ * Data source configuration for a widget
+ * Supports both saved queries and inline SQL
+ */
+export interface WidgetDataSource {
+  /** Whether to use a saved query or inline SQL */
+  type: "saved-query" | "inline";
+  /** Reference to saved query (when type is 'saved-query') */
+  savedQueryId?: string;
+  /** Inline SQL query (when type is 'inline') */
+  sql?: string;
+  /** Connection to execute against */
+  connectionId: string;
+}
+
+/**
+ * Configuration for chart widgets
+ */
+export interface ChartWidgetConfig {
+  widgetType: "chart";
+  chartType: ChartWidgetType;
+  /** Column to use for X axis */
+  xKey: string;
+  /** Columns to use for Y axis (supports multiple series) */
+  yKeys: string[];
+  /** Custom colors for series */
+  colors?: string[];
+  /** Whether to show legend */
+  showLegend?: boolean;
+  /** Whether to show grid lines */
+  showGrid?: boolean;
+  /** Chart title */
+  title?: string;
+  /** Chart description */
+  description?: string;
+}
+
+/**
+ * Configuration for KPI/metric widgets
+ */
+export interface KPIWidgetConfig {
+  widgetType: "kpi";
+  /** Display format for the value */
+  format: KPIFormat;
+  /** Label shown above the value */
+  label: string;
+  /** Column containing the main value */
+  valueKey: string;
+  /** Column for trend calculation (optional) */
+  trendKey?: string;
+  /** Whether up is good or bad for trend coloring */
+  trendType?: "up-good" | "down-good";
+  /** Column for sparkline data (optional) */
+  sparklineKey?: string;
+  /** Prefix for value display (e.g., '$') */
+  prefix?: string;
+  /** Suffix for value display (e.g., '%') */
+  suffix?: string;
+}
+
+/**
+ * Configuration for table preview widgets
+ */
+export interface TableWidgetConfig {
+  widgetType: "table";
+  /** Maximum rows to display */
+  maxRows: number;
+  /** Specific columns to show (all if not specified) */
+  columns?: string[];
+  /** Default sort configuration */
+  sortBy?: { column: string; direction: "asc" | "desc" };
+}
+
+/**
+ * Union type for all widget configurations
+ */
+export type WidgetConfig =
+  | ChartWidgetConfig
+  | KPIWidgetConfig
+  | TableWidgetConfig;
+
+/**
+ * Widget position and size in the grid layout
+ */
+export interface WidgetLayout {
+  /** X position in grid units */
+  x: number;
+  /** Y position in grid units */
+  y: number;
+  /** Width in grid units */
+  w: number;
+  /** Height in grid units */
+  h: number;
+  /** Minimum width (optional) */
+  minW?: number;
+  /** Minimum height (optional) */
+  minH?: number;
+}
+
+/**
+ * A dashboard widget
+ */
+export interface Widget {
+  /** Unique identifier */
+  id: string;
+  /** Display name */
+  name: string;
+  /** Data source configuration */
+  dataSource: WidgetDataSource;
+  /** Widget-specific configuration */
+  config: WidgetConfig;
+  /** Position and size in grid */
+  layout: WidgetLayout;
+  /** Auto-refresh interval in seconds (optional) */
+  refreshInterval?: number;
+  /** Whether this widget was AI-generated */
+  aiGenerated?: boolean;
+  /** When the widget was created (Unix timestamp) */
+  createdAt: number;
+  /** When the widget was last updated (Unix timestamp) */
+  updatedAt: number;
+}
+
+/**
+ * Result of executing a widget's query
+ */
+export interface WidgetRunResult {
+  /** Widget ID */
+  widgetId: string;
+  /** Whether execution succeeded */
+  success: boolean;
+  /** Query result data */
+  data?: Record<string, unknown>[];
+  /** Column metadata */
+  fields?: QueryField[];
+  /** Error message if failed */
+  error?: string;
+  /** Execution duration in milliseconds */
+  durationMs: number;
+  /** Number of rows returned */
+  rowCount: number;
+  /** When the query was executed (Unix timestamp) */
+  executedAt: number;
+}
+
+/**
+ * A dashboard containing widgets
+ */
+export interface Dashboard {
+  /** Unique identifier */
+  id: string;
+  /** Display name */
+  name: string;
+  /** Optional description */
+  description?: string;
+  /** Tags for organization */
+  tags: string[];
+  /** Widgets in this dashboard */
+  widgets: Widget[];
+  /** Number of columns in the grid layout */
+  layoutCols: number;
+  /** Auto-refresh schedule configuration */
+  refreshSchedule?: {
+    /** Whether auto-refresh is enabled */
+    enabled: boolean;
+    /** Schedule preset */
+    preset: SchedulePreset;
+    /** Custom cron expression (when preset is 'custom') */
+    cronExpression?: string;
+    /** Timezone for schedule */
+    timezone?: string;
+  };
+  /** When the dashboard was created (Unix timestamp) */
+  createdAt: number;
+  /** When the dashboard was last updated (Unix timestamp) */
+  updatedAt: number;
+  /** Version number for conflict detection (future sync) */
+  version: number;
+  /** Server-assigned sync ID (for future cloud sync) */
+  syncId?: string;
+}
+
+/**
+ * Input for creating a new dashboard
+ */
+export type CreateDashboardInput = Omit<
+  Dashboard,
+  "id" | "createdAt" | "updatedAt" | "version"
+>;
+
+/**
+ * Input for updating a dashboard
+ */
+export type UpdateDashboardInput = Partial<
+  Omit<Dashboard, "id" | "createdAt" | "updatedAt">
+>;
+
+/**
+ * Input for creating a new widget
+ */
+export type CreateWidgetInput = Omit<Widget, "id" | "createdAt" | "updatedAt">;
+
+/**
+ * Input for updating a widget
+ */
+export type UpdateWidgetInput = Partial<
+  Omit<Widget, "id" | "createdAt" | "updatedAt">
+>;
+
+export interface ColumnStatsRequest {
+  schema: string;
+  table: string;
+  column: string;
+  dataType: string;
+}
+
+export type ColumnStatsType =
+  | "numeric"
+  | "text"
+  | "datetime"
+  | "boolean"
+  | "other";
+
+export interface HistogramBucket {
+  min: number;
+  max: number;
+  count: number;
+}
+
+export interface CommonValue {
+  value: string | null;
+  count: number;
+  percentage: number;
+}
+
+export interface ColumnStats {
+  column: string;
+  dataType: string;
+  statsType: ColumnStatsType;
+  totalRows: number;
+  nullCount: number;
+  nullPercentage: number;
+  distinctCount: number;
+  distinctPercentage: number;
+  min?: string | number | null;
+  max?: string | number | null;
+  avg?: number | null;
+  median?: number | null;
+  stdDev?: number | null;
+  minLength?: number | null;
+  maxLength?: number | null;
+  avgLength?: number | null;
+  histogram?: HistogramBucket[];
+  commonValues?: CommonValue[];
+  trueCount?: number;
+  falseCount?: number;
+}
+
+export interface CsvColumnMapping {
+  csvColumn: string;
+  tableColumn: string | null;
+  inferredType?: string;
+}
+
+export interface CsvImportOptions {
+  batchSize: number;
+  onConflict: "error" | "skip" | "update";
+  truncateFirst: boolean;
+  useTransaction: boolean;
+  useCopy: boolean;
+}
+
+export interface CsvImportRequest {
+  schema: string;
+  table: string;
+  columns: string[];
+  mappings: CsvColumnMapping[];
+  options: CsvImportOptions;
+  createTable: boolean;
+  tableDefinition?: {
+    columns: Array<{ name: string; dataType: string; isNullable: boolean }>;
+  };
+}
+
+export interface CsvImportProgress {
+  phase: "preparing" | "importing" | "complete" | "error";
+  rowsImported: number;
+  totalRows: number;
+  currentBatch: number;
+  totalBatches: number;
+  error?: string;
+}
+
+export interface CsvImportResult {
+  success: boolean;
+  rowsImported: number;
+  rowsSkipped: number;
+  rowsFailed: number;
+  error?: string;
+  durationMs: number;
+}
+
+export interface BatchInsertOptions {
+  schema: string;
+  table: string;
+  columns: string[];
+  onConflict: "error" | "skip" | "update";
+  primaryKeyColumns?: string[];
+}
+
+export interface BatchInsertResult {
+  rowsInserted: number;
+  rowsSkipped: number;
+  rowsFailed: number;
+}
+
+export type GeneratorType =
+  | "auto-increment"
+  | "uuid"
+  | "faker"
+  | "random-int"
+  | "random-float"
+  | "random-boolean"
+  | "random-date"
+  | "random-enum"
+  | "fk-reference"
+  | "fixed"
+  | "null"
+  | "expression";
+
+export interface ColumnGenerator {
+  columnName: string;
+  dataType: string;
+  generatorType: GeneratorType;
+  fakerMethod?: string;
+  fixedValue?: string;
+  minValue?: number;
+  maxValue?: number;
+  enumValues?: string[];
+  nullPercentage: number;
+  skip: boolean;
+  fkTable?: string;
+  fkColumn?: string;
+}
+
+export interface DataGenConfig {
+  schema: string;
+  table: string;
+  rowCount: number;
+  seed?: number;
+  columns: ColumnGenerator[];
+  batchSize: number;
+}
+
+export interface DataGenProgress {
+  phase: "generating" | "inserting" | "complete" | "error";
+  rowsGenerated: number;
+  rowsInserted: number;
+  totalRows: number;
+  error?: string;
+}
+
+export interface DataGenResult {
+  success: boolean;
+  rowsInserted: number;
+  durationMs: number;
+  error?: string;
+}
+
+export interface PgNotificationEvent {
+  id: string;
+  connectionId: string;
+  channel: string;
+  payload: string;
+  receivedAt: number;
+}
+
+export interface PgNotificationChannel {
+  name: string;
+  isListening: boolean;
+  eventCount: number;
+  lastEventAt?: number;
+}
+
+export interface PgNotificationStats {
+  eventsPerSecond: number;
+  totalEvents: number;
+  avgPayloadSize: number;
+  connectedSince?: number;
+}
+
+export type PgNotificationConnectionState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected"
+  | "error";
+
+export interface PgNotificationConnectionStatus {
+  connectionId: string;
+  state: PgNotificationConnectionState;
+  connectedSince?: number;
+  lastError?: string;
+  retryAttempt: number;
+  nextRetryAt?: number;
+  backoffMs?: number;
+}
+
+export interface ActiveQuery {
+  pid: number;
+  user: string;
+  database: string;
+  state: string;
+  duration: string;
+  durationMs: number;
+  query: string;
+  waitEvent?: string;
+  applicationName?: string;
+}
+
+export interface TableSizeInfo {
+  schema: string;
+  table: string;
+  rowCountEstimate: number;
+  dataSize: string;
+  dataSizeBytes: number;
+  indexSize: string;
+  indexSizeBytes: number;
+  totalSize: string;
+  totalSizeBytes: number;
+}
+
+export interface CacheStats {
+  bufferCacheHitRatio: number;
+  indexHitRatio: number;
+  tableCacheDetails?: Array<{
+    table: string;
+    hitRatio: number;
+    seqScans: number;
+    indexScans: number;
+  }>;
+}
+
+export interface LockInfo {
+  blockedPid: number;
+  blockedUser: string;
+  blockedQuery: string;
+  blockingPid: number;
+  blockingUser: string;
+  blockingQuery: string;
+  lockType: string;
+  relation?: string;
+  waitDuration: string;
+  waitDurationMs: number;
+}
+
+export interface DatabaseSizeInfo {
+  totalSize: string;
+  totalSizeBytes: number;
+}
+
+// ── Schema Intel / Diagnostics ──────────────────────────────────────────────
+
+/**
+ * Identifier for a schema diagnostic check.
+ */
+export type SchemaIntelCheckId =
+  | "tables_without_pk"
+  | "unused_indexes"
+  | "duplicate_indexes"
+  | "missing_fk_indexes"
+  | "invalid_indexes"
+  | "bloated_tables"
+  | "never_vacuumed"
+  | "nullable_fks";
+
+export type SchemaIntelSeverity = "info" | "warning" | "critical";
+
+/**
+ * Static metadata about a diagnostic check (id, title, description, supported
+ * database types). Returned by {@link SchemaIntelRunResponse} so the UI can
+ * render all checks — even those that yielded zero findings — with a friendly
+ * label.
+ */
+export interface SchemaIntelCheckDefinition {
+  id: SchemaIntelCheckId;
+  title: string;
+  description: string;
+  severity: SchemaIntelSeverity;
+  /** Database types this check is supported on. */
+  supportedDbTypes: DatabaseType[];
+}
+
+/**
+ * A single actionable finding surfaced by a check.
+ */
+export interface SchemaIntelFinding {
+  checkId: SchemaIntelCheckId;
+  severity: SchemaIntelSeverity;
+  /** Short human-readable headline (e.g. "public.users has no primary key"). */
+  title: string;
+  /** Longer explanation / impact. */
+  detail?: string;
+  /** Primary database entity this finding refers to. */
+  entity?: {
+    schema?: string;
+    name: string;
+    kind: "table" | "index" | "column" | "foreign_key";
+  };
+  /** Auxiliary structured data (e.g. row counts, column lists). */
+  metadata?: Record<string, unknown>;
+  /** SQL the user can copy/run to resolve the finding. */
+  suggestedSql?: string;
+}
+
+/**
+ * Report returned by a single intel run.
+ */
+export interface SchemaIntelReport {
+  findings: SchemaIntelFinding[];
+  /**
+   * Checks that were requested but could not be run (unsupported DB,
+   * permission error, missing extension, etc.).
+   */
+  skipped: Array<{ checkId: SchemaIntelCheckId; reason: string }>;
+  durationMs: number;
+  ranAt: number;
+}
+
+/** List of all check definitions surfaced to the renderer. */
+export const SCHEMA_INTEL_CHECKS: readonly SchemaIntelCheckDefinition[] = [
+  {
+    id: "tables_without_pk",
+    title: "Tables without a primary key",
+    description:
+      "Tables without a primary key make replication, de-duplication, and row-level edits more difficult.",
+    severity: "warning",
+    supportedDbTypes: ["postgresql", "mysql", "mssql"],
+  },
+  {
+    id: "missing_fk_indexes",
+    title: "Foreign keys missing an index",
+    description:
+      "Foreign key columns without a supporting index force sequential scans during joins and deletes on the parent table.",
+    severity: "warning",
+    supportedDbTypes: ["postgresql", "mysql"],
+  },
+  {
+    id: "duplicate_indexes",
+    title: "Duplicate or redundant indexes",
+    description:
+      "Multiple indexes that cover the same leading columns waste disk space and slow writes.",
+    severity: "warning",
+    supportedDbTypes: ["postgresql", "mysql"],
+  },
+  {
+    id: "unused_indexes",
+    title: "Unused indexes",
+    description:
+      "Indexes that have never served a scan since stats were reset. They add maintenance overhead without speeding up reads.",
+    severity: "info",
+    supportedDbTypes: ["postgresql"],
+  },
+  {
+    id: "invalid_indexes",
+    title: "Invalid indexes",
+    description:
+      "Indexes that failed to build (e.g. from a cancelled CREATE INDEX CONCURRENTLY). They are not used by the planner and should be dropped or rebuilt.",
+    severity: "critical",
+    supportedDbTypes: ["postgresql"],
+  },
+  {
+    id: "bloated_tables",
+    title: "Bloated tables",
+    description:
+      "Tables where dead tuples make up a large share of storage. Consider VACUUM (FULL) or pg_repack.",
+    severity: "info",
+    supportedDbTypes: ["postgresql"],
+  },
+  {
+    id: "never_vacuumed",
+    title: "Never vacuumed or analyzed",
+    description:
+      "Tables that autovacuum has never touched typically have stale statistics, leading to poor plans.",
+    severity: "info",
+    supportedDbTypes: ["postgresql"],
+  },
+  {
+    id: "nullable_fks",
+    title: "Nullable foreign keys",
+    description:
+      "Foreign key columns that allow NULL can silently orphan rows. Decide whether NULL is really allowed.",
+    severity: "info",
+    supportedDbTypes: ["postgresql", "mysql"],
+  },
+];
+
+// ── PostgreSQL Export/Import (pg_dump / pg_restore) ──────────────────────────
+
+export type PgExportMode = "full" | "schema-only" | "data-only";
+
+export interface PgExportOptions {
+  mode: PgExportMode;
+  schemas: string[];
+  tables: string[];
+  excludeTables: string[];
+  includeTypes: boolean;
+  includeSequences: boolean;
+  includeFunctions: boolean;
+  includeViews: boolean;
+  dataBatchSize: number;
+  includeDropStatements: boolean;
+  includeTransaction: boolean;
+}
+
+export type PgExportPhase =
+  | "preparing"
+  | "types"
+  | "sequences"
+  | "tables"
+  | "data"
+  | "indexes"
+  | "foreign_keys"
+  | "views"
+  | "functions"
+  | "complete"
+  | "error";
+
+export interface PgExportProgress {
+  phase: PgExportPhase;
+  currentObject: string;
+  objectsProcessed: number;
+  totalObjects: number;
+  rowsExported: number;
+  bytesWritten: number;
+  error?: string;
+}
+
+export interface PgExportResult {
+  success: boolean;
+  filePath: string;
+  tablesExported: number;
+  rowsExported: number;
+  bytesWritten: number;
+  durationMs: number;
+  error?: string;
+}
+
+export type PgImportOnError = "abort" | "skip";
+
+export interface PgImportOptions {
+  onError: PgImportOnError;
+  useTransaction: boolean;
+}
+
+export type PgImportPhase = "reading" | "executing" | "complete" | "error";
+
+export interface PgImportProgress {
+  phase: PgImportPhase;
+  statementsExecuted: number;
+  totalStatements: number;
+  currentStatement: string;
+  errorsEncountered: number;
+  error?: string;
+}
+
+export interface PgImportResult {
+  success: boolean;
+  statementsExecuted: number;
+  statementsSkipped: number;
+  statementsFailed: number;
+  errors: Array<{ statementIndex: number; statement: string; error: string }>;
+  durationMs: number;
+}
+
+export type {
+  SessionState,
+  ParsedStatement,
+  StepSessionError,
+  StartStepRequest,
+  StartStepResponse,
+  NextStepResponse,
+  SkipStepResponse,
+  ContinueStepResponse,
+  RetryStepResponse,
+  StopStepResponse,
+} from "./step-types";
+export {
+  STEP_SESSION_IDLE_TIMEOUT_MS,
+  STEP_SESSION_CLEANUP_INTERVAL_MS,
+  DDL_KEYWORD_REGEX,
+} from "./step-types";
+
+/**
+ * Time Machine — persisted result-history for query tabs.
+ *
+ * Runs are keyed by (connectionId, fingerprint) where the fingerprint is the FULL
+ * normalized-SQL string produced main-side by fingerprintQuery — never the 32-bit
+ * hashFingerprint, whose collisions would silently merge two queries' histories.
+ * Timestamps are epoch ms so they survive JSON/IPC. Row payloads are columnar
+ * (unknown[][] with column metadata stored once), values pre-normalized at capture:
+ * Date → ISO string, bigint → string, undefined → null, binary → capped hex preview.
+ */
+export interface TimeMachineRunMeta {
+  id: string;
+  connectionId: string;
+  fingerprint: string;
+  sql: string;
+  capturedAt: number;
+  durationMs: number;
+  rowCount: number;
+  storedRowCount: number;
+  truncated: boolean;
+  contentHash: string;
+  keyStrategy: "primary_key" | "row_position";
+  keyColumns: string[];
+  /** False when the payload exceeded TM_MAX_SNAPSHOT_PAYLOAD_BYTES and only metadata was kept. */
+  hasRows: boolean;
+}
+
+export interface TimeMachineSnapshot extends TimeMachineRunMeta {
+  columns: { name: string; dataType: string }[];
+  rows: unknown[][];
+}
+
+export interface TimeMachineCapturePayload {
+  connectionId: string;
+  sql: string;
+  capturedAt: number;
+  durationMs: number;
+  rowCount: number;
+  truncated: boolean;
+  keyStrategy: "primary_key" | "row_position";
+  keyColumns: string[];
+  columns: { name: string; dataType: string }[];
+  rows: unknown[][];
+}
+
+export interface TimeMachineListResult {
+  fingerprint: string;
+  runs: TimeMachineRunMeta[];
+}
+
+export interface TimeMachineStats {
+  runCount: number;
+  queryCount: number;
+  totalBytes: number;
+  oldestCapturedAt: number | null;
+}
+
+export const TM_MAX_SNAPSHOT_ROWS = 2000;
+export const TM_MAX_SNAPSHOT_PAYLOAD_BYTES = 6 * 1024 * 1024;
+export const TM_MAX_RUNS_PER_QUERY = 50;
+export const TM_GLOBAL_BUDGET_BYTES = 512 * 1024 * 1024;
+
+export interface McpApprovalRequest {
+  id: string;
+  connectionName: string;
+  sql: string;
+}
+
+export interface McpServerStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  token: string;
+  url: string;
+  error?: string;
+}
+
+export type AuditSource = "editor" | "inline-edit" | "ddl" | "scheduled" | "mcp";
+
+export interface AuditEntryInput {
+  source: AuditSource;
+  connectionId: string;
+  connectionName: string;
+  dbType: string;
+  sql: string;
+  rowCount: number | null;
+  success: boolean;
+  error?: string;
+  durationMs?: number;
+}
+
+export interface AuditEntry extends AuditEntryInput {
+  id: number;
+  ts: string;
+  prevHash: string;
+  hash: string;
+}
+
+export interface AuditFilters {
+  source?: AuditSource;
+  connectionId?: string;
+  from?: string;
+  to?: string;
+}
+
+export interface AuditVerifyResult {
+  valid: boolean;
+  entries: number;
+  firstBrokenId?: number;
+}
+
+export interface AuditStatus {
+  available: boolean;
+  enabled: boolean;
+  retentionDays: number;
+  entryCount: number;
 }

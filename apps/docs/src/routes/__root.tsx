@@ -3,63 +3,40 @@ import {
   HeadContent,
   Outlet,
   Scripts,
-} from '@tanstack/react-router';
-import * as React from 'react';
-import appCss from '@/styles/app.css?url';
-import { RootProvider } from 'fumadocs-ui/provider/tanstack';
+} from "@tanstack/react-router";
+import * as React from "react";
+import appCss from "@/styles/app.css?url";
+import { RootProvider } from "fumadocs-ui/provider/tanstack";
+import { generateMetaTags, DOCS_CONFIG } from "@/lib/seo";
+import { Analytics } from "@vercel/analytics/react";
 
 export const Route = createRootRoute({
-  head: () => ({
-    meta: [
-      {
-        charSet: 'utf-8',
-      },
-      {
-        name: 'viewport',
-        content: 'width=device-width, initial-scale=1',
-      },
-      {
-        title: 'data-peek Docs',
-      },
-      {
-        name: 'description',
-        content:
-          'Documentation for data-peek - A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
-      },
-      {
-        name: 'theme-color',
-        content: '#0a0a0b',
-      },
-      {
-        property: 'og:title',
-        content: 'data-peek Documentation',
-      },
-      {
-        property: 'og:description',
-        content: 'A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
-      },
-      {
-        property: 'og:type',
-        content: 'website',
-      },
-      {
-        name: 'twitter:card',
-        content: 'summary_large_image',
-      },
-      {
-        name: 'twitter:title',
-        content: 'data-peek Documentation',
-      },
-      {
-        name: 'twitter:description',
-        content: 'A minimal, fast, lightweight SQL client for PostgreSQL and MySQL',
-      },
-    ],
-    links: [
-      { rel: 'stylesheet', href: appCss },
-      { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
-    ],
-  }),
+  head: () => {
+    return {
+      meta: generateMetaTags({
+        title: DOCS_CONFIG.title,
+        description: DOCS_CONFIG.description,
+        keywords: [
+          "data-peek documentation",
+          "PostgreSQL client docs",
+          "MySQL client docs",
+          "SQL client documentation",
+          "database client guide",
+          "SQL editor documentation",
+        ],
+      }),
+      links: [
+        { rel: "stylesheet", href: appCss },
+        { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      ],
+      scripts: [
+        {
+          src: "https://scripts.simpleanalyticscdn.com/latest.js",
+          async: true,
+        },
+      ],
+    };
+  },
   component: RootComponent,
 });
 
@@ -73,7 +50,7 @@ function RootComponent() {
 
 function RootDocument({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
       </head>
@@ -81,12 +58,12 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <RootProvider
           theme={{
             enabled: true,
-            defaultTheme: 'dark',
-            forcedTheme: 'dark',
+            defaultTheme: "dark",
           }}
         >
           {children}
         </RootProvider>
+        <Analytics />
         <Scripts />
       </body>
     </html>

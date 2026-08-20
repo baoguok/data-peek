@@ -5,59 +5,78 @@ import {
   createMemoryHistory,
   Outlet,
   Link,
-  useNavigate
+  useRouter,
+  type ErrorComponentProps
 } from '@tanstack/react-router'
-import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Moon, Sun, Monitor, Sparkles, Command } from 'lucide-react'
+import { useState, useEffect, useCallback, useMemo, Component, type ReactNode } from 'react'
+import { Moon, Sun, Monitor, Sparkles, Command, AlertTriangle } from 'lucide-react'
+import { useAutoUpdater } from '@/hooks/use-auto-updater'
+import { usePokemonTracker } from '@/hooks/use-pokemon-tracker'
 import { ThemeProvider, useTheme } from '@/components/theme-provider'
-import {
-  CommandPalette,
-  type CommandItem,
-  Database,
-  Settings,
-  Plus,
-  Bookmark,
-  RefreshCw,
-  Keyboard
-} from '@/components/command-palette'
+import { CommandPalette } from '@/components/command-palette'
+import { McpApprovalDialog } from '@/components/mcp-approval-dialog'
 import { SavedQueriesDialog } from '@/components/saved-queries-dialog'
 import { DatabaseIcon } from '@/components/database-icons'
 import { AppSidebar } from '@/components/app-sidebar'
 import { NavActions } from '@/components/nav-actions'
-import { Separator } from '@/components/ui/separator'
-import { SidebarInset, SidebarProvider, SidebarTrigger, useSidebar } from '@/components/ui/sidebar'
+import {
+  Separator,
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+  useSidebar,
+  Switch,
+  Label,
+  Input,
+  cn,
+  keys,
+  Button,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger
+} from '@data-peek/ui'
 import { TabContainer } from '@/components/tab-container'
+import { DashboardView } from '@/components/dashboard'
 import { ConnectionPicker } from '@/components/connection-picker'
+import { AddConnectionDialog } from '@/components/add-connection-dialog'
 import { LicenseStatusIndicator } from '@/components/license-status-indicator'
 import { LicenseActivationModal } from '@/components/license-activation-modal'
 import { LicenseSettingsModal } from '@/components/license-settings-modal'
 import { AIChatPanel, AISettingsModal } from '@/components/ai'
+import { SettingsModal } from '@/components/settings-modal'
+import { Notifications } from '@/components/notifications'
+import { PokemonBuddy } from '@/components/pokemon-buddy'
 import { useAIStore } from '@/stores/ai-store'
-import { Switch } from '@/components/ui/switch'
-import { Label } from '@/components/ui/label'
 import { useConnectionStore, useLicenseStore, useSettingsStore, useTabStore } from '@/stores'
-import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { TitlebarActions } from '@/components/titlebar-actions'
+import { useHotkeys, type UseHotkeyDefinition, type Hotkey } from '@tanstack/react-hotkeys'
+
+// Command palette page type for direct navigation
+type CommandPalettePage = 'home' | 'connections' | 'connections:switch' | 'saved-queries'
 
 // Inner layout component that has access to sidebar context
 function LayoutContent() {
-  const navigate = useNavigate()
-  const { toggleSidebar } = useSidebar()
-  const { setTheme } = useTheme()
-
+  const { state: sidebarState } = useSidebar()
   const activeConnection = useConnectionStore((s) => s.getActiveConnection())
   const connections = useConnectionStore((s) => s.connections)
   const setActiveConnection = useConnectionStore((s) => s.setActiveConnection)
   const setConnectionStatus = useConnectionStore((s) => s.setConnectionStatus)
-  const fetchSchemas = useConnectionStore((s) => s.fetchSchemas)
   const [isConnectionPickerOpen, setIsConnectionPickerOpen] = useState(false)
 
   // Command palette state
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false)
+  const [commandPaletteInitialPage, setCommandPaletteInitialPage] =
+    useState<CommandPalettePage>('home')
 
   // Saved queries dialog state
   const [isSavedQueriesOpen, setIsSavedQueriesOpen] = useState(false)
+
+  // Add connection dialog state (for command palette integration)
+  const [isAddConnectionOpen, setIsAddConnectionOpen] = useState(false)
+  const [editConnectionId, setEditConnectionId] = useState<string | null>(null)
+
+  // Settings modal state
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
 
   // License modal states from store
   const isActivationModalOpen = useLicenseStore((s) => s.isActivationModalOpen)
@@ -68,14 +87,17 @@ function LayoutContent() {
   // AI states from store
   const isAIPanelOpen = useAIStore((s) => s.isPanelOpen)
   const toggleAIPanel = useAIStore((s) => s.togglePanel)
-  const openAIPanel = useAIStore((s) => s.openPanel)
   const closeAIPanel = useAIStore((s) => s.closePanel)
   const isAISettingsOpen = useAIStore((s) => s.isSettingsOpen)
   const openAISettings = useAIStore((s) => s.openSettings)
   const closeAISettings = useAIStore((s) => s.closeSettings)
-  const aiConfig = useAIStore((s) => s.config)
+  const multiProviderConfig = useAIStore((s) => s.multiProviderConfig)
   const isAIConfigured = useAIStore((s) => s.isConfigured)
-  const setAIConfig = useAIStore((s) => s.setConfig)
+  const setProviderConfig = useAIStore((s) => s.setProviderConfig)
+  const removeProviderConfig = useAIStore((s) => s.removeProviderConfig)
+  const setActiveProvider = useAIStore((s) => s.setActiveProvider)
+  const setActiveModel = useAIStore((s) => s.setActiveModel)
+  const loadConfigFromMain = useAIStore((s) => s.loadConfigFromMain)
 
   // Get schemas for AI context
   const schemas = useConnectionStore((s) => s.schemas)
@@ -83,6 +105,12 @@ function LayoutContent() {
   // Tab store for opening SQL in new tab
   const createQueryTab = useTabStore((s) => s.createQueryTab)
   const setActiveTab = useTabStore((s) => s.setActiveTab)
+  const syncActiveTabWithConnection = useTabStore((s) => s.syncActiveTabWithConnection)
+
+  // Track active connection ID for sync effect
+  const activeConnectionId = useConnectionStore((s) => s.activeConnectionId)
+
+  const platform = window.electron.process.platform
 
   // Handle opening SQL in a new tab (without execution)
   const handleAIOpenInTab = useCallback(
@@ -93,7 +121,27 @@ function LayoutContent() {
     [activeConnection, createQueryTab, setActiveTab]
   )
 
-  // Handle connection switching
+  // Load AI config from main process on mount
+  useEffect(() => {
+    loadConfigFromMain()
+  }, [loadConfigFromMain])
+
+  // Listen for settings menu event
+  useEffect(() => {
+    const cleanup = window.api.menu.onOpenSettings(() => {
+      setIsSettingsOpen(true)
+    })
+    return cleanup
+  }, [])
+
+  // Sync active query tab's connection when the active connection changes
+  useEffect(() => {
+    if (activeConnectionId) {
+      syncActiveTabWithConnection(activeConnectionId)
+    }
+  }, [activeConnectionId, syncActiveTabWithConnection])
+
+  // Handle connection switching (used by keyboard shortcuts)
   const handleSelectConnection = useCallback(
     (connectionId: string) => {
       setConnectionStatus(connectionId, { isConnecting: true, error: undefined })
@@ -105,218 +153,43 @@ function LayoutContent() {
     [setConnectionStatus, setActiveConnection]
   )
 
-  // Command palette commands
-  const commands = useMemo<CommandItem[]>(() => {
-    const cmds: CommandItem[] = [
-      // AI Commands
-      {
-        id: 'ai-open',
-        label: 'Open AI Assistant',
-        description: 'Chat with AI to generate SQL queries',
-        icon: <Sparkles className="size-4 text-blue-400" />,
-        shortcut: ['⌘', 'I'],
-        category: 'AI',
-        action: () => openAIPanel(),
-        keywords: ['chat', 'assistant', 'generate', 'sql']
-      },
-      {
-        id: 'ai-settings',
-        label: 'AI Settings',
-        description: 'Configure AI provider and API key',
-        icon: <Sparkles className="size-4 text-blue-400" />,
-        category: 'AI',
-        action: () => openAISettings(),
-        keywords: ['api', 'key', 'provider', 'openai', 'anthropic']
-      },
-
-      // Connection Commands
-      {
-        id: 'connection-picker',
-        label: 'Switch Connection',
-        description: 'Open connection picker',
-        icon: <Database className="size-4 text-emerald-400" />,
-        shortcut: ['⌘', 'P'],
-        category: 'Connections',
-        action: () => setIsConnectionPickerOpen(true),
-        keywords: ['database', 'connect', 'switch']
-      },
-      {
-        id: 'connection-refresh',
-        label: 'Refresh Schema',
-        description: 'Reload database schema',
-        icon: <RefreshCw className="size-4 text-emerald-400" />,
-        category: 'Connections',
-        action: () => {
-          if (activeConnection) {
-            fetchSchemas(activeConnection.id)
-          }
-        },
-        keywords: ['reload', 'schema', 'tables']
-      },
-
-      // Query Commands
-      {
-        id: 'query-new',
-        label: 'New Query Tab',
-        description: 'Create a new query tab',
-        icon: <Plus className="size-4 text-amber-400" />,
-        shortcut: ['⌘', 'T'],
-        category: 'Queries',
-        action: () => {
-          const tabId = createQueryTab(activeConnection?.id || null)
-          setActiveTab(tabId)
-        },
-        keywords: ['tab', 'editor', 'sql']
-      },
-      {
-        id: 'query-saved',
-        label: 'Saved Queries',
-        description: 'Browse and load saved queries',
-        icon: <Bookmark className="size-4 text-amber-400" />,
-        category: 'Queries',
-        action: () => setIsSavedQueriesOpen(true),
-        keywords: ['bookmark', 'favorites', 'history']
-      },
-
-      // Navigation Commands
-      {
-        id: 'nav-settings',
-        label: 'Settings',
-        description: 'Open application settings',
-        icon: <Settings className="size-4 text-purple-400" />,
-        category: 'Navigation',
-        action: () => navigate({ to: '/settings' }),
-        keywords: ['preferences', 'config']
-      },
-      {
-        id: 'nav-sidebar',
-        label: 'Toggle Sidebar',
-        description: 'Show or hide the sidebar',
-        icon: <Command className="size-4 text-purple-400" />,
-        shortcut: ['⌘', 'B'],
-        category: 'Navigation',
-        action: () => toggleSidebar(),
-        keywords: ['panel', 'hide', 'show']
-      },
-      {
-        id: 'nav-shortcuts',
-        label: 'Keyboard Shortcuts',
-        description: 'View all keyboard shortcuts',
-        icon: <Keyboard className="size-4 text-purple-400" />,
-        category: 'Navigation',
-        action: () => navigate({ to: '/settings' }),
-        keywords: ['hotkeys', 'keybindings']
-      },
-
-      // Appearance Commands
-      {
-        id: 'theme-light',
-        label: 'Light Theme',
-        description: 'Switch to light mode',
-        icon: <Sun className="size-4 text-pink-400" />,
-        category: 'Appearance',
-        action: () => setTheme('light'),
-        keywords: ['mode', 'bright']
-      },
-      {
-        id: 'theme-dark',
-        label: 'Dark Theme',
-        description: 'Switch to dark mode',
-        icon: <Moon className="size-4 text-pink-400" />,
-        category: 'Appearance',
-        action: () => setTheme('dark'),
-        keywords: ['mode', 'night']
-      },
-      {
-        id: 'theme-system',
-        label: 'System Theme',
-        description: 'Follow system preference',
-        icon: <Monitor className="size-4 text-pink-400" />,
-        category: 'Appearance',
-        action: () => setTheme('system'),
-        keywords: ['mode', 'auto']
-      }
-    ]
-
-    // Add connection quick-switch commands
-    connections.slice(0, 9).forEach((conn, index) => {
-      cmds.push({
-        id: `connection-${conn.id}`,
-        label: conn.name,
-        description: `Switch to ${conn.dbType} connection`,
-        icon: <Database className="size-4 text-emerald-400" />,
-        shortcut: ['⌘', '⇧', String(index + 1)],
-        category: 'Connections',
-        action: () => handleSelectConnection(conn.id),
-        keywords: [conn.dbType, conn.host || '']
-      })
-    })
-
-    return cmds
-  }, [
-    activeConnection,
-    connections,
-    createQueryTab,
-    fetchSchemas,
-    handleSelectConnection,
-    navigate,
-    openAIPanel,
-    openAISettings,
-    setActiveTab,
-    setTheme,
-    toggleSidebar
-  ])
+  // Open command palette with specific page
+  const openCommandPalette = useCallback((page: CommandPalettePage = 'home') => {
+    setCommandPaletteInitialPage(page)
+    setIsCommandPaletteOpen(true)
+  }, [])
 
   // Global keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const isMeta = e.metaKey || e.ctrlKey
-
-      // Cmd+K: Open command palette
-      if (isMeta && e.key === 'k' && !e.shiftKey) {
-        e.preventDefault()
-        setIsCommandPaletteOpen(true)
-        return
-      }
-
-      // Cmd+P: Open connection picker
-      if (isMeta && e.key === 'p' && !e.shiftKey) {
-        e.preventDefault()
-        setIsConnectionPickerOpen(true)
-        return
-      }
-
-      // Cmd+I: Toggle AI panel
-      if (isMeta && e.key === 'i' && !e.shiftKey) {
-        e.preventDefault()
-        toggleAIPanel()
-        return
-      }
-
-      // Cmd+Shift+1-9: Switch to connection N
-      if (isMeta && e.shiftKey && e.key >= '1' && e.key <= '9') {
-        e.preventDefault()
-        const connectionIndex = parseInt(e.key) - 1
-        if (connections[connectionIndex]) {
-          handleSelectConnection(connections[connectionIndex].id)
+  const globalHotkeys = useMemo<UseHotkeyDefinition[]>(
+    () => [
+      { hotkey: 'Mod+K', callback: () => openCommandPalette('home') },
+      { hotkey: 'Mod+P', callback: () => openCommandPalette('connections:switch') },
+      { hotkey: 'Mod+I', callback: () => toggleAIPanel() },
+      ...Array.from({ length: 9 }, (_, i) => ({
+        hotkey: `Mod+Shift+${i + 1}` as Hotkey,
+        callback: () => {
+          if (connections[i]) handleSelectConnection(connections[i].id)
         }
-        return
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [connections, handleSelectConnection, toggleAIPanel])
+      }))
+    ],
+    [connections, handleSelectConnection, openCommandPalette, toggleAIPanel]
+  )
+  useHotkeys(globalHotkeys)
 
   return (
     <>
       <AppSidebar />
       <SidebarInset>
-        <header className="titlebar-drag-region flex h-14 shrink-0 items-center gap-2 border-b border-border/40 bg-background/80 backdrop-blur-xl">
+        <header
+          className={cn(
+            'titlebar-drag-region flex h-14 shrink-0 items-center gap-2 border-b border-border/40 bg-background/80 backdrop-blur-xl transition-[margin] duration-200 ease-linear',
+            sidebarState === 'collapsed' && platform === 'darwin' && 'ml-[72px]'
+          )}
+        >
           <div className="flex flex-1 items-center gap-2 px-3">
             <SidebarTrigger className="titlebar-no-drag" />
             <Separator orientation="vertical" className="mr-2 data-[orientation=vertical]:h-4" />
-            <span className="text-sm font-medium text-muted-foreground">data-peek</span>
+            <span className="text-sm font-medium text-muted-foreground">Data Peek</span>
             {activeConnection && (
               <>
                 <Separator
@@ -346,7 +219,7 @@ function LayoutContent() {
                   <Command className="size-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">Command Palette (⌘K)</TooltipContent>
+              <TooltipContent side="bottom">Command Palette ({keys.mod}+K)</TooltipContent>
             </Tooltip>
             {/* AI Assistant Button */}
             <Tooltip>
@@ -363,13 +236,19 @@ function LayoutContent() {
                   <Sparkles className="size-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">AI Assistant (⌘I)</TooltipContent>
+              <TooltipContent side="bottom">AI Assistant ({keys.mod}+I)</TooltipContent>
             </Tooltip>
             <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
             <LicenseStatusIndicator />
             <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
             <NavActions />
           </div>
+          {platform === 'win32' && (
+            <>
+              <Separator orientation="vertical" className="data-[orientation=vertical]:h-4 -ml-3" />
+              <TitlebarActions />
+            </>
+          )}
         </header>
 
         <Outlet />
@@ -379,14 +258,33 @@ function LayoutContent() {
       <CommandPalette
         isOpen={isCommandPaletteOpen}
         onClose={() => setIsCommandPaletteOpen(false)}
-        commands={commands}
+        initialPage={commandPaletteInitialPage}
+        onOpenAddConnection={() => setIsAddConnectionOpen(true)}
+        onOpenEditConnection={(id) => setEditConnectionId(id)}
       />
+
+      <McpApprovalDialog />
 
       {/* Global Connection Picker */}
       <ConnectionPicker open={isConnectionPickerOpen} onOpenChange={setIsConnectionPickerOpen} />
 
       {/* Saved Queries Dialog */}
       <SavedQueriesDialog open={isSavedQueriesOpen} onOpenChange={setIsSavedQueriesOpen} />
+
+      {/* Add/Edit Connection Dialog (triggered from command palette) */}
+      <AddConnectionDialog
+        open={isAddConnectionOpen || editConnectionId !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setIsAddConnectionOpen(false)
+            setEditConnectionId(null)
+          }
+        }}
+        connection={editConnectionId ? connections.find((c) => c.id === editConnectionId) : null}
+      />
+
+      {/* Settings Modal */}
+      <SettingsModal open={isSettingsOpen} onOpenChange={setIsSettingsOpen} />
 
       {/* License Modals */}
       <LicenseActivationModal open={isActivationModalOpen} onOpenChange={closeActivationModal} />
@@ -407,16 +305,30 @@ function LayoutContent() {
       <AISettingsModal
         isOpen={isAISettingsOpen}
         onClose={closeAISettings}
-        currentConfig={aiConfig}
-        onSave={async (config) => {
+        multiProviderConfig={multiProviderConfig}
+        onSaveProviderConfig={async (provider, config) => {
           // Save to local store
-          setAIConfig(config)
+          setProviderConfig(provider, config)
           // Save to main process
-          await window.api.ai.setConfig(config)
+          await window.api.ai.setProviderConfig(provider, config)
         }}
-        onClear={async () => {
-          setAIConfig(null)
-          await window.api.ai.clearConfig()
+        onRemoveProviderConfig={async (provider) => {
+          // Remove from local store
+          removeProviderConfig(provider)
+          // Remove from main process
+          await window.api.ai.removeProviderConfig(provider)
+        }}
+        onSetActiveProvider={async (provider) => {
+          // Set active in local store
+          setActiveProvider(provider)
+          // Set active in main process
+          await window.api.ai.setActiveProvider(provider)
+        }}
+        onSetActiveModel={async (provider, model) => {
+          // Set model in local store
+          setActiveModel(provider, model)
+          // Set model in main process
+          await window.api.ai.setActiveModel(provider, model)
         }}
       />
     </>
@@ -425,10 +337,20 @@ function LayoutContent() {
 
 // Root Layout wrapper that provides context
 function RootLayout() {
+  // Initialize auto-updater notifications
+  useAutoUpdater()
+
+  const pokemonBuddyEnabled = useSettingsStore((s) => s.pokemonBuddyEnabled)
+
+  // Track queries for Pokemon buddy analytics
+  usePokemonTracker()
+
   return (
     <ThemeProvider defaultTheme="dark" storageKey="data-peek-theme">
       <SidebarProvider>
         <LayoutContent />
+        <Notifications />
+        {pokemonBuddyEnabled && <PokemonBuddy />}
       </SidebarProvider>
     </ThemeProvider>
   )
@@ -452,6 +374,7 @@ function ThemeOption({
 
   return (
     <button
+      type="button"
       onClick={() => onSelect(value)}
       className={cn(
         'flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-all',
@@ -504,7 +427,15 @@ function SettingsPage() {
     hideQueryEditorByDefault,
     expandJsonByDefault,
     setHideQueryEditorByDefault,
-    setExpandJsonByDefault
+    setExpandJsonByDefault,
+    hideQuickQueryPanel,
+    setHideQuickQueryPanel,
+    queryTimeoutMs,
+    setQueryTimeoutMs,
+    pokemonBuddyEnabled,
+    setPokemonBuddyEnabled,
+    jsonExpandDepth,
+    setJsonExpandDepth
   } = useSettingsStore()
 
   return (
@@ -515,7 +446,7 @@ function SettingsPage() {
         </Link>
         <h1 className="text-2xl font-semibold">Settings</h1>
       </div>
-      <div className="space-y-6 max-w-2xl">
+      <div className="space-y-6 max-w-2xl pb-10">
         {/* License */}
         <div className="rounded-lg border border-border/50 bg-card p-4">
           <h2 className="text-lg font-medium mb-2">License</h2>
@@ -546,6 +477,7 @@ function SettingsPage() {
               )}
             </div>
             <button
+              type="button"
               onClick={() =>
                 licenseStatus?.type === 'personal' ? openActivationModal() : openSettingsModal()
               }
@@ -587,6 +519,27 @@ function SettingsPage() {
           </div>
         </div>
 
+        {/* Fun Features */}
+        <div className="rounded-lg border border-border/50 bg-card p-4">
+          <h2 className="text-lg font-medium mb-2">Fun Features</h2>
+          <p className="text-sm text-muted-foreground mb-4">
+            Enable fun features to personalize your experience.
+          </p>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="pokemon-buddy">Pokemon Buddy</Label>
+              <p className="text-xs text-muted-foreground">
+                Show a friendly Pokemon buddy in the sidebar
+              </p>
+            </div>
+            <Switch
+              id="pokemon-buddy"
+              checked={pokemonBuddyEnabled}
+              onCheckedChange={setPokemonBuddyEnabled}
+            />
+          </div>
+        </div>
+
         {/* Keyboard Shortcuts */}
         <div className="rounded-lg border border-border/50 bg-card p-4">
           <h2 className="text-lg font-medium mb-2">Keyboard Shortcuts</h2>
@@ -599,11 +552,14 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Tab Management</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'T']} description="Create new query tab" />
-                <ShortcutRow keys={['⌘', 'W']} description="Close current tab" />
-                <ShortcutRow keys={['⌘', '1-9']} description="Switch to tab by number" />
-                <ShortcutRow keys={['⌘', '⌥', '→']} description="Switch to next tab" />
-                <ShortcutRow keys={['⌘', '⌥', '←']} description="Switch to previous tab" />
+                <ShortcutRow keys={[keys.mod, 'T']} description="Create new query tab" />
+                <ShortcutRow keys={[keys.mod, 'W']} description="Close current tab" />
+                <ShortcutRow keys={[keys.mod, '1-9']} description="Switch to tab by number" />
+                <ShortcutRow keys={[keys.mod, keys.alt, '→']} description="Switch to next tab" />
+                <ShortcutRow
+                  keys={[keys.mod, keys.alt, '←']}
+                  description="Switch to previous tab"
+                />
               </div>
             </div>
 
@@ -611,9 +567,9 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Connections</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'P']} description="Open connection picker" />
+                <ShortcutRow keys={[keys.mod, 'P']} description="Open connection picker" />
                 <ShortcutRow
-                  keys={['⌘', '⇧', '1-9']}
+                  keys={[keys.mod, keys.shift, '1-9']}
                   description="Switch to connection by number"
                 />
               </div>
@@ -623,7 +579,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Sidebar</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'B']} description="Toggle sidebar visibility" />
+                <ShortcutRow keys={[keys.mod, 'B']} description="Toggle sidebar visibility" />
               </div>
             </div>
 
@@ -631,8 +587,24 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Query Editor</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'Enter']} description="Execute/run current query" />
-                <ShortcutRow keys={['⌘', 'Shift', 'F']} description="Format SQL query" />
+                <ShortcutRow keys={[keys.mod, 'Enter']} description="Execute/run current query" />
+                <ShortcutRow keys={[keys.mod, keys.shift, 'F']} description="Format SQL query" />
+                <ShortcutRow keys={[keys.mod, keys.shift, 'W']} description="Toggle Watch Mode" />
+                <ShortcutRow
+                  keys={[keys.mod, keys.shift, 'H']}
+                  description="Toggle Time Machine run history"
+                />
+              </div>
+            </div>
+
+            {/* Data Editing */}
+            <div>
+              <h3 className="text-sm font-semibold text-foreground mb-2">Data Editing</h3>
+              <div className="space-y-1">
+                <ShortcutRow keys={[keys.mod, 'S']} description="Save pending changes" />
+                <ShortcutRow keys={[keys.mod, keys.shift, 'Z']} description="Discard all changes" />
+                <ShortcutRow keys={[keys.mod, keys.shift, 'A']} description="Add new row" />
+                <ShortcutRow keys={['Escape']} description="Exit edit mode" />
               </div>
             </div>
 
@@ -640,7 +612,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">Foreign Keys</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'Click']} description="Open foreign key in new tab" />
+                <ShortcutRow keys={[keys.mod, 'Click']} description="Open foreign key in new tab" />
                 <ShortcutRow keys={['Click']} description="Open foreign key in side panel" />
               </div>
             </div>
@@ -649,7 +621,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">AI Assistant</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'I']} description="Toggle AI assistant panel" />
+                <ShortcutRow keys={[keys.mod, 'I']} description="Toggle AI assistant panel" />
               </div>
             </div>
 
@@ -657,7 +629,7 @@ function SettingsPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground mb-2">General</h3>
               <div className="space-y-1">
-                <ShortcutRow keys={['⌘', 'K']} description="Open command palette" />
+                <ShortcutRow keys={[keys.mod, 'K']} description="Open command palette" />
               </div>
             </div>
           </div>
@@ -690,6 +662,17 @@ function SettingsPage() {
               onCheckedChange={setHideQueryEditorByDefault}
             />
           </div>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="hide-quick-query-panel">Hide quick query panel by default</Label>
+              <p className="text-xs text-muted-foreground">Hide the quick query panel by default</p>
+            </div>
+            <Switch
+              id="hide-quick-query-panel"
+              checked={hideQuickQueryPanel}
+              onCheckedChange={setHideQuickQueryPanel}
+            />
+          </div>
         </div>
 
         {/* JSON Display */}
@@ -698,7 +681,7 @@ function SettingsPage() {
           <p className="text-sm text-muted-foreground mb-4">
             Configure how JSON data is displayed in results.
           </p>
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between mb-4">
             <div className="space-y-0.5">
               <Label htmlFor="expand-json">Expand JSON by default</Label>
               <p className="text-xs text-muted-foreground">
@@ -711,31 +694,168 @@ function SettingsPage() {
               onCheckedChange={setExpandJsonByDefault}
             />
           </div>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="json-depth">Default JSON expansion depth</Label>
+              <p className="text-xs text-muted-foreground">
+                How many levels deep JSON should be expanded
+              </p>
+            </div>
+            <Input
+              id="json-depth"
+              type="number"
+              min={1}
+              max={10}
+              className="w-24"
+              value={jsonExpandDepth}
+              onChange={(e) => {
+                const val = parseInt(e.target.value)
+                if (!isNaN(val)) setJsonExpandDepth(val)
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Database */}
+        <div className="rounded-lg border border-border/50 bg-card p-4">
+          <h2 className="text-lg font-medium mb-2">Database</h2>
+          <p className="text-sm text-muted-foreground mb-4">Configure database query behavior.</p>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="query-timeout">Query timeout (seconds)</Label>
+              <p className="text-xs text-muted-foreground">
+                Maximum time to wait for a query to complete. Set to 0 for no timeout.
+              </p>
+            </div>
+            <Input
+              id="query-timeout"
+              type="number"
+              min={0}
+              className="w-24"
+              value={queryTimeoutMs === 0 ? '' : queryTimeoutMs / 1000}
+              placeholder="0"
+              onChange={(e) => {
+                const seconds = e.target.value ? parseFloat(e.target.value) : 0
+                setQueryTimeoutMs(Math.round(seconds * 1000))
+              }}
+            />
+          </div>
         </div>
       </div>
     </div>
   )
 }
 
+function RouteErrorComponent({ error, reset }: ErrorComponentProps) {
+  const router = useRouter()
+
+  return (
+    <div className="flex flex-1 items-center justify-center p-8">
+      <div className="flex flex-col items-center gap-4 max-w-md text-center">
+        <AlertTriangle className="size-10 text-amber-500" />
+        <h2 className="text-lg font-semibold">Something went wrong</h2>
+        <pre className="text-xs text-muted-foreground bg-muted/50 rounded-md p-3 max-w-full overflow-auto whitespace-pre-wrap">
+          {error.message}
+        </pre>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={reset}>
+            Try Again
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => {
+              reset()
+              router.navigate({ to: '/' })
+            }}
+          >
+            Go Home
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export class RootErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex h-screen w-screen items-center justify-center bg-background text-foreground p-8">
+          <div className="flex flex-col items-center gap-4 max-w-md text-center">
+            <AlertTriangle className="size-10 text-amber-500" />
+            <h2 className="text-lg font-semibold">Something went wrong</h2>
+            <pre className="text-xs text-muted-foreground bg-muted/50 rounded-md p-3 max-w-full overflow-auto whitespace-pre-wrap">
+              {this.state.error?.message}
+            </pre>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  this.setState({ hasError: false, error: null })
+                }}
+              >
+                Try Again
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  this.setState({ hasError: false, error: null })
+                  window.location.reload()
+                }}
+              >
+                Reload App
+              </Button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 // Create routes
 const rootRoute = createRootRoute({
-  component: RootLayout
+  component: RootLayout,
+  errorComponent: RouteErrorComponent
 })
 
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
-  component: TabContainer
+  component: TabContainer,
+  errorComponent: RouteErrorComponent
 })
 
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
-  component: SettingsPage
+  component: SettingsPage,
+  errorComponent: RouteErrorComponent
+})
+
+const dashboardRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/dashboard/$dashboardId',
+  component: DashboardView,
+  errorComponent: RouteErrorComponent
 })
 
 // Create route tree
-const routeTree = rootRoute.addChildren([indexRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([indexRoute, settingsRoute, dashboardRoute])
 
 // Create memory history for Electron (file:// protocol doesn't work with browser history)
 const memoryHistory = createMemoryHistory({

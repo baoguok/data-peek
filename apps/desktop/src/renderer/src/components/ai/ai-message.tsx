@@ -1,26 +1,47 @@
-'use client'
-
 import * as React from 'react'
-import { User, Sparkles, Copy, Check, AlertTriangle, Loader2 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import {
+  User,
+  Sparkles,
+  Copy,
+  Check,
+  AlertTriangle,
+  Loader2,
+  CornerDownRight,
+  Pin,
+  BookmarkPlus,
+  LayoutDashboard,
+  NotebookPen
+} from 'lucide-react'
+import {
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger
+} from '@data-peek/ui'
+import { buildWidgetConfig, widgetNameFor, type WidgetSourceData } from '@/lib/ai-widget'
 import { AISQLPreview } from './ai-sql-preview'
 import { AIChart, type ChartData } from './ai-chart'
 import { AIMetricCard, type MetricData } from './ai-metric-card'
 import { AISchemaCard } from './ai-schema-card'
 import { AIQueryResult } from './ai-query-result'
+import { AIReport } from './ai-report'
 import type {
   AIChatMessage,
   AIResponseData,
   AIQueryData,
   AIChartData,
   AIMetricData,
-  AISchemaData
+  AISchemaData,
+  AIReportData
 } from './ai-chat-panel'
 import type { ConnectionConfig, SchemaInfo } from '@data-peek/shared'
+import { isReadOnlySql } from '@data-peek/shared'
 
 interface AIMessageProps {
   message: AIChatMessage
   onOpenInTab: (sql: string) => void
+  onSuggestionClick?: (prompt: string) => void
   connection?: ConnectionConfig | null
   schemas?: SchemaInfo[]
 }
@@ -33,7 +54,13 @@ interface QueryResultState {
   duration: number
 }
 
-export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AIMessageProps) {
+export function AIMessage({
+  message,
+  onOpenInTab,
+  onSuggestionClick,
+  connection,
+  schemas = []
+}: AIMessageProps) {
   const [copiedContent, setCopiedContent] = React.useState(false)
   const [chartData, setChartData] = React.useState<Record<string, unknown>[] | null>(null)
   const [chartLoading, setChartLoading] = React.useState(false)
@@ -45,7 +72,122 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
   const [queryExecuting, setQueryExecuting] = React.useState(false)
   const [queryError, setQueryError] = React.useState<string | null>(null)
 
+  const [pinBusy, setPinBusy] = React.useState(false)
+  const [pinResult, setPinResult] = React.useState<string | null>(null)
+
   const isUser = message.role === 'user'
+
+  // SQL-bearing responses (query/chart/metric) can be pinned into artifacts.
+  const rd = message.responseData
+  const pinnableSql =
+    rd && (rd.type === 'query' || rd.type === 'chart' || rd.type === 'metric') ? rd.sql : null
+
+  const toWidgetSource = (): WidgetSourceData => {
+    if (rd?.type === 'chart') {
+      return {
+        type: 'chart',
+        message: message.content,
+        chartType: rd.chartType,
+        xKey: rd.xKey,
+        yKeys: rd.yKeys,
+        title: rd.title
+      }
+    }
+    if (rd?.type === 'metric') {
+      return { type: 'metric', message: message.content, label: rd.label, format: rd.format }
+    }
+    return { type: 'query', message: message.content }
+  }
+
+  const saveQuery = async () => {
+    if (!pinnableSql) return
+    setPinBusy(true)
+    try {
+      const now = Date.now()
+      await window.api.savedQueries.add({
+        id: crypto.randomUUID(),
+        name: (message.content || 'AI query').slice(0, 60),
+        query: pinnableSql,
+        tags: [],
+        connectionId: connection?.id,
+        usageCount: 0,
+        createdAt: now,
+        updatedAt: now
+      })
+      setPinResult('Saved to Saved Queries')
+    } catch {
+      setPinResult('Save failed')
+    } finally {
+      setPinBusy(false)
+    }
+  }
+
+  const pinToDashboard = async () => {
+    if (!pinnableSql || !connection) return
+    setPinBusy(true)
+    try {
+      const run = await window.api.db.query(connection, pinnableSql)
+      const rows = (run.success && (run.data as { rows?: Record<string, unknown>[] })?.rows) || []
+      const cols = rows[0] ? Object.keys(rows[0]) : []
+      const source = toWidgetSource()
+      const { config, w, h } = buildWidgetConfig(source, cols)
+
+      const list = await window.api.dashboards.list()
+      let dash = list.success && list.data && list.data.length > 0 ? list.data[0] : null
+      if (!dash) {
+        const created = await window.api.dashboards.create({
+          name: 'AI Dashboard',
+          tags: [],
+          widgets: [],
+          layoutCols: 12
+        })
+        dash = created.success ? (created.data ?? null) : null
+      }
+      if (!dash) throw new Error('no dashboard')
+
+      await window.api.dashboards.addWidget(dash.id, {
+        name: widgetNameFor(source),
+        dataSource: { type: 'inline', sql: pinnableSql, connectionId: connection.id },
+        config,
+        layout: { x: 0, y: 0, w, h, minW: 2, minH: 2 },
+        aiGenerated: true
+      })
+      setPinResult(`Added to ${dash.name}`)
+    } catch {
+      setPinResult('Pin failed')
+    } finally {
+      setPinBusy(false)
+    }
+  }
+
+  const addToNotebook = async () => {
+    if (!pinnableSql || !connection) return
+    setPinBusy(true)
+    try {
+      const list = await window.api.notebooks.list()
+      let nb =
+        list.success && list.data
+          ? (list.data.find((n) => n.connectionId === connection.id) ?? null)
+          : null
+      if (!nb) {
+        const created = await window.api.notebooks.create({
+          title: 'AI Notebook',
+          connectionId: connection.id
+        })
+        nb = created.success ? (created.data ?? null) : null
+      }
+      if (!nb) throw new Error('no notebook')
+
+      const full = await window.api.notebooks.get(nb.id)
+      const order = full.success && full.data ? full.data.cells.length : 0
+      await window.api.notebooks.addCell(nb.id, { type: 'sql', content: pinnableSql, order })
+      setPinResult(`Added to ${nb.title}`)
+    } catch {
+      setPinResult('Add failed')
+    } finally {
+      setPinBusy(false)
+    }
+  }
 
   const handleCopyContent = () => {
     navigator.clipboard.writeText(message.content)
@@ -54,52 +196,75 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
   }
 
   // Execute query inline and show results in chat
-  const handleExecuteInline = async (sql: string) => {
-    if (!connection || queryExecuting) return
+  const handleExecuteInline = React.useCallback(
+    async (sql: string) => {
+      if (!connection || queryExecuting) return
 
-    setQueryExecuting(true)
-    setQueryError(null)
+      setQueryExecuting(true)
+      setQueryError(null)
 
-    const startTime = performance.now()
+      const startTime = performance.now()
 
-    try {
-      const response = await window.api.db.query(connection, sql)
-      const duration = Math.round(performance.now() - startTime)
+      try {
+        const response = await window.api.db.query(connection, sql)
+        const duration = Math.round(performance.now() - startTime)
 
-      if (response.success && response.data) {
-        const data = response.data as {
-          rows: Record<string, unknown>[]
-          fields?: Array<{ name: string; dataTypeID?: number }>
+        if (response.success && response.data) {
+          const data = response.data as {
+            rows: Record<string, unknown>[]
+            fields?: Array<{ name: string; dataTypeID?: number }>
+          }
+
+          // Extract column info from fields or first row
+          const columns: Array<{ name: string; type: string }> =
+            data.fields?.map((f) => ({
+              name: f.name,
+              type: f.dataTypeID ? `type_${f.dataTypeID}` : 'unknown'
+            })) ||
+            (data.rows[0]
+              ? Object.keys(data.rows[0]).map((key) => ({
+                  name: key,
+                  type: typeof data.rows[0][key]
+                }))
+              : [])
+
+          setQueryResult({
+            columns,
+            rows: data.rows,
+            totalRows: data.rows.length,
+            duration
+          })
+        } else {
+          setQueryError(response.error || 'Query failed')
         }
-
-        // Extract column info from fields or first row
-        const columns: Array<{ name: string; type: string }> =
-          data.fields?.map((f) => ({
-            name: f.name,
-            type: f.dataTypeID ? `type_${f.dataTypeID}` : 'unknown'
-          })) ||
-          (data.rows[0]
-            ? Object.keys(data.rows[0]).map((key) => ({
-                name: key,
-                type: typeof data.rows[0][key]
-              }))
-            : [])
-
-        setQueryResult({
-          columns,
-          rows: data.rows,
-          totalRows: data.rows.length,
-          duration
-        })
-      } else {
-        setQueryError(response.error || 'Query failed')
+      } catch (err) {
+        setQueryError(err instanceof Error ? err.message : 'Unknown error')
+      } finally {
+        setQueryExecuting(false)
       }
-    } catch (err) {
-      setQueryError(err instanceof Error ? err.message : 'Unknown error')
-    } finally {
-      setQueryExecuting(false)
-    }
-  }
+    },
+    [connection, queryExecuting]
+  )
+
+  // Auto-run read-only queries (SELECT/CTE/SHOW/EXPLAIN) the assistant returns so
+  // results show without a manual click. Writes and anything flagged for
+  // confirmation still wait for the explicit Run button.
+  React.useEffect(() => {
+    if (isUser) return
+    const rd = message.responseData
+    if (rd?.type !== 'query') return
+    if (rd.requiresConfirmation || !isReadOnlySql(rd.sql)) return
+    if (!connection || queryResult || queryExecuting || queryError) return
+    void handleExecuteInline(rd.sql)
+  }, [
+    isUser,
+    message.responseData,
+    connection,
+    queryResult,
+    queryExecuting,
+    queryError,
+    handleExecuteInline
+  ])
 
   // Fetch chart data when chart response is received
   React.useEffect(() => {
@@ -188,6 +353,7 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
               onExecute={() => handleExecuteInline(queryData.sql)}
               onOpenInTab={() => onOpenInTab(queryData.sql)}
               isExecuting={queryExecuting}
+              requiresConfirmation={queryData.requiresConfirmation}
             />
 
             {/* Query Error */}
@@ -339,6 +505,17 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
         )
       }
 
+      case 'report': {
+        const reportData = data as AIReportData
+        return (
+          <AIReport
+            widgets={reportData.widgets}
+            connection={connection}
+            onOpenInTab={onOpenInTab}
+          />
+        )
+      }
+
       default:
         return null
     }
@@ -399,11 +576,17 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
                 }
                 return part
               })}
+              {/* Streaming caret while prose is still arriving */}
+              {!isUser && message.streaming && (
+                <span className="inline-block w-1 h-3.5 ml-0.5 -mb-0.5 bg-blue-400/80 animate-pulse align-middle" />
+              )}
             </div>
 
             {/* Copy button */}
             {!isUser && message.content.length > 20 && (
               <button
+                type="button"
+                aria-label="Copy message"
                 onClick={handleCopyContent}
                 className="absolute -right-1 -top-1 opacity-0 group-hover/content:opacity-100 transition-opacity p-1 rounded bg-muted hover:bg-muted/80"
               >
@@ -417,8 +600,88 @@ export function AIMessage({ message, onOpenInTab, connection, schemas = [] }: AI
           </div>
         )}
 
+        {/* Live streaming activity: a grounding/tool step, or "Thinking…" before
+            any prose has arrived. Hidden once prose is streaming with no active step. */}
+        {!isUser && message.streaming && (message.activity || !message.content) && (
+          <div className="flex items-center gap-1.5 text-[11px] text-blue-400/90">
+            <Loader2 className="size-3 animate-spin" />
+            {message.activity ?? 'Thinking…'}
+          </div>
+        )}
+
+        {/* Grounded-against-DB indicator (BYOH agentic mode queried the live DB) */}
+        {!isUser && message.grounded && (
+          <div className="flex items-center gap-1 text-[10px] text-green-400/90">
+            <Check className="size-3" />
+            Grounded against your database
+          </div>
+        )}
+
         {/* Response data (query, chart, metric, schema) */}
         {message.responseData && renderResponseData(message.responseData)}
+
+        {/* Pin to a dashboard / notebook / saved query */}
+        {!isUser && !message.streaming && pinnableSql && connection && (
+          <div className="flex items-center gap-2 mt-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  disabled={pinBusy}
+                  className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                >
+                  {pinBusy ? (
+                    <Loader2 className="size-3 animate-spin" />
+                  ) : (
+                    <Pin className="size-3" />
+                  )}
+                  Pin
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-48">
+                <DropdownMenuItem onClick={saveQuery}>
+                  <BookmarkPlus className="size-3.5" />
+                  Save query
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={pinToDashboard}>
+                  <LayoutDashboard className="size-3.5" />
+                  Add to dashboard
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={addToNotebook}>
+                  <NotebookPen className="size-3.5" />
+                  Add to notebook cell
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {pinResult && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-green-400/90">
+                <Check className="size-3" />
+                {pinResult}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Follow-up suggestion chips */}
+        {!isUser &&
+          !message.streaming &&
+          onSuggestionClick &&
+          message.suggestions &&
+          message.suggestions.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2.5">
+              {message.suggestions.slice(0, 3).map((s, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => onSuggestionClick(s)}
+                  className="inline-flex items-center gap-1 rounded-full border border-blue-500/25 bg-blue-500/5 px-2.5 py-1 text-xs text-blue-300/90 hover:bg-blue-500/10 hover:border-blue-500/40 transition-colors"
+                >
+                  <CornerDownRight className="size-3 opacity-60" />
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
 
         {/* Timestamp */}
         <p className="text-[10px] text-muted-foreground/50 mt-1">

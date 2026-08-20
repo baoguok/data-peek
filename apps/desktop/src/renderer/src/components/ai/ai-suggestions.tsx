@@ -1,8 +1,6 @@
-'use client'
-
 import * as React from 'react'
 import { Table2, Clock, TrendingUp, Search, GitBranch, Users } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn } from '@data-peek/ui'
 import type { SchemaInfo } from '@data-peek/shared'
 
 interface AISuggestionsProps {
@@ -94,7 +92,8 @@ export function AISuggestions({ schemas, onSelect }: AISuggestionsProps) {
     <div className="flex flex-wrap gap-2 justify-center max-w-[320px]">
       {suggestions.map((suggestion, index) => (
         <button
-          key={index}
+          type="button"
+          key={suggestion.query}
           onClick={() => onSelect(suggestion.query)}
           className={cn(
             'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg',

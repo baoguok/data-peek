@@ -29,6 +29,7 @@ pnpm --filter @data-peek/desktop build:linux
 ## Architecture
 
 ### Monorepo Structure (pnpm workspaces)
+
 ```
 apps/desktop/           # Electron desktop application
 apps/web/               # Next.js web app (license API, marketing)
@@ -38,6 +39,7 @@ seeds/                  # Database seed files for testing
 ```
 
 ### Desktop App Layers
+
 ```
 src/main/               # Electron main process (Node.js)
   index.ts              # IPC handlers, DB connections, query execution
@@ -67,6 +69,7 @@ src/renderer/src/       # React frontend
 ### IPC Contract
 
 The preload script exposes `window.api`:
+
 ```typescript
 window.api.connections.{list, add, update, delete}
 window.api.db.{connect, query, schemas, execute, previewSql, explain}
@@ -81,6 +84,7 @@ All IPC types are defined in `packages/shared/src/index.ts`.
 ### Database Adapter Pattern
 
 Multi-database support via adapters in `src/main/adapters/`:
+
 - `DatabaseAdapter` interface defines standard operations (connect, query, execute, getSchemas, explain, getTableDDL)
 - `getAdapter(config)` returns the appropriate adapter based on `config.dbType`
 - Supported types: `'postgresql' | 'mysql' | 'sqlite' | 'mssql'` (SQLite pending implementation)
@@ -88,6 +92,7 @@ Multi-database support via adapters in `src/main/adapters/`:
 ### State Management
 
 Zustand stores in `src/renderer/src/stores/`:
+
 - `connection-store.ts` - Active connection, available connections, schema cache
 - `query-store.ts` - Query history, execution history
 - `tab-store.ts` - Multiple editor tabs
@@ -128,3 +133,34 @@ Zustand stores in `src/renderer/src/stores/`:
 5. **Schema Caching**: Schema info is fetched once per connection and stored in Zustand.
 
 6. **Licensing**: Commercial use requires license activation via `apps/web` API. Personal use is free.
+
+7. **Feature Documentation**: When adding a new feature, update all three locations:
+   - `README.md` - Add to the appropriate Features section
+   - `docs/` - Update relevant documentation pages
+   - `apps/web/` - Update marketing site if user-facing
+
+## Design Context
+
+### Users
+
+Developers (backend engineers, full-stack devs, data-curious builders) who need to quickly peek at database contents, debug queries, and explore schemas. They're mid-task — checking a migration, verifying data, or writing a query — and want to get in, get answers, and get out.
+
+### Brand Personality
+
+**Fast. Honest. Modern devtool.** Feels like it belongs alongside Linear and Raycast — not DBeaver or pgAdmin.
+
+### Aesthetic Direction
+
+Minimal, technical, monospace-native. Dark mode is the primary design target. Dense where useful, spacious where it aids scanning. No wizard flows, no gratuitous icons, no "website in a window" energy.
+
+### Color System
+
+OKLCH blue (hue 250°) is the canonical accent color across all apps. Desktop app is the source of truth — marketing site, docs, and video assets all use the same blue palette (`#6b8cf5` bright / `#3b52c4` deep). Full details in `.impeccable.md`.
+
+### Design Principles
+
+1. **Data is the UI** — Query results and schemas are the primary interface. Chrome minimizes its footprint.
+2. **Speed over ceremony** — No confirmation dialogs where undo works. Prefer inline editing, command palettes, keyboard shortcuts.
+3. **Dense but scannable** — Embrace information density, use typography weight and subtle color for hierarchy.
+4. **Native, not web-feeling** — Proper titlebar behavior, system font rendering, platform-appropriate shortcuts.
+5. **Quiet confidence** — No flashy animations or decorative elements. Motion only for state transitions, under 200ms.

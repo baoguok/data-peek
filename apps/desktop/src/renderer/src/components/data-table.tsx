@@ -1,39 +1,69 @@
-'use client'
-
 import * as React from 'react'
 import {
   flexRender,
   getCoreRowModel,
   getFilteredRowModel,
   getPaginationRowModel,
-  getSortedRowModel,
   useReactTable,
-  type ColumnDef,
-  type ColumnFiltersState,
-  type SortingState
+  type ColumnDef
 } from '@tanstack/react-table'
-import {
-  ArrowUpDown,
-  ArrowUp,
-  ArrowDown,
-  ChevronLeft,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
-  Filter,
-  X,
-  Link2,
-  Copy
-} from 'lucide-react'
+import { useVirtualizer, type Virtualizer } from '@tanstack/react-virtual'
+import { ArrowUpDown, ArrowUp, ArrowDown, Link2, Copy, BarChart2, Lock, Unlock } from 'lucide-react'
 import type { ForeignKeyInfo } from '@data-peek/shared'
-import { Input } from '@/components/ui/input'
+import { RowContextMenu } from '@/components/row-context-menu'
+import {
+  Button,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+  Badge,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@data-peek/ui'
 
-import { Button } from '@/components/ui/button'
 import { JsonCellValue } from '@/components/json-cell-value'
 import { FKCellValue } from '@/components/fk-cell-value'
-import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Badge } from '@/components/ui/badge'
+import { SmartFilterBar, chipMatchesRow, type FilterChip } from '@/components/smart-filter-bar'
+import { SmartSortBar } from '@/components/sort/smart-sort-bar'
+import {
+  applySorts,
+  toggleColumnSort,
+  type NullsPosition,
+  type SortChip,
+  type SortMode
+} from '@/lib/sort-model'
+import type { SortScope } from '@/lib/sort-scope'
+
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { getTypeColor } from '@/lib/type-colors'
+import { PaginationControls } from '@/components/pagination-controls'
+import { useSettingsStore } from '@/stores/settings-store'
+import { useMaskingStore } from '@/stores/masking-store'
+import { CellGridInspector, CellGridOverlays, useCellGrid } from '@/components/cell-grid'
+import { WatchDecorationOverlay } from '@/components/cell-grid/watch-decoration-overlay'
+import { useWatchStore } from '@/stores/watch-store'
+import type { WatchDiff } from '@/lib/watch-types'
+import {
+  INLINE_ADDED_ROW_STYLE,
+  INLINE_CHANGED_CELL_STYLE,
+  inlineDiffPlan,
+  isInlineChangedCell,
+  isPinnedDiffView,
+  resolveInlineRowDecoration,
+  selectInlineWatchDiff
+} from '@/lib/watch-inline-diff'
+
+const VIRTUALIZATION_THRESHOLD = 50
+const ROW_HEIGHT = 37
 
 // Export types for parent components
 export interface DataTableFilter {
@@ -44,6 +74,12 @@ export interface DataTableFilter {
 export interface DataTableSort {
   column: string
   direction: 'asc' | 'desc'
+  /**
+   * Carried so the consumer can tell whether this sort survives translation to SQL.
+   * Absent means a plain column sort, which always does.
+   */
+  mode?: SortMode
+  nullsPosition?: NullsPosition
 }
 
 export interface DataTableColumn {
@@ -53,36 +89,42 @@ export interface DataTableColumn {
 }
 
 interface DataTableProps<TData> {
+  tabId?: string
   columns: DataTableColumn[]
   data: TData[]
   pageSize?: number
   onFiltersChange?: (filters: DataTableFilter[]) => void
   onSortingChange?: (sorting: DataTableSort[]) => void
+  onPageSizeChange?: (size: number) => void
+  /** Push the active filters into the query's WHERE clause. Filter bar only. */
+  onApplyToQuery?: () => void
+  /**
+   * Whether a client-side sort covers every row, or only the loaded slice.
+   * Defaults to `complete` over `data` — correct for callers that hand the table
+   * the entire result set. Paginated callers must pass their real scope.
+   */
+  sortScope?: SortScope
+  /** True while a server-side sort re-run is debouncing or in flight. */
+  isSortingOnServer?: boolean
+  /** Rewrite ORDER BY and re-run so the sort covers rows not yet loaded. */
+  onSortWholeSet?: () => void
   /** Called when user clicks a FK cell (opens panel) */
   onForeignKeyClick?: (foreignKey: ForeignKeyInfo, value: unknown) => void
   /** Called when user Cmd+clicks a FK cell (opens new tab) */
   onForeignKeyOpenTab?: (foreignKey: ForeignKeyInfo, value: unknown) => void
+  /** Called when user requests column statistics for a column */
+  onColumnStatsClick?: (column: DataTableColumn) => void
+  /**
+   * Pinned cell-diff decorations (Time Machine compare view). Unlike the watch
+   * diff these never fade and never change after mount, so they're passed in
+   * rather than subscribed to. Watch Mode does not use this prop — it reaches
+   * the grid through the watch store instead (see `selectInlineWatchDiff` and
+   * `WatchOverlay` below).
+   */
+  diffOverlay?: WatchDiff | null
 }
 
-function getTypeColor(type: string): string {
-  const lower = type.toLowerCase()
-  if (lower.includes('uuid')) return 'text-purple-400'
-  if (lower.includes('varchar') || lower.includes('text') || lower.includes('char'))
-    return 'text-green-400'
-  if (
-    lower.includes('int') ||
-    lower.includes('numeric') ||
-    lower.includes('decimal') ||
-    lower.includes('bigint')
-  )
-    return 'text-blue-400'
-  if (lower.includes('timestamp') || lower.includes('date') || lower.includes('time'))
-    return 'text-orange-400'
-  if (lower.includes('bool')) return 'text-yellow-400'
-  return 'text-muted-foreground'
-}
-
-function CellValue({
+const CellValue = React.memo(function CellValue({
   value,
   dataType,
   columnName,
@@ -97,7 +139,7 @@ function CellValue({
   onForeignKeyClick?: (foreignKey: ForeignKeyInfo, value: unknown) => void
   onForeignKeyOpenTab?: (foreignKey: ForeignKeyInfo, value: unknown) => void
 }) {
-  const [copied, setCopied] = React.useState(false)
+  const { copied, copy } = useCopyToClipboard({ resetDelay: 1500 })
   const lowerType = dataType.toLowerCase()
 
   // Handle JSON/JSONB types specially
@@ -117,26 +159,44 @@ function CellValue({
     )
   }
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(String(value ?? ''))
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
-  }
-
   if (value === null || value === undefined) {
     return <span className="text-muted-foreground/50 italic">NULL</span>
   }
 
+  // Handle boolean types with colored display
+  if (lowerType.includes('bool')) {
+    const boolVal = value === true || value === 'true' || value === 't' || value === 1
+    return (
+      <button
+        type="button"
+        onClick={() => copy(String(value))}
+        className={`text-xs font-mono px-1.5 py-0.5 -mx-1 rounded hover:bg-accent/50 transition-colors ${
+          boolVal ? 'text-green-500' : 'text-red-400'
+        }`}
+      >
+        {String(value)}
+      </button>
+    )
+  }
+
   const stringValue = String(value)
   const isLong = stringValue.length > 50
-  const isMono = lowerType.includes('uuid') || lowerType.includes('int')
+  const isMono =
+    lowerType.includes('uuid') ||
+    lowerType.includes('int') ||
+    lowerType.includes('numeric') ||
+    lowerType.includes('decimal') ||
+    lowerType.includes('float') ||
+    lowerType.includes('double') ||
+    lowerType.includes('money')
 
   return (
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
           <button
-            onClick={handleCopy}
+            type="button"
+            onClick={() => copy(stringValue)}
             className={`text-left truncate max-w-[300px] hover:bg-accent/50 px-1 -mx-1 rounded transition-colors ${isMono ? 'font-mono text-xs' : ''}`}
           >
             {isLong ? stringValue.substring(0, 50) + '...' : stringValue}
@@ -145,7 +205,12 @@ function CellValue({
         <TooltipContent side="bottom" className="max-w-md">
           <div className="flex items-start gap-2">
             <pre className="text-xs whitespace-pre-wrap break-all flex-1">{stringValue}</pre>
-            <Button variant="ghost" size="icon" className="size-6 shrink-0" onClick={handleCopy}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 shrink-0"
+              onClick={() => copy(stringValue)}
+            >
               <Copy className="size-3" />
             </Button>
           </div>
@@ -154,49 +219,145 @@ function CellValue({
       </Tooltip>
     </TooltipProvider>
   )
-}
+})
+
+const MaskedCell = React.memo(function MaskedCell({
+  isMasked,
+  hoverToPeek,
+  children
+}: {
+  isMasked: boolean
+  hoverToPeek: boolean
+  children: React.ReactNode
+}) {
+  const [peeking, setPeeking] = React.useState(false)
+
+  if (!isMasked) return <>{children}</>
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!hoverToPeek) return
+    if (e.altKey) {
+      if (!peeking) setPeeking(true)
+    } else if (peeking) {
+      setPeeking(false)
+    }
+  }
+
+  const handleMouseLeave = () => setPeeking(false)
+
+  return (
+    <span
+      style={peeking ? undefined : { filter: 'blur(5px)', userSelect: 'none' }}
+      onMouseEnter={handleMouseMove}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+      className="inline-block select-none"
+    >
+      {children}
+    </span>
+  )
+})
 
 export function DataTable<TData extends Record<string, unknown>>({
+  tabId,
   columns: columnDefs,
   data,
-  pageSize = 50,
+  pageSize: propPageSize,
   onFiltersChange,
   onSortingChange,
+  onPageSizeChange,
+  onApplyToQuery,
+  sortScope,
+  isSortingOnServer,
+  onSortWholeSet,
   onForeignKeyClick,
-  onForeignKeyOpenTab
+  onForeignKeyOpenTab,
+  onColumnStatsClick,
+  diffOverlay
 }: DataTableProps<TData>) {
-  const [sorting, setSorting] = React.useState<SortingState>([])
-  const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>([])
-  const [showFilters, setShowFilters] = React.useState(false)
+  const { defaultPageSize } = useSettingsStore()
+  const toggleColumnMask = useMaskingStore((s) => s.toggleColumnMask)
+  const hoverToPeek = useMaskingStore((s) => s.hoverToPeek)
+  const maskedColumnsMap = useMaskingStore((s) => s.maskedColumns)
+  const autoMaskRules = useMaskingStore((s) => s.autoMaskRules)
+  const autoMaskEnabled = useMaskingStore((s) => s.autoMaskEnabled)
+  const getEffectiveMaskedColumns = useMaskingStore((s) => s.getEffectiveMaskedColumns)
 
-  // Notify parent of filter changes
-  React.useEffect(() => {
-    if (onFiltersChange) {
-      const filters: DataTableFilter[] = columnFilters
-        .filter((f) => f.value !== '')
-        .map((f) => ({
-          column: f.id,
-          value: String(f.value)
-        }))
-      onFiltersChange(filters)
-    }
-  }, [columnFilters, onFiltersChange])
+  const allColumnNames = React.useMemo(() => columnDefs.map((c) => c.name), [columnDefs])
+  const effectiveMasked = React.useMemo(
+    () => (tabId ? getEffectiveMaskedColumns(tabId, allColumnNames) : new Set<string>()),
+    [
+      tabId,
+      allColumnNames,
+      getEffectiveMaskedColumns,
+      maskedColumnsMap,
+      autoMaskRules,
+      autoMaskEnabled
+    ]
+  )
+  const pageSize = propPageSize ?? defaultPageSize
+  const [sortChips, setSortChips] = React.useState<SortChip[]>([])
+  const [filterChips, setFilterChips] = React.useState<FilterChip[]>([])
+
+  const sortedData = React.useMemo(() => {
+    if (sortChips.length === 0) return data
+    return applySorts(data, sortChips, columnDefs)
+  }, [data, sortChips, columnDefs])
+
+  const toggleHeaderSort = React.useCallback(
+    (col: { name: string; dataType: string }, multi: boolean) => {
+      setSortChips((prev) => toggleColumnSort(prev, col, { multi }))
+    },
+    []
+  )
+
+  const globalFilterFn = React.useCallback(
+    (row: { original: unknown }): boolean => {
+      if (filterChips.length === 0) return true
+      return filterChips.every((chip) =>
+        chipMatchesRow(chip, row.original as Record<string, unknown>)
+      )
+    },
+    [filterChips]
+  )
+
+  const handleFilterChange = React.useCallback(
+    (chips: FilterChip[]) => {
+      setFilterChips(chips)
+      if (onFiltersChange) {
+        const filters: DataTableFilter[] = chips
+          .filter((c) => c.column !== null)
+          .map((c) => ({
+            column: c.column!,
+            value: c.value
+          }))
+        onFiltersChange(filters)
+      }
+    },
+    [onFiltersChange]
+  )
 
   // Notify parent of sorting changes
   React.useEffect(() => {
     if (onSortingChange) {
-      const sorts: DataTableSort[] = sorting.map((s) => ({
-        column: s.id,
-        direction: s.desc ? 'desc' : 'asc'
+      const sorts: DataTableSort[] = sortChips.map((c) => ({
+        column: c.column,
+        direction: c.direction,
+        mode: c.mode,
+        nullsPosition: c.nullsPosition
       }))
       onSortingChange(sorts)
     }
-  }, [sorting, onSortingChange])
+  }, [sortChips, onSortingChange])
 
   // Generate TanStack Table columns from column definitions
   const columns = React.useMemo<ColumnDef<TData>[]>(
     () =>
-      columnDefs.map((col) => {
+      columnDefs.map((col, index) => {
+        // Generate a stable id for columns - MSSQL can return empty names for aggregates like COUNT(*)
+        const columnId = col.name || `_col_${index}`
+        const displayName = col.name || `(column ${index + 1})`
+
         const lowerType = col.dataType.toLowerCase()
         const isNumeric =
           lowerType.includes('int') ||
@@ -208,32 +369,90 @@ export function DataTable<TData extends Record<string, unknown>>({
           lowerType.includes('money')
 
         return {
+          id: columnId,
           accessorKey: col.name,
-          header: ({ column }) => {
-            const isSorted = column.getIsSorted()
+          enableSorting: false,
+          header: () => {
+            const activeChip = sortChips.find((c) => c.column === col.name)
+            const activeRank = activeChip
+              ? sortChips.findIndex((c) => c.column === col.name) + 1
+              : 0
+            const isMasked = effectiveMasked.has(col.name)
             return (
               <div className="flex flex-col gap-0.5">
-                <Button
-                  variant="ghost"
-                  className="h-auto py-1 px-2 -mx-2 font-medium hover:bg-accent/50"
-                  onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
-                >
-                  <span>{col.name}</span>
-                  {col.foreignKey && <Link2 className="ml-1 size-3 text-blue-400" />}
-                  <Badge
-                    variant="outline"
-                    className={`ml-1.5 text-[9px] px-1 py-0 font-mono ${getTypeColor(col.dataType)}`}
+                <div className="flex items-center">
+                  <Button
+                    variant="ghost"
+                    className="h-auto py-1 px-2 -mx-2 font-medium hover:bg-accent/50 flex-1"
+                    onClick={(e) => toggleHeaderSort(col, e.shiftKey || e.metaKey || e.ctrlKey)}
+                    title="Click to sort, Shift+click for multi-sort"
                   >
-                    {col.dataType}
-                  </Badge>
-                  {isSorted === 'asc' ? (
-                    <ArrowUp className="ml-1 size-3 text-primary" />
-                  ) : isSorted === 'desc' ? (
-                    <ArrowDown className="ml-1 size-3 text-primary" />
-                  ) : (
-                    <ArrowUpDown className="ml-1 size-3 opacity-50" />
+                    <span>{displayName}</span>
+                    {isMasked && <Lock className="ml-1 size-3 text-amber-500" />}
+                    {col.foreignKey && <Link2 className="ml-1 size-3 text-blue-400" />}
+                    <Badge
+                      variant="outline"
+                      className={`ml-1.5 text-[9px] px-1 py-0 font-mono ${getTypeColor(col.dataType)}`}
+                    >
+                      {col.dataType}
+                    </Badge>
+                    {activeChip ? (
+                      <span className="ml-1 inline-flex items-center gap-0.5">
+                        {activeChip.direction === 'asc' ? (
+                          <ArrowUp className="size-3 text-primary" />
+                        ) : (
+                          <ArrowDown className="size-3 text-primary" />
+                        )}
+                        {sortChips.length > 1 && (
+                          <span className="text-[9px] font-mono font-semibold text-primary/80 tabular-nums">
+                            {activeRank}
+                          </span>
+                        )}
+                      </span>
+                    ) : (
+                      <ArrowUpDown className="ml-1 size-3 opacity-50" />
+                    )}
+                  </Button>
+                  {(onColumnStatsClick || tabId) && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          data-testid={`column-stats-trigger-${col.name}`}
+                          className="size-5 ml-0.5 opacity-0 group-hover/head:opacity-100 hover:opacity-100 focus:opacity-100"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <BarChart2 className="size-3" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {onColumnStatsClick && (
+                          <DropdownMenuItem onClick={() => onColumnStatsClick(col)}>
+                            <BarChart2 className="size-3 mr-2" />
+                            Column Statistics
+                          </DropdownMenuItem>
+                        )}
+                        {onColumnStatsClick && tabId && <DropdownMenuSeparator />}
+                        {tabId && (
+                          <DropdownMenuItem onClick={() => toggleColumnMask(tabId, col.name)}>
+                            {isMasked ? (
+                              <>
+                                <Unlock className="size-3 mr-2" />
+                                Unmask Column
+                              </>
+                            ) : (
+                              <>
+                                <Lock className="size-3 mr-2" />
+                                Mask Column
+                              </>
+                            )}
+                          </DropdownMenuItem>
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   )}
-                </Button>
+                </div>
                 {col.foreignKey && (
                   <span className="text-[9px] text-muted-foreground px-2 -mt-0.5">
                     → {col.foreignKey.referencedTable}
@@ -242,16 +461,21 @@ export function DataTable<TData extends Record<string, unknown>>({
               </div>
             )
           },
-          cell: ({ getValue }) => (
-            <CellValue
-              value={getValue()}
-              dataType={col.dataType}
-              columnName={col.name}
-              foreignKey={col.foreignKey}
-              onForeignKeyClick={onForeignKeyClick}
-              onForeignKeyOpenTab={onForeignKeyOpenTab}
-            />
-          ),
+          cell: ({ getValue }) => {
+            const isMasked = effectiveMasked.has(col.name)
+            return (
+              <MaskedCell isMasked={isMasked} hoverToPeek={hoverToPeek}>
+                <CellValue
+                  value={getValue()}
+                  dataType={col.dataType}
+                  columnName={col.name}
+                  foreignKey={col.foreignKey}
+                  onForeignKeyClick={onForeignKeyClick}
+                  onForeignKeyOpenTab={onForeignKeyOpenTab}
+                />
+              </MaskedCell>
+            )
+          },
           filterFn: isNumeric
             ? (row, columnId, filterValue) => {
                 const value = row.getValue(columnId)
@@ -296,83 +520,183 @@ export function DataTable<TData extends Record<string, unknown>>({
             : 'includesString'
         }
       }),
-    [columnDefs, onForeignKeyClick, onForeignKeyOpenTab]
+    [
+      columnDefs,
+      onForeignKeyClick,
+      onForeignKeyOpenTab,
+      onColumnStatsClick,
+      effectiveMasked,
+      tabId,
+      toggleColumnMask,
+      hoverToPeek,
+      sortChips,
+      toggleHeaderSort
+    ]
   )
 
+  const tableState = React.useMemo(
+    () => ({
+      globalFilter: filterChips
+    }),
+    [filterChips]
+  )
+
+  const tableInitialState = React.useMemo(
+    () => ({
+      pagination: { pageSize }
+    }),
+    [pageSize]
+  )
+
+  const tableGlobalFilterFn = React.useCallback(
+    (row: { original: unknown }) => globalFilterFn(row),
+    [globalFilterFn]
+  )
+
+  // A watch tick hands us a fresh `data` array every cadence, and TanStack
+  // resets the page index whenever data identity changes — which would yank a
+  // watcher on page 3 back to page 1 on every tick. A boolean selector keeps
+  // this cheap: it re-renders when the watch is toggled, not per tick (the same
+  // trick query-results.tsx uses for the Time Machine view flag).
+  const isWatching = useWatchStore((s) => !!(tabId && s.states[tabId]?.enabled))
+
   const table = useReactTable({
-    data,
+    data: sortedData,
     columns,
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    onSortingChange: setSorting,
-    onColumnFiltersChange: setColumnFilters,
-    state: {
-      sorting,
-      columnFilters
-    },
-    initialState: {
-      pagination: {
-        pageSize
-      }
-    }
+    globalFilterFn: tableGlobalFilterFn,
+    autoResetPageIndex: !isWatching,
+    state: tableState,
+    initialState: tableInitialState
   })
 
-  const activeFilterCount = columnFilters.filter((f) => f.value !== '').length
+  React.useEffect(() => {
+    table.setPageIndex(0)
+  }, [sortChips, filterChips, table])
 
-  const clearAllFilters = () => {
-    setColumnFilters([])
-  }
+  const tableContainerRef = React.useRef<HTMLDivElement>(null)
+  const headerRef = React.useRef<HTMLTableRowElement>(null)
+  const [columnWidths, setColumnWidths] = React.useState<number[]>([])
+
+  const rows = table.getRowModel().rows
+  const shouldVirtualize = rows.length > VIRTUALIZATION_THRESHOLD
+
+  // Time Machine renders historical rows through this same grid, so the live
+  // watch diff must not decorate them.
+  const isPinnedView = isPinnedDiffView(diffOverlay)
+
+  // Below the threshold the geometry overlay can't paint (no measured column
+  // offsets), so the row map further down tints cells inline instead. Scoped to
+  // the non-virtualized case on purpose: this subscription re-renders the whole
+  // grid on every tick, which is only acceptable at <= 50 rows — and there the
+  // grid re-renders anyway, since a tick replaces `tab.result`.
+  const inlineWatchDiff = useWatchStore((s) =>
+    selectInlineWatchDiff(tabId && !isPinnedView ? s.states[tabId] : undefined, shouldVirtualize)
+  )
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => tableContainerRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 10
+  })
+
+  const columnKey = columnDefs.map((c) => c.name).join(',')
+
+  React.useEffect(() => {
+    setColumnWidths([])
+  }, [columnKey])
+
+  React.useEffect(() => {
+    if (!shouldVirtualize || !headerRef.current) return
+
+    const measureWidths = () => {
+      const headerCells = headerRef.current?.querySelectorAll('th')
+      if (!headerCells) return
+      const widths = Array.from(headerCells, (cell) => cell.offsetWidth)
+      // Skip the update when widths haven't changed — otherwise every ResizeObserver
+      // tick churns geometry identity and re-renders the overlay layer.
+      setColumnWidths((prev) =>
+        prev.length === widths.length && prev.every((w, i) => w === widths[i]) ? prev : widths
+      )
+    }
+
+    const timeoutId = setTimeout(measureWidths, 0)
+
+    const resizeObserver = new ResizeObserver(measureWidths)
+    if (headerRef.current) {
+      resizeObserver.observe(headerRef.current)
+    }
+
+    return () => {
+      clearTimeout(timeoutId)
+      resizeObserver.disconnect()
+    }
+  }, [shouldVirtualize, columnKey])
+
+  const cellGrid = useCellGrid({
+    rows,
+    columnDefs,
+    columnWidths,
+    rowHeight: ROW_HEIGHT,
+    // Must match the sticky <TableHeader> row height; drift causes overlay misalignment.
+    headerHeight: 40,
+    containerRef: tableContainerRef,
+    virtualizer,
+    enabled: shouldVirtualize
+  })
+
+  // Time Machine's pinned diff and Watch Mode's live one are never both active
+  // on the same grid — one comes from a compare view, the other from a watched
+  // tab — so a single inline painter serves both.
+  const inlineDiff = diffOverlay ?? inlineWatchDiff
+  const diffPlan = inlineDiffPlan(inlineDiff)
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      {/* Filter Toggle Bar */}
-      <div className="flex items-center justify-between px-2 py-1.5 border-b border-border/30 shrink-0">
-        <div className="flex items-center gap-2">
-          <Button
-            variant={showFilters ? 'secondary' : 'ghost'}
-            size="sm"
-            className="h-7 gap-1.5 text-xs"
-            onClick={() => setShowFilters(!showFilters)}
-          >
-            <Filter className="size-3" />
-            Filter
-            {activeFilterCount > 0 && (
-              <Badge variant="secondary" className="ml-1 px-1.5 py-0 text-[10px]">
-                {activeFilterCount}
-              </Badge>
-            )}
-          </Button>
-          {activeFilterCount > 0 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 gap-1 text-xs text-muted-foreground"
-              onClick={clearAllFilters}
-            >
-              <X className="size-3" />
-              Clear all
-            </Button>
-          )}
-        </div>
-        <div className="text-xs text-muted-foreground">
-          {table.getFilteredRowModel().rows.length} of {data.length} rows
-        </div>
-      </div>
+      <SmartFilterBar
+        columns={columnDefs}
+        onFilterChange={handleFilterChange}
+        onApplyToQuery={onApplyToQuery}
+        totalRows={data.length}
+        filteredRows={table.getFilteredRowModel().rows.length}
+        className="shrink-0"
+      />
+      <SmartSortBar
+        columns={columnDefs}
+        chips={sortChips}
+        onChipsChange={setSortChips}
+        scope={sortScope ?? { kind: 'complete', rows: data.length }}
+        isSortingOnServer={isSortingOnServer}
+        onSortWholeSet={onSortWholeSet}
+        className="shrink-0"
+      />
 
       {/* Table with single scroll container */}
       <div className="flex-1 min-h-0 border rounded-lg border-border/50 relative">
-        <div className="absolute inset-0 overflow-auto">
+        <CellGridInspector
+          cellGrid={cellGrid}
+          rowCount={rows.length}
+          colCount={columnDefs.length}
+          onForeignKeyOpen={onForeignKeyClick}
+        />
+        <div
+          ref={tableContainerRef}
+          tabIndex={0}
+          onClick={cellGrid.handleGridClick}
+          className="absolute inset-0 overflow-auto outline-none rounded-lg"
+        >
           <table className="w-full min-w-max caption-bottom text-sm">
-            <TableHeader className="sticky top-0 bg-muted/95 backdrop-blur-sm z-10">
+            <TableHeader className="sticky top-0 bg-muted z-10">
               {table.getHeaderGroups().map((headerGroup) => (
                 <React.Fragment key={headerGroup.id}>
-                  <TableRow className="hover:bg-transparent border-border/50">
+                  <TableRow ref={headerRef} className="hover:bg-transparent border-border/50">
                     {headerGroup.headers.map((header) => (
                       <TableHead
                         key={header.id}
-                        className="h-10 text-xs font-medium text-muted-foreground whitespace-nowrap bg-muted/95"
+                        className="h-10 text-xs font-medium text-muted-foreground whitespace-nowrap bg-muted/95 group/head"
                       >
                         {header.isPlaceholder
                           ? null
@@ -380,43 +704,99 @@ export function DataTable<TData extends Record<string, unknown>>({
                       </TableHead>
                     ))}
                   </TableRow>
-                  {/* Filter Row */}
-                  {showFilters && (
-                    <TableRow className="hover:bg-transparent border-border/50 bg-muted/80">
-                      {headerGroup.headers.map((header) => (
-                        <TableHead
-                          key={`filter-${header.id}`}
-                          className="h-9 py-1 px-2 bg-muted/80"
-                        >
-                          {header.column.getCanFilter() ? (
-                            <Input
-                              placeholder={`Filter...`}
-                              value={(header.column.getFilterValue() as string) ?? ''}
-                              onChange={(e) => header.column.setFilterValue(e.target.value)}
-                              className="h-7 text-xs bg-background/80"
-                            />
-                          ) : null}
-                        </TableHead>
-                      ))}
-                    </TableRow>
-                  )}
                 </React.Fragment>
               ))}
             </TableHeader>
             <TableBody>
-              {table.getRowModel().rows?.length ? (
-                table.getRowModel().rows.map((row) => (
-                  <TableRow
-                    key={row.id}
-                    className="hover:bg-accent/30 border-border/30 transition-colors"
-                  >
-                    {row.getVisibleCells().map((cell) => (
-                      <TableCell key={cell.id} className="py-2 text-sm whitespace-nowrap">
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))
+              {rows.length ? (
+                shouldVirtualize && columnWidths.length > 0 ? (
+                  <tr>
+                    <td colSpan={columns.length} style={{ padding: 0 }}>
+                      <div
+                        role="rowgroup"
+                        aria-rowcount={rows.length}
+                        style={{
+                          height: virtualizer.getTotalSize(),
+                          position: 'relative'
+                        }}
+                      >
+                        {virtualizer.getVirtualItems().map((virtualRow) => {
+                          const row = rows[virtualRow.index]
+                          return (
+                            <div
+                              key={row.id}
+                              role="row"
+                              aria-rowindex={row.index + 1}
+                              data-index={virtualRow.index}
+                              className="hover:bg-accent/30 border-b border-border/30 transition-colors flex items-center"
+                              style={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                height: `${virtualRow.size}px`,
+                                transform: `translateY(${virtualRow.start}px)`
+                              }}
+                            >
+                              {row.getVisibleCells().map((cell, cellIndex) => (
+                                <div
+                                  key={cell.id}
+                                  role="cell"
+                                  data-cell-row={virtualRow.index}
+                                  data-cell-col={cellIndex}
+                                  className="py-2 px-4 text-sm whitespace-nowrap overflow-hidden"
+                                  style={{
+                                    width: columnWidths[cellIndex] || 'auto',
+                                    flexShrink: 0
+                                  }}
+                                >
+                                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                </div>
+                              ))}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  rows.map((row) => {
+                    const decoration = resolveInlineRowDecoration(
+                      inlineDiff,
+                      diffPlan,
+                      row.original as Record<string, unknown>,
+                      row.index
+                    )
+                    return (
+                      <RowContextMenu
+                        key={row.id}
+                        row={row.original as Record<string, unknown>}
+                        columns={columnDefs.map((c) => ({ name: c.name, dataType: c.dataType }))}
+                      >
+                        <TableRow
+                          className="hover:bg-accent/30 border-border/30 transition-colors"
+                          style={decoration.isAdded ? INLINE_ADDED_ROW_STYLE : undefined}
+                        >
+                          {row.getVisibleCells().map((cell, cellIndex) => {
+                            const isChangedCell = isInlineChangedCell(
+                              inlineDiff,
+                              decoration,
+                              columnDefs[cellIndex]?.name
+                            )
+                            return (
+                              <TableCell
+                                key={cell.id}
+                                className="py-2 text-sm whitespace-nowrap"
+                                style={isChangedCell ? INLINE_CHANGED_CELL_STYLE : undefined}
+                              >
+                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                              </TableCell>
+                            )
+                          })}
+                        </TableRow>
+                      </RowContextMenu>
+                    )
+                  })
+                )
               ) : (
                 <TableRow>
                   <TableCell colSpan={columns.length} className="h-24 text-center">
@@ -426,58 +806,89 @@ export function DataTable<TData extends Record<string, unknown>>({
               )}
             </TableBody>
           </table>
+          <CellGridOverlays cellGrid={cellGrid} />
+          {/*
+            The geometry overlays below and the inline tints above are mutually
+            exclusive: these need measured column widths, which only the
+            virtualized path produces. Everything at or below the threshold is
+            decorated inline (lib/watch-inline-diff.ts).
+          */}
+          <WatchOverlay
+            tabId={tabId}
+            rows={rows}
+            columnDefs={columnDefs}
+            geometry={cellGrid.geometry}
+            virtualizer={virtualizer}
+            enabled={shouldVirtualize && columnWidths.length > 0 && !isPinnedView}
+          />
+          {diffOverlay && shouldVirtualize && columnWidths.length > 0 && (
+            <WatchDecorationOverlay
+              diff={diffOverlay}
+              rows={rows}
+              columnNames={columnDefs.map((c) => c.name)}
+              geometry={cellGrid.geometry}
+              virtualizer={virtualizer}
+              fadeMs={Number.MAX_SAFE_INTEGER}
+            />
+          )}
         </div>
       </div>
 
       {/* Pagination */}
-      <div className="flex items-center justify-between py-2 shrink-0">
-        <div className="text-xs text-muted-foreground">
-          {table.getFilteredRowModel().rows.length} row(s) total
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="text-xs text-muted-foreground">
-            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
-          </div>
-          <div className="flex items-center gap-1">
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.setPageIndex(0)}
-              disabled={!table.getCanPreviousPage()}
-            >
-              <ChevronsLeft className="size-3.5" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.previousPage()}
-              disabled={!table.getCanPreviousPage()}
-            >
-              <ChevronLeft className="size-3.5" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.nextPage()}
-              disabled={!table.getCanNextPage()}
-            >
-              <ChevronRight className="size-3.5" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-7"
-              onClick={() => table.setPageIndex(table.getPageCount() - 1)}
-              disabled={!table.getCanNextPage()}
-            >
-              <ChevronsRight className="size-3.5" />
-            </Button>
-          </div>
-        </div>
-      </div>
+      <PaginationControls
+        currentPage={table.getState().pagination.pageIndex + 1}
+        totalPages={table.getPageCount()}
+        pageSize={table.getState().pagination.pageSize}
+        totalRows={data.length}
+        filteredRows={table.getFilteredRowModel().rows.length}
+        onPageChange={(page) => table.setPageIndex(page - 1)}
+        onPageSizeChange={(size) => {
+          table.setPageSize(size)
+          onPageSizeChange?.(size)
+        }}
+        canPreviousPage={table.getCanPreviousPage()}
+        canNextPage={table.getCanNextPage()}
+      />
     </div>
+  )
+}
+
+/**
+ * Lightweight wrapper that subscribes to the watch store for this tab and
+ * renders the diff layer. Split out so a per-tick diff change re-renders only
+ * this overlay, not the (potentially thousands of rows) virtualized grid.
+ *
+ * The non-virtualized counterpart can't use this trick — its decorations live
+ * on the grid's own rows — so it subscribes at grid level, bounded to <= 50
+ * rows. See `selectInlineWatchDiff`.
+ */
+function WatchOverlay({
+  tabId,
+  rows,
+  columnDefs,
+  geometry,
+  virtualizer,
+  enabled
+}: {
+  tabId?: string
+  rows: ReadonlyArray<{ original: Record<string, unknown> }>
+  columnDefs: DataTableColumn[]
+  geometry: ReturnType<typeof useCellGrid>['geometry']
+  virtualizer: Virtualizer<HTMLDivElement, Element>
+  enabled: boolean
+}) {
+  const watchState = useWatchStore((s) => (tabId ? s.states[tabId] : null))
+  if (!enabled || !tabId || !watchState || !watchState.enabled || !watchState.diff) {
+    return null
+  }
+  return (
+    <WatchDecorationOverlay
+      diff={watchState.diff}
+      rows={rows}
+      columnNames={columnDefs.map((c) => c.name)}
+      geometry={geometry}
+      virtualizer={virtualizer}
+      fadeMs={watchState.config.fadeMs}
+    />
   )
 }

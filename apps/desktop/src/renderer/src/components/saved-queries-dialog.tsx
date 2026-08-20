@@ -1,5 +1,3 @@
-'use client'
-
 import { useState, useMemo, useEffect, useCallback } from 'react'
 import {
   Bookmark,
@@ -17,22 +15,31 @@ import {
   BarChart3,
   SortAsc
 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import { Input } from '@/components/ui/input'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import {
+  Button,
+  Badge,
+  Input,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  ScrollArea,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  cn,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue
-} from '@/components/ui/select'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+} from '@data-peek/ui'
+
 import { useSavedQueryStore, useConnectionStore, useTabStore } from '@/stores'
-import { cn } from '@/lib/utils'
 import type { SavedQuery } from '@shared/index'
 
 interface SavedQueriesDialogProps {
@@ -109,7 +116,9 @@ export function SavedQueriesDialog({ open, onOpenChange, onEditQuery }: SavedQue
   const [selectedFolder, setSelectedFolder] = useState<string>('all')
   const [selectedTag, setSelectedTag] = useState<string>('all')
   const [sortBy, setSortBy] = useState<SortOption>('lastUsed')
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['(ungrouped)']))
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    () => new Set(['(ungrouped)'])
+  )
 
   // Initialize on open
   useEffect(() => {
@@ -119,8 +128,8 @@ export function SavedQueriesDialog({ open, onOpenChange, onEditQuery }: SavedQue
   }, [open, isInitialized, initializeSavedQueries])
 
   // Get available folders and tags
-  const folders = useMemo(() => getFolders(), [getFolders, savedQueries])
-  const tags = useMemo(() => getTags(), [getTags, savedQueries])
+  const folders = useMemo(() => getFolders(), [getFolders])
+  const tags = useMemo(() => getTags(), [getTags])
 
   // Filter and sort queries
   const filteredQueries = useMemo(() => {
@@ -152,7 +161,7 @@ export function SavedQueriesDialog({ open, onOpenChange, onEditQuery }: SavedQue
     }
 
     // Sort
-    result = [...result].sort((a, b) => {
+    result = result.toSorted((a, b) => {
       switch (sortBy) {
         case 'name':
           return a.name.localeCompare(b.name)

@@ -1,70 +1,52 @@
-import Link from 'next/link'
-import { Button } from '@/components/ui/button'
-import { ArrowRight, Download } from 'lucide-react'
+import Link from "next/link";
 
-export function CTA() {
+export function Cta() {
   return (
-    <section className="relative py-20 sm:py-32 overflow-hidden">
-      {/* Background Effects */}
-      <div className="absolute inset-0 grid-pattern opacity-30" />
-      <div
-        className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] sm:w-[800px] h-[400px] sm:h-[600px] rounded-full opacity-20"
-        style={{
-          background: 'radial-gradient(circle, var(--color-accent) 0%, transparent 60%)',
-          filter: 'blur(100px)',
-        }}
-      />
-
-      <div className="relative z-10 max-w-4xl mx-auto px-4 sm:px-6 text-center">
-        {/* Headline */}
-        <h2
-          className="text-3xl sm:text-4xl md:text-5xl lg:text-6xl font-semibold tracking-tight mb-4 sm:mb-6"
-          style={{ fontFamily: 'var(--font-display)' }}
+    <section className="relative">
+      <div className="mx-auto max-w-[1240px] px-5 sm:px-8 pb-24 sm:pb-32">
+        <div
+          className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-8 items-center p-8 sm:p-12"
+          style={{
+            border: "1px solid var(--n-line)",
+            background: "var(--n-bg-sunken)",
+          }}
         >
-          Ready to peek?
-        </h2>
-        <p
-          className="text-base sm:text-lg md:text-xl text-[--color-text-secondary] max-w-xl mx-auto mb-8 sm:mb-10 px-2"
-          style={{ fontFamily: 'var(--font-body)' }}
-        >
-          Download for free and start querying in seconds.
-          <br className="hidden sm:block" />
-          <span className="sm:hidden"> </span>
-          No sign-up required.
-        </p>
-
-        {/* CTA Buttons */}
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4">
-          <Button size="lg" className="w-full sm:w-auto" asChild>
-            <Link href="/download">
-              <Download className="w-4 h-4" />
-              Download Free
+          <div>
+            <div className="text-[10.5px] uppercase tracking-[0.18em] text-[var(--n-fg-faint)]">
+              Ready when you are
+            </div>
+            <h3 className="mt-3 text-[28px] sm:text-[34px] leading-[1.05] tracking-[-0.02em] text-[var(--n-fg)]">
+              Stop babysitting your database client.
+            </h3>
+            <p className="mt-3 text-[13px] leading-[1.65] text-[var(--n-fg-muted)] max-w-[58ch]">
+              Download the free build, run your next query in data-peek, and see
+              if your current tool still deserves a dock icon.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <Link
+              href="/download"
+              className="h-11 inline-flex items-center gap-2 px-5 text-[13px] font-medium"
+              style={{
+                background: "var(--n-accent)",
+                color: "var(--n-accent-ink)",
+              }}
+            >
+              Download — free
+              <span aria-hidden>↓</span>
             </Link>
-          </Button>
-          <Button variant="secondary" size="lg" className="w-full sm:w-auto" asChild>
-            <Link href="#pricing">
-              Get Pro — $29
-              <ArrowRight className="w-4 h-4" />
+            <Link
+              href="https://github.com/Rohithgilla12/data-peek"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="h-11 inline-flex items-center gap-2 px-5 text-[13px] text-[var(--n-fg)]"
+              style={{ border: "1px solid var(--n-line)" }}
+            >
+              <span aria-hidden>★</span> GitHub
             </Link>
-          </Button>
-        </div>
-
-        {/* Trust Signals */}
-        <div className="mt-8 sm:mt-12 flex flex-col sm:flex-row flex-wrap items-center justify-center gap-3 sm:gap-6 text-xs sm:text-sm text-[--color-text-muted]">
-          <span className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-[--color-success]" />
-            No credit card required
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-[--color-success]" />
-            14-day money-back guarantee
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-[--color-success]" />
-            Works offline
-          </span>
+          </div>
         </div>
       </div>
     </section>
-  )
+  );
 }

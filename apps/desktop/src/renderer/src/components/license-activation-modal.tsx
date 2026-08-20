@@ -1,18 +1,20 @@
-'use client'
-
 import { useState } from 'react'
 import { Loader2, Key, ExternalLink } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
+  Button,
+  Input,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle
-} from '@/components/ui/dialog'
+} from '@data-peek/ui'
+
 import { useLicenseStore } from '@/stores/license-store'
+import { buildTrackingUrl, LICENSE_PURCHASE_PATH, LICENSE_DASHBOARD_PATH } from '@shared/index'
+
+const UTM_PARAMS = { source: 'desktop', medium: 'app', content: 'activation_modal' }
 
 interface LicenseActivationModalProps {
   open: boolean
@@ -129,7 +131,7 @@ export function LicenseActivationModal({ open, onOpenChange }: LicenseActivation
             <p className="text-sm text-muted-foreground">
               Don&apos;t have a license?{' '}
               <a
-                href="https://data-peek.dev/pricing"
+                href={buildTrackingUrl(LICENSE_PURCHASE_PATH, UTM_PARAMS)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 text-primary hover:underline"
@@ -141,7 +143,7 @@ export function LicenseActivationModal({ open, onOpenChange }: LicenseActivation
             <p className="mt-2 text-sm text-muted-foreground">
               Need to manage your license?{' '}
               <a
-                href="https://data-peek.dev/dashboard"
+                href={buildTrackingUrl(LICENSE_DASHBOARD_PATH, UTM_PARAMS)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 text-primary hover:underline"

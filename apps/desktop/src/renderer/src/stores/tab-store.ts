@@ -2,8 +2,22 @@ import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
 import type { QueryResult } from './query-store'
 import type { StatementResult } from '@data-peek/shared'
-import { buildSelectQuery } from '@/lib/sql-helpers'
+import {
+  buildQualifiedTableRef,
+  buildFullyQualifiedTableRef,
+  buildSelectQuery,
+  quoteIdentifier
+} from '@/lib/sql-helpers'
 import { useConnectionStore } from './connection-store'
+import { useSettingsStore } from './settings-store'
+import { gridHoldReason, useEditStore } from './edit-store'
+import { useWatchStore } from './watch-store'
+import { useTimeMachineStore } from './time-machine-store'
+import { usePerfIndicatorStore } from './perf-indicator-store'
+import { useDataGenStore } from './data-gen-store'
+import { validateRefName } from '@/lib/cross-tab-name-validation'
+import type { SetTabNameResult } from '@/lib/cross-tab-types'
+import { isNamedQueryTab } from '@/lib/cross-tab-integration'
 
 /**
  * Extended QueryResult with multi-statement support
@@ -18,7 +32,16 @@ export interface MultiQueryResult {
 }
 
 // Tab type discriminator
-export type TabType = 'query' | 'table-preview' | 'erd' | 'table-designer'
+export type TabType =
+  | 'query'
+  | 'table-preview'
+  | 'erd'
+  | 'table-designer'
+  | 'data-generator'
+  | 'pg-notifications'
+  | 'health-monitor'
+  | 'schema-intel'
+  | 'notebook'
 
 // Base tab interface
 interface BaseTab {
@@ -41,8 +64,11 @@ export interface QueryTab extends BaseTab {
   activeResultIndex: number // Index of currently displayed result set
   error: string | null
   isExecuting: boolean
+  executionId: string | null // ID for cancellation support
   currentPage: number
   pageSize: number
+  /** User-assigned cross-tab reference name (e.g. used as @active_users). Query tabs only. */
+  name?: string
 }
 
 // Table preview tab
@@ -57,8 +83,12 @@ export interface TablePreviewTab extends BaseTab {
   activeResultIndex: number // Index of currently displayed result set
   error: string | null
   isExecuting: boolean
+  executionId: string | null // ID for cancellation support
   currentPage: number
   pageSize: number
+  // Server-side pagination fields
+  totalRowCount: number | null // Total rows in table (for pagination)
+  tableRef: string // Table reference for building queries (e.g., "schema.table")
 }
 
 // ERD visualization tab
@@ -74,7 +104,81 @@ export interface TableDesignerTab extends BaseTab {
   mode: 'create' | 'edit'
 }
 
-export type Tab = QueryTab | TablePreviewTab | ERDTab | TableDesignerTab
+// Data Generator tab
+export interface DataGeneratorTab extends BaseTab {
+  type: 'data-generator'
+  schemaName: string
+  tableName?: string
+}
+
+// PostgreSQL Notifications tab
+export interface PgNotificationsTab extends BaseTab {
+  type: 'pg-notifications'
+}
+
+// Health Monitor tab
+export interface HealthMonitorTab extends BaseTab {
+  type: 'health-monitor'
+}
+
+// Schema Intel / diagnostics tab
+export interface SchemaIntelTab extends BaseTab {
+  type: 'schema-intel'
+}
+
+// Notebook tab
+export interface NotebookTab extends BaseTab {
+  type: 'notebook'
+  notebookId: string
+}
+
+export type Tab =
+  | QueryTab
+  | TablePreviewTab
+  | ERDTab
+  | TableDesignerTab
+  | DataGeneratorTab
+  | PgNotificationsTab
+  | HealthMonitorTab
+  | SchemaIntelTab
+  | NotebookTab
+
+export type ExecutableTab = QueryTab | TablePreviewTab
+
+export function isExecutableTab(tab: Tab): tab is ExecutableTab {
+  return tab.type === 'query' || tab.type === 'table-preview'
+}
+
+// Fire best-effort cancel for any executable tab that's currently running a query.
+// Used by every tab-close path so the bulk-close variants (close all / close others /
+// close right) don't orphan pg pool clients — POOL_MAX is 5, a handful of abandoned
+// long-running tabs is enough to starve new connections.
+function cancelInFlightQueries(tabs: Tab[]): void {
+  for (const tab of tabs) {
+    if (isExecutableTab(tab) && tab.isExecuting && tab.executionId) {
+      void window.api.db.cancelQuery(tab.executionId).catch(() => {
+        // Cancellation is best-effort — main will time out the orphan eventually.
+      })
+    }
+
+    // Clear out dependent state to prevent memory leaks
+    useWatchStore.getState().stop(tab.id)
+    useTimeMachineStore.getState().stop(tab.id)
+    usePerfIndicatorStore.getState().clearTabAnalysis(tab.id)
+    useDataGenStore.getState().removeTab(tab.id)
+    useEditStore.getState().clearPendingChanges(tab.id)
+  }
+}
+
+function mapTab(tabs: Tab[], id: string, updater: (t: Tab) => Tab): Tab[] {
+  const idx = tabs.findIndex((t) => t.id === id)
+  if (idx === -1) return tabs
+  const updated = updater(tabs[idx])
+  if (updated === tabs[idx]) return tabs
+  const next = tabs.slice()
+  next[idx] = updated
+  return next
+}
 
 // Persisted tab data (minimal for storage)
 interface PersistedTab {
@@ -88,6 +192,9 @@ interface PersistedTab {
   schemaName?: string
   tableName?: string
   mode?: 'create' | 'edit'
+  notebookId?: string
+  /** Cross-tab reference name (query tabs only). */
+  name?: string
 }
 
 interface TabState {
@@ -107,6 +214,11 @@ interface TabState {
   ) => string
   createERDTab: (connectionId: string) => string
   createTableDesignerTab: (connectionId: string, schemaName: string, tableName?: string) => string
+  createDataGeneratorTab: (connectionId: string, schemaName: string, tableName?: string) => string
+  createPgNotificationsTab: (connectionId: string) => string
+  createHealthMonitorTab: (connectionId: string) => string
+  createSchemaIntelTab: (connectionId: string) => string
+  createNotebookTab: (connectionId: string, notebookId: string, title: string) => string
   closeTab: (tabId: string) => void
   closeAllTabs: () => void
   closeOtherTabs: (tabId: string) => void
@@ -120,13 +232,33 @@ interface TabState {
     multiResult: MultiQueryResult | null,
     error: string | null
   ) => void
+  /**
+   * Refresh a tab's displayed rows from a Watch Mode tick. Returns false when
+   * the refresh was declined, which tells the scheduler the grid still shows
+   * the previous rows. See the implementation for the edit-mode contract.
+   */
+  applyWatchResult: (tabId: string, result: QueryResult) => boolean
   setActiveResultIndex: (tabId: string, index: number) => void
-  updateTabExecuting: (tabId: string, isExecuting: boolean) => void
+  updateTabExecuting: (
+    tabId: string,
+    isExecuting: boolean,
+    executionId?: string | null,
+    expectedExecutionId?: string | null
+  ) => void
   markTabSaved: (tabId: string) => void
 
   // Pagination per tab
   setTabPage: (tabId: string, page: number) => void
   setTabPageSize: (tabId: string, size: number) => void
+
+  // Server-side pagination for table previews
+  setTablePreviewTotalCount: (tabId: string, count: number | null) => void
+  updateTablePreviewPagination: (
+    tabId: string,
+    page: number,
+    pageSize: number,
+    rebuiltQuery: string | null
+  ) => void
 
   // Pinning
   pinTab: (tabId: string) => void
@@ -137,6 +269,13 @@ interface TabState {
 
   // Tab title
   renameTab: (tabId: string, title: string) => void
+
+  // Cross-tab naming
+  setTabName: (tabId: string, name: string) => SetTabNameResult
+  clearTabName: (tabId: string) => void
+
+  // Connection sync
+  syncActiveTabWithConnection: (connectionId: string | null) => void
 
   // Computed helpers
   getTab: (tabId: string) => Tab | undefined
@@ -165,6 +304,14 @@ interface TabState {
     schemaName: string,
     tableName?: string
   ) => Tab | undefined
+  findDataGeneratorTab: (
+    connectionId: string,
+    schemaName: string,
+    tableName?: string
+  ) => Tab | undefined
+  findPgNotificationsTab: (connectionId: string) => Tab | undefined
+  findHealthMonitorTab: (connectionId: string) => Tab | undefined
+  findSchemaIntelTab: (connectionId: string) => Tab | undefined
 }
 
 export const useTabStore = create<TabState>()(
@@ -193,6 +340,7 @@ export const useTabStore = create<TabState>()(
           activeResultIndex: 0,
           error: null,
           isExecuting: false,
+          executionId: null,
           currentPage: 1,
           pageSize: 100
         }
@@ -217,10 +365,12 @@ export const useTabStore = create<TabState>()(
           .connections.find((c) => c.id === connectionId)
         const dbType = connection?.dbType
 
-        // Build table reference (handle MSSQL's dbo schema)
-        const defaultSchema = dbType === 'mssql' ? 'dbo' : 'public'
-        const tableRef = schemaName === defaultSchema ? tableName : `${schemaName}.${tableName}`
-        const query = buildSelectQuery(tableRef, dbType, { limit: 100 })
+        // Get default page size from settings
+        const pageSize = useSettingsStore.getState().defaultPageSize
+
+        const tableRef = buildFullyQualifiedTableRef(schemaName, tableName, dbType)
+        const sqlTableRef = buildQualifiedTableRef(schemaName, tableName, dbType)
+        const query = buildSelectQuery(sqlTableRef, dbType, { limit: pageSize })
 
         const newTab: TablePreviewTab = {
           id,
@@ -239,8 +389,11 @@ export const useTabStore = create<TabState>()(
           activeResultIndex: 0,
           error: null,
           isExecuting: false,
+          executionId: null,
           currentPage: 1,
-          pageSize: 100
+          pageSize,
+          totalRowCount: null,
+          tableRef
         }
 
         set((state) => ({
@@ -262,9 +415,7 @@ export const useTabStore = create<TabState>()(
           .connections.find((c) => c.id === connectionId)
         const dbType = connection?.dbType
 
-        // Build table reference (handle MSSQL's dbo schema)
-        const defaultSchema = dbType === 'mssql' ? 'dbo' : 'public'
-        const tableRef = schema === defaultSchema ? table : `${schema}.${table}`
+        const sqlTableRef = buildQualifiedTableRef(schema, table, dbType)
 
         // Format value for SQL - handle strings, numbers, nulls
         let formattedValue: string
@@ -277,10 +428,9 @@ export const useTabStore = create<TabState>()(
           formattedValue = String(value)
         }
 
-        // Use bracket quoting for MSSQL, double quotes for others
-        const quotedColumn = dbType === 'mssql' ? `[${column}]` : `"${column}"`
+        const quotedColumn = quoteIdentifier(column, dbType)
         const whereClause = `WHERE ${quotedColumn} = ${formattedValue}`
-        const query = buildSelectQuery(tableRef, dbType, { where: whereClause, limit: 100 })
+        const query = buildSelectQuery(sqlTableRef, dbType, { where: whereClause, limit: 100 })
 
         const newTab: QueryTab = {
           id,
@@ -297,6 +447,7 @@ export const useTabStore = create<TabState>()(
           activeResultIndex: 0,
           error: null,
           isExecuting: false,
+          executionId: null,
           currentPage: 1,
           pageSize: 100
         }
@@ -384,9 +535,157 @@ export const useTabStore = create<TabState>()(
         return id
       },
 
+      createDataGeneratorTab: (connectionId, schemaName, tableName) => {
+        const id = crypto.randomUUID()
+        const tabs = get().tabs
+        const maxOrder = tabs.length > 0 ? Math.max(...tabs.map((t) => t.order)) : -1
+        const title = tableName ? `Generate: ${tableName}` : 'Data Generator'
+
+        const newTab: DataGeneratorTab = {
+          id,
+          type: 'data-generator',
+          title,
+          isPinned: false,
+          connectionId,
+          createdAt: Date.now(),
+          order: maxOrder + 1,
+          schemaName,
+          tableName
+        }
+
+        set((state) => ({
+          tabs: [...state.tabs, newTab],
+          activeTabId: id
+        }))
+
+        return id
+      },
+
+      createPgNotificationsTab: (connectionId) => {
+        const existing = get().tabs.find(
+          (t) => t.type === 'pg-notifications' && t.connectionId === connectionId
+        )
+        if (existing) {
+          set({ activeTabId: existing.id })
+          return existing.id
+        }
+
+        const id = crypto.randomUUID()
+        const tabs = get().tabs
+        const maxOrder = tabs.length > 0 ? Math.max(...tabs.map((t) => t.order)) : -1
+
+        const newTab: PgNotificationsTab = {
+          id,
+          type: 'pg-notifications',
+          title: 'Notifications',
+          isPinned: false,
+          connectionId,
+          createdAt: Date.now(),
+          order: maxOrder + 1
+        }
+
+        set((state) => ({
+          tabs: [...state.tabs, newTab],
+          activeTabId: id
+        }))
+
+        return id
+      },
+
+      createHealthMonitorTab: (connectionId) => {
+        const existing = get().tabs.find(
+          (t) => t.type === 'health-monitor' && t.connectionId === connectionId
+        )
+        if (existing) {
+          set({ activeTabId: existing.id })
+          return existing.id
+        }
+
+        const id = crypto.randomUUID()
+        const tabs = get().tabs
+        const maxOrder = tabs.length > 0 ? Math.max(...tabs.map((t) => t.order)) : -1
+
+        const newTab: HealthMonitorTab = {
+          id,
+          type: 'health-monitor',
+          title: 'Health Monitor',
+          isPinned: false,
+          connectionId,
+          createdAt: Date.now(),
+          order: maxOrder + 1
+        }
+
+        set((state) => ({
+          tabs: [...state.tabs, newTab],
+          activeTabId: id
+        }))
+
+        return id
+      },
+
+      createSchemaIntelTab: (connectionId) => {
+        const existing = get().tabs.find(
+          (t) => t.type === 'schema-intel' && t.connectionId === connectionId
+        )
+        if (existing) {
+          set({ activeTabId: existing.id })
+          return existing.id
+        }
+
+        const id = crypto.randomUUID()
+        const tabs = get().tabs
+        const maxOrder = tabs.length > 0 ? Math.max(...tabs.map((t) => t.order)) : -1
+
+        const newTab: SchemaIntelTab = {
+          id,
+          type: 'schema-intel',
+          title: 'Schema Intel',
+          isPinned: false,
+          connectionId,
+          createdAt: Date.now(),
+          order: maxOrder + 1
+        }
+
+        set((state) => ({
+          tabs: [...state.tabs, newTab],
+          activeTabId: id
+        }))
+
+        return id
+      },
+
+      createNotebookTab: (connectionId, notebookId, title) => {
+        const existingTab = get().tabs.find(
+          (t) => t.type === 'notebook' && (t as NotebookTab).notebookId === notebookId
+        )
+        if (existingTab) {
+          set({ activeTabId: existingTab.id })
+          return existingTab.id
+        }
+
+        const id = crypto.randomUUID()
+        const tab: NotebookTab = {
+          id,
+          type: 'notebook',
+          title,
+          isPinned: false,
+          connectionId,
+          createdAt: Date.now(),
+          order: get().tabs.length,
+          notebookId
+        }
+        set((state) => ({
+          tabs: [...state.tabs, tab],
+          activeTabId: id
+        }))
+        return id
+      },
+
       closeTab: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
         if (!tab || tab.isPinned) return
+
+        cancelInFlightQueries([tab])
 
         set((state) => {
           const newTabs = state.tabs.filter((t) => t.id !== tabId)
@@ -403,8 +702,11 @@ export const useTabStore = create<TabState>()(
       },
 
       closeAllTabs: () => {
-        set((state) => {
-          // Keep pinned tabs
+        const state = get()
+        const removed = state.tabs.filter((t) => !t.isPinned)
+        cancelInFlightQueries(removed)
+
+        set(() => {
           const pinnedTabs = state.tabs.filter((t) => t.isPinned)
           return {
             tabs: pinnedTabs,
@@ -414,8 +716,11 @@ export const useTabStore = create<TabState>()(
       },
 
       closeOtherTabs: (tabId) => {
-        set((state) => {
-          // Keep the specified tab and all pinned tabs
+        const state = get()
+        const removed = state.tabs.filter((t) => t.id !== tabId && !t.isPinned)
+        cancelInFlightQueries(removed)
+
+        set(() => {
           const keptTabs = state.tabs.filter((t) => t.id === tabId || t.isPinned)
           return {
             tabs: keptTabs,
@@ -425,10 +730,14 @@ export const useTabStore = create<TabState>()(
       },
 
       closeTabsToRight: (tabId) => {
-        set((state) => {
-          const tabIndex = state.tabs.findIndex((t) => t.id === tabId)
-          if (tabIndex === -1) return state
+        const state = get()
+        const tabIndex = state.tabs.findIndex((t) => t.id === tabId)
+        if (tabIndex === -1) return
 
+        const removed = state.tabs.filter((t, i) => i > tabIndex && !t.isPinned)
+        cancelInFlightQueries(removed)
+
+        set(() => {
           const keptTabs = state.tabs.filter((t, i) => i <= tabIndex || t.isPinned)
           return {
             tabs: keptTabs,
@@ -448,42 +757,117 @@ export const useTabStore = create<TabState>()(
       },
 
       updateTabResult: (tabId, result, error) => {
+        // Pending inline edits are captured against the *previous* result rows. Once the
+        // result changes, those snapshots no longer correspond to anything onscreen and
+        // committing them would target rows the user never saw — drop them defensively.
+        // Skip when the result is being blanked by a cancellation (`null` result + error
+        // text): the user's edits are still valid against what's currently displayed.
+        if (result !== null) {
+          useEditStore.getState().clearPendingChanges(tabId)
+        }
         set((state) => ({
-          tabs: state.tabs.map((t) =>
-            t.id === tabId ? { ...t, result, error, currentPage: 1 } : t
-          )
+          tabs: state.tabs.map((t) => {
+            if (t.id !== tabId) return t
+            // For table-preview with server-side pagination, preserve currentPage
+            const preservePage = t.type === 'table-preview' && t.totalRowCount != null
+            return { ...t, result, error, currentPage: preservePage ? t.currentPage : 1 }
+          })
         }))
       },
 
       updateTabMultiResult: (tabId, multiResult, error) => {
+        // Same rule as updateTabResult: a null result is a cancel/error blank, not a
+        // new result set, so don't wipe the user's pending edits.
+        if (multiResult !== null) {
+          useEditStore.getState().clearPendingChanges(tabId)
+        }
         set((state) => ({
-          tabs: state.tabs.map((t) =>
-            t.id === tabId
-              ? {
-                  ...t,
-                  multiResult,
-                  error,
-                  currentPage: 1,
-                  activeResultIndex: 0,
-                  // Also update legacy result field for backward compatibility
-                  result: multiResult?.statements?.[0]
-                    ? {
-                        columns: multiResult.statements[0].fields.map((f) => ({
-                          name: f.name,
-                          dataType: f.dataType
-                        })),
-                        rows: multiResult.statements[0].rows,
-                        rowCount: multiResult.statements[0].rowCount,
-                        durationMs: multiResult.totalDurationMs
-                      }
-                    : null
-                }
-              : t
-          )
+          tabs: state.tabs.map((t) => {
+            if (t.id !== tabId) return t
+            // For table-preview with server-side pagination, preserve currentPage
+            const preservePage = t.type === 'table-preview' && t.totalRowCount != null
+            return {
+              ...t,
+              multiResult,
+              error,
+              currentPage: preservePage ? t.currentPage : 1,
+              activeResultIndex: preservePage ? t.activeResultIndex : 0,
+              // Also update legacy result field for backward compatibility
+              result: multiResult?.statements?.[0]
+                ? {
+                    columns: multiResult.statements[0].fields.map((f) => ({
+                      name: f.name,
+                      dataType: f.dataType
+                    })),
+                    rows: multiResult.statements[0].rows,
+                    rowCount: multiResult.statements[0].rowCount,
+                    durationMs: multiResult.totalDurationMs
+                  }
+                : null
+            }
+          })
         }))
       },
 
+      applyWatchResult: (tabId, result) => {
+        const tab = get().tabs.find((t) => t.id === tabId)
+        if (!tab || !isExecutableTab(tab)) return false
+
+        // Watch Mode polls on a cadence, so it can't use updateTabResult: that
+        // drops pending inline edits, which would silently destroy in-progress
+        // work every few seconds. Keeping the edits *and* moving the rows is the
+        // other trap — a commit would then target a row the user never saw. So
+        // while the user is mid-edit the rows stay put; the tick is still
+        // recorded in the watch store, and the next tick after they commit or
+        // discard brings the grid forward. WatchButton reads the same rule to
+        // label the hold, so the stall is explained rather than silent.
+        if (gridHoldReason(useEditStore.getState().tabEdits, tabId)) return false
+
+        // The SQL gate (lib/watch-sql-gate.ts) only lets a single statement be
+        // watched, so a watched tab's multiResult holds exactly that SELECT and
+        // the grid reads tab.result. More than one statement means the grid is
+        // rendering from multiResult instead and this refresh wouldn't reach it.
+        const statements = tab.multiResult?.statements
+        if (statements && statements.length > 1) return false
+
+        set((state) => ({
+          tabs: state.tabs.map((t) => {
+            if (t.id !== tabId || !isExecutableTab(t)) return t
+            const single = t.multiResult?.statements[0]
+            // Unlike updateTabResult, currentPage is left alone: a tick refreshes
+            // the same query rather than running a new one, and yanking a watcher
+            // back to page 1 every cadence would make paged results unusable.
+            return {
+              ...t,
+              result,
+              error: null,
+              multiResult:
+                t.multiResult && single
+                  ? {
+                      ...t.multiResult,
+                      statements: [
+                        {
+                          ...single,
+                          fields: result.columns,
+                          rows: result.rows,
+                          rowCount: result.rowCount,
+                          durationMs: result.durationMs
+                        }
+                      ],
+                      totalDurationMs: result.durationMs
+                    }
+                  : t.multiResult
+            }
+          })
+        }))
+        return true
+      },
+
       setActiveResultIndex: (tabId, index) => {
+        // Pending edits are captured against the previously active statement; switching to
+        // a different statement (potentially a different table) would otherwise let those
+        // edits commit with the wrong context.
+        useEditStore.getState().clearPendingChanges(tabId)
         set((state) => ({
           tabs: state.tabs.map((t) =>
             t.id === tabId
@@ -497,33 +881,84 @@ export const useTabStore = create<TabState>()(
         }))
       },
 
-      updateTabExecuting: (tabId, isExecuting) => {
-        set((state) => ({
-          tabs: state.tabs.map((t) => (t.id === tabId ? { ...t, isExecuting } : t))
-        }))
+      updateTabExecuting: (tabId, isExecuting, executionId?, expectedExecutionId?) => {
+        set((state) => {
+          const tabs = mapTab(state.tabs, tabId, (t) => {
+            if (!isExecutableTab(t)) return t
+            // Compare-and-swap: a stale "finally" from execution A must not flip the
+            // flag on execution B that started after A was cancelled or thrown.
+            if (expectedExecutionId !== undefined && t.executionId !== expectedExecutionId) {
+              return t
+            }
+            const newExecutionId =
+              executionId !== undefined ? executionId : isExecuting ? t.executionId : null
+            if (t.isExecuting === isExecuting && t.executionId === newExecutionId) return t
+            return { ...t, isExecuting, executionId: newExecutionId }
+          })
+          return tabs === state.tabs ? {} : { tabs }
+        })
       },
 
       markTabSaved: (tabId) => {
-        set((state) => ({
-          tabs: state.tabs.map((t) =>
-            t.id === tabId && t.type !== 'erd' && t.type !== 'table-designer'
-              ? { ...t, savedQuery: t.query }
-              : t
-          )
-        }))
+        set((state) => {
+          const tabs = mapTab(state.tabs, tabId, (t) => {
+            if (!isExecutableTab(t)) return t
+            if (t.savedQuery === t.query) return t
+            return { ...t, savedQuery: t.query }
+          })
+          return tabs === state.tabs ? {} : { tabs }
+        })
       },
 
       setTabPage: (tabId, page) => {
-        set((state) => ({
-          tabs: state.tabs.map((t) => (t.id === tabId ? { ...t, currentPage: page } : t))
-        }))
+        set((state) => {
+          const tabs = mapTab(state.tabs, tabId, (t) => {
+            if (!isExecutableTab(t) || t.currentPage === page) return t
+            return { ...t, currentPage: page }
+          })
+          return tabs === state.tabs ? {} : { tabs }
+        })
       },
 
       setTabPageSize: (tabId, size) => {
+        set((state) => {
+          const tabs = mapTab(state.tabs, tabId, (t) => {
+            if (!isExecutableTab(t) || (t.pageSize === size && t.currentPage === 1)) return t
+            return { ...t, pageSize: size, currentPage: 1 }
+          })
+          return tabs === state.tabs ? {} : { tabs }
+        })
+      },
+
+      setTablePreviewTotalCount: (tabId, count) => {
+        set((state) => {
+          const tabs = mapTab(state.tabs, tabId, (t) => {
+            if (t.type !== 'table-preview' || t.totalRowCount === count) return t
+            return { ...t, totalRowCount: count }
+          })
+          return tabs === state.tabs ? {} : { tabs }
+        })
+      },
+
+      updateTablePreviewPagination: (tabId, page, pageSize, rebuiltQuery) => {
+        // The renderer decides whether the executed SQL still maps to the stored
+        // table and supplies a rebuiltQuery only when it's safe to overwrite. If
+        // null, we update pagination state without touching the user's typed SQL —
+        // pagination falls back to client-side over the existing result set.
         set((state) => ({
-          tabs: state.tabs.map((t) =>
-            t.id === tabId ? { ...t, pageSize: size, currentPage: 1 } : t
-          )
+          tabs: state.tabs.map((t) => {
+            if (t.id !== tabId || t.type !== 'table-preview') return t
+            if (rebuiltQuery !== null) {
+              return {
+                ...t,
+                currentPage: page,
+                pageSize,
+                query: rebuiltQuery,
+                savedQuery: rebuiltQuery
+              }
+            }
+            return { ...t, currentPage: page, pageSize }
+          })
         }))
       },
 
@@ -566,6 +1001,65 @@ export const useTabStore = create<TabState>()(
         }))
       },
 
+      setTabName: (tabId, name) => {
+        const tab = get().tabs.find((t) => t.id === tabId)
+        if (!tab || tab.type !== 'query') {
+          return { ok: false, error: { kind: 'not_a_query_tab' } }
+        }
+        const taken = new Map<string, string>()
+        for (const t of get().tabs) {
+          if (isNamedQueryTab(t) && t.connectionId === tab.connectionId) {
+            taken.set(t.name, t.id)
+          }
+        }
+        const result = validateRefName(name, { takenNames: taken, ownTabId: tabId })
+        if (!result.ok) return result
+        set((state) => ({
+          tabs: mapTab(state.tabs, tabId, (t) => ({ ...t, name: result.normalized }))
+        }))
+        return result
+      },
+
+      clearTabName: (tabId) => {
+        set((state) => {
+          const tabs = mapTab(state.tabs, tabId, (t) =>
+            t.type === 'query' && t.name !== undefined ? { ...t, name: undefined } : t
+          )
+          return tabs === state.tabs ? {} : { tabs }
+        })
+      },
+
+      syncActiveTabWithConnection: (connectionId) => {
+        const activeTab = get().getActiveTab()
+        if (!activeTab) return
+
+        // Only sync query tabs (not table-preview, erd, or table-designer)
+        // Table previews are tied to specific tables in specific databases
+        // ERD and table designer are also database-specific
+        if (activeTab.type !== 'query') return
+
+        // A tab's @name is unique per connection. Moving a named tab onto a
+        // connection that already uses that name would make @name resolution
+        // ambiguous, so drop the name when it collides on the target connection.
+        let keepName = true
+        if (isNamedQueryTab(activeTab)) {
+          const taken = new Set<string>()
+          for (const t of get().tabs) {
+            if (isNamedQueryTab(t) && t.connectionId === connectionId && t.id !== activeTab.id) {
+              taken.add(t.name)
+            }
+          }
+          keepName = !taken.has(activeTab.name)
+        }
+
+        set((state) => ({
+          tabs: state.tabs.map((t) => {
+            if (t.id !== activeTab.id || t.type !== 'query') return t
+            return { ...t, connectionId, name: keepName ? t.name : undefined }
+          })
+        }))
+      },
+
       getTab: (tabId) => {
         return get().tabs.find((t) => t.id === tabId)
       },
@@ -585,43 +1079,38 @@ export const useTabStore = create<TabState>()(
 
       isTabDirty: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab) return false
-        // ERD and table-designer tabs are never dirty (table-designer uses its own store)
-        if (tab.type === 'erd' || tab.type === 'table-designer') return false
+        if (!tab || !isExecutableTab(tab)) return false
         return tab.query !== tab.savedQuery
       },
 
       getTabPaginatedRows: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return []
-        if (!tab.result) return []
+        if (!tab || !isExecutableTab(tab) || !tab.result) return []
         const start = (tab.currentPage - 1) * tab.pageSize
         return tab.result.rows.slice(start, start + tab.pageSize)
       },
 
       getTabTotalPages: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return 0
-        if (!tab.result) return 0
+        if (!tab || !isExecutableTab(tab) || !tab.result) return 0
         return Math.ceil(tab.result.rowCount / tab.pageSize)
       },
 
       getActiveStatementResult: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return undefined
-        if (!tab.multiResult?.statements) return undefined
+        if (!tab || !isExecutableTab(tab) || !tab.multiResult?.statements) return undefined
         return tab.multiResult.statements[tab.activeResultIndex]
       },
 
       getAllStatementResults: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return []
+        if (!tab || !isExecutableTab(tab)) return []
         return tab.multiResult?.statements ?? []
       },
 
       getActiveResultPaginatedRows: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return []
+        if (!tab || !isExecutableTab(tab)) return []
         const statement = tab.multiResult?.statements?.[tab.activeResultIndex]
         if (!statement) return []
         const start = (tab.currentPage - 1) * tab.pageSize
@@ -630,7 +1119,7 @@ export const useTabStore = create<TabState>()(
 
       getActiveResultTotalPages: (tabId) => {
         const tab = get().tabs.find((t) => t.id === tabId)
-        if (!tab || tab.type === 'erd' || tab.type === 'table-designer') return 0
+        if (!tab || !isExecutableTab(tab)) return 0
         const statement = tab.multiResult?.statements?.[tab.activeResultIndex]
         if (!statement) return 0
         return Math.ceil(statement.rowCount / tab.pageSize)
@@ -660,11 +1149,44 @@ export const useTabStore = create<TabState>()(
               ? (t as TableDesignerTab).tableName === tableName
               : !(t as TableDesignerTab).tableName)
         )
+      },
+
+      findDataGeneratorTab: (connectionId, schemaName, tableName) => {
+        return get().tabs.find(
+          (t) =>
+            t.type === 'data-generator' &&
+            t.connectionId === connectionId &&
+            (t as DataGeneratorTab).schemaName === schemaName &&
+            (tableName
+              ? (t as DataGeneratorTab).tableName === tableName
+              : !(t as DataGeneratorTab).tableName)
+        )
+      },
+
+      findPgNotificationsTab: (connectionId) => {
+        return get().tabs.find(
+          (t) => t.type === 'pg-notifications' && t.connectionId === connectionId
+        )
+      },
+
+      findHealthMonitorTab: (connectionId) => {
+        return get().tabs.find(
+          (t) => t.type === 'health-monitor' && t.connectionId === connectionId
+        )
+      },
+
+      findSchemaIntelTab: (connectionId) => {
+        return get().tabs.find((t) => t.type === 'schema-intel' && t.connectionId === connectionId)
       }
     }),
     {
       name: 'data-peek-tabs',
-      storage: createJSONStorage(() => localStorage),
+      storage: createJSONStorage(() => {
+        if (typeof process !== 'undefined' && process.env.NODE_ENV === 'test') {
+          return { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+        }
+        return typeof localStorage !== 'undefined' ? localStorage : ({} as unknown as Storage)
+      }),
       partialize: (state) => ({
         // Only persist pinned tabs
         tabs: state.tabs
@@ -692,12 +1214,40 @@ export const useTabStore = create<TabState>()(
               }
             }
 
+            if (t.type === 'data-generator') {
+              return {
+                ...base,
+                schemaName: t.schemaName,
+                tableName: t.tableName
+              }
+            }
+
+            if (t.type === 'pg-notifications') {
+              return base
+            }
+
+            if (t.type === 'health-monitor') {
+              return base
+            }
+
+            if (t.type === 'schema-intel') {
+              return base
+            }
+
+            if (t.type === 'notebook') {
+              return {
+                ...base,
+                notebookId: t.notebookId
+              }
+            }
+
             // query or table-preview tabs
             return {
               ...base,
               query: t.query,
               schemaName: t.type === 'table-preview' ? t.schemaName : undefined,
-              tableName: t.type === 'table-preview' ? t.tableName : undefined
+              tableName: t.type === 'table-preview' ? t.tableName : undefined,
+              name: t.type === 'query' ? t.name : undefined
             }
           }),
         activeTabId: state.activeTabId
@@ -728,6 +1278,56 @@ export const useTabStore = create<TabState>()(
               } as TableDesignerTab
             }
 
+            // Data generator tabs
+            if (t.type === 'data-generator') {
+              const persisted = t as unknown as PersistedTab
+              return {
+                ...t,
+                type: 'data-generator' as const,
+                createdAt: Date.now(),
+                schemaName: persisted.schemaName ?? 'public',
+                tableName: persisted.tableName
+              } as DataGeneratorTab
+            }
+
+            // PG Notifications tabs
+            if (t.type === 'pg-notifications') {
+              return {
+                ...t,
+                type: 'pg-notifications' as const,
+                createdAt: Date.now()
+              } as PgNotificationsTab
+            }
+
+            // Health Monitor tabs
+            if (t.type === 'health-monitor') {
+              return {
+                ...t,
+                type: 'health-monitor' as const,
+                createdAt: Date.now()
+              } as HealthMonitorTab
+            }
+
+            // Schema Intel tabs
+            if (t.type === 'schema-intel') {
+              return {
+                ...t,
+                type: 'schema-intel' as const,
+                createdAt: Date.now()
+              } as SchemaIntelTab
+            }
+
+            // Notebook tabs
+            if (t.type === 'notebook') {
+              const persisted = t as unknown as PersistedTab
+              return {
+                ...t,
+                type: 'notebook' as const,
+                createdAt: Date.now(),
+                notebookId: persisted.notebookId || ''
+              } as NotebookTab
+            }
+
             const base = {
               ...t,
               result: null,
@@ -735,6 +1335,7 @@ export const useTabStore = create<TabState>()(
               activeResultIndex: 0,
               error: null,
               isExecuting: false,
+              executionId: null,
               savedQuery: (t as unknown as { query?: string }).query ?? '',
               createdAt: Date.now(),
               currentPage: 1,
@@ -742,11 +1343,16 @@ export const useTabStore = create<TabState>()(
             }
 
             if (t.type === 'table-preview') {
+              const schemaName = (t as unknown as TablePreviewTab).schemaName ?? ''
+              const tableName = (t as unknown as TablePreviewTab).tableName ?? ''
+              const tableRef = buildFullyQualifiedTableRef(schemaName, tableName, undefined)
               return {
                 ...base,
                 type: 'table-preview' as const,
-                schemaName: (t as unknown as TablePreviewTab).schemaName ?? '',
-                tableName: (t as unknown as TablePreviewTab).tableName ?? ''
+                schemaName,
+                tableName,
+                totalRowCount: null,
+                tableRef
               }
             }
 

@@ -2,7 +2,7 @@ import { ElectronAPI } from '@electron-toolkit/preload'
 import type {
   ConnectionConfig,
   IpcResponse,
-  DatabaseSchema,
+  DatabaseSchemaResponse,
   EditBatch,
   EditResult,
   TableDefinition,
@@ -14,11 +14,75 @@ import type {
   LicenseActivationRequest,
   LicenseType,
   SavedQuery,
-  SchemaInfo
+  QueryHistoryEntry,
+  SchemaInfo,
+  BenchmarkResult,
+  MultiStatementResultWithTelemetry,
+  PerformanceAnalysisResult,
+  PerformanceAnalysisConfig,
+  QueryHistoryItemForAnalysis,
+  ScheduledQuery,
+  ScheduledQueryRun,
+  CreateScheduledQueryInput,
+  UpdateScheduledQueryInput,
+  Dashboard,
+  Widget,
+  WidgetRunResult,
+  CreateDashboardInput,
+  UpdateDashboardInput,
+  CreateWidgetInput,
+  UpdateWidgetInput,
+  WidgetLayout,
+  Snippet,
+  ColumnStats,
+  ColumnStatsRequest,
+  CsvImportRequest,
+  CsvImportResult,
+  CsvImportProgress,
+  DataGenConfig,
+  DataGenResult,
+  DataGenProgress,
+  PgNotificationEvent,
+  PgNotificationChannel,
+  PgNotificationConnectionStatus,
+  ActiveQuery,
+  TableSizeInfo,
+  CacheStats,
+  LockInfo,
+  DatabaseSizeInfo,
+  SchemaIntelCheckId,
+  SchemaIntelReport,
+  PgExportOptions,
+  PgExportProgress,
+  PgExportResult,
+  PgImportOptions,
+  PgImportProgress,
+  PgImportResult,
+  Notebook,
+  NotebookWithCells,
+  NotebookCell,
+  CreateNotebookInput,
+  UpdateNotebookInput,
+  AddCellInput,
+  UpdateCellInput,
+  StartStepRequest,
+  StartStepResponse,
+  NextStepResponse,
+  SkipStepResponse,
+  ContinueStepResponse,
+  RetryStepResponse,
+  StopStepResponse,
+  TimeMachineCapturePayload,
+  TimeMachineRunMeta,
+  TimeMachineSnapshot,
+  TimeMachineListResult,
+  TimeMachineStats,
+  McpServerStatus,
+  McpApprovalRequest,
+  AuditStatus,
+  AuditVerifyResult,
+  AIProvider
 } from '@shared/index'
-
-// AI Types
-type AIProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'ollama'
 
 interface AIConfig {
   provider: AIProvider
@@ -27,64 +91,72 @@ interface AIConfig {
   baseUrl?: string
 }
 
+// Multi-provider config types
+interface AIProviderConfig {
+  apiKey?: string
+  baseUrl?: string
+}
+
+type AIProviderConfigs = Partial<Record<AIProvider, AIProviderConfig>>
+
+interface AIMultiProviderConfig {
+  providers: AIProviderConfigs
+  activeProvider: AIProvider
+  activeModels: Partial<Record<AIProvider, string>>
+}
+
 interface AIMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
 }
 
 // Structured AI response types
-type AIResponseType = 'message' | 'query' | 'chart' | 'metric' | 'schema'
+type AIResponseType = 'message' | 'query' | 'chart' | 'metric' | 'schema' | 'report'
 
-interface AIQueryResponse {
-  type: 'query'
-  message: string
-  sql: string
-  explanation: string
-  warning?: string
-}
-
-interface AIChartResponse {
-  type: 'chart'
-  message: string
+interface AIReportWidget {
   title: string
-  description?: string
-  chartType: 'bar' | 'line' | 'pie' | 'area'
+  kind: 'kpi' | 'chart' | 'table'
   sql: string
-  xKey: string
-  yKeys: string[]
+  chartType?: 'bar' | 'line' | 'pie' | 'area' | null
+  format?: 'number' | 'currency' | 'percent' | 'duration' | null
+  xKey?: string | null
+  yKeys?: string[] | null
 }
 
-interface AIMetricResponse {
-  type: 'metric'
+// Incremental event from a streaming chat run (mirror of shared AIChatStreamEvent)
+type AIChatStreamEvent = { type: 'message'; text: string } | { type: 'activity'; label: string }
+
+// Flat schema with nullable fields for AI provider compatibility
+interface AIChatResponse {
+  type: AIResponseType
   message: string
-  label: string
-  sql: string
-  format: 'number' | 'currency' | 'percent' | 'duration'
+  // Query fields (null when type is not query)
+  sql: string | null
+  explanation: string | null
+  warning: string | null
+  requiresConfirmation: boolean | null
+  // Chart fields (null when type is not chart)
+  title: string | null
+  description: string | null
+  chartType: 'bar' | 'line' | 'pie' | 'area' | null
+  xKey: string | null
+  yKeys: string[] | null
+  // Metric fields (null when type is not metric)
+  label: string | null
+  format: 'number' | 'currency' | 'percent' | 'duration' | null
+  // Schema fields (null when type is not schema)
+  tables: string[] | null
+  // Report fields (null when type is not report)
+  widgets: AIReportWidget[] | null
+  // 2–3 short follow-up prompts (any type). null when none.
+  suggestions: string[] | null
 }
-
-interface AISchemaResponse {
-  type: 'schema'
-  message: string
-  tables: string[]
-}
-
-interface AIMessageResponse {
-  type: 'message'
-  message: string
-}
-
-type AIChatResponse =
-  | AIQueryResponse
-  | AIChartResponse
-  | AIMetricResponse
-  | AISchemaResponse
-  | AIMessageResponse
 
 // Stored response data types (without message field since it's in content)
 interface StoredQueryData {
   type: 'query'
   sql: string
-  explanation: string
+  explanation?: string
   warning?: string
 }
 
@@ -111,11 +183,7 @@ interface StoredSchemaData {
 }
 
 type StoredResponseData =
-  | StoredQueryData
-  | StoredChartData
-  | StoredMetricData
-  | StoredSchemaData
-  | null
+  StoredQueryData | StoredChartData | StoredMetricData | StoredSchemaData | null
 
 // Stored chat message type (for persistence)
 interface StoredChatMessage {
@@ -141,11 +209,27 @@ interface DataPeekApi {
     add: (connection: ConnectionConfig) => Promise<IpcResponse<ConnectionConfig>>
     update: (connection: ConnectionConfig) => Promise<IpcResponse<ConnectionConfig>>
     delete: (id: string) => Promise<IpcResponse<void>>
+    // Listen for connection changes from other windows
+    onConnectionsUpdated: (callback: () => void) => () => void
   }
   db: {
     connect: (config: ConnectionConfig) => Promise<IpcResponse<void>>
-    query: (config: ConnectionConfig, query: string) => Promise<IpcResponse<unknown>>
-    schemas: (config: ConnectionConfig) => Promise<IpcResponse<DatabaseSchema>>
+    query: (
+      config: ConnectionConfig,
+      query: string,
+      executionId?: string,
+      queryTimeoutMs?: number,
+      sessionId?: string
+    ) => Promise<IpcResponse<unknown>>
+    cancelQuery: (executionId: string) => Promise<IpcResponse<{ cancelled: boolean }>>
+    schemas: (
+      config: ConnectionConfig,
+      forceRefresh?: boolean
+    ) => Promise<IpcResponse<DatabaseSchemaResponse>>
+    invalidateSchemaCache: (config: ConnectionConfig) => Promise<IpcResponse<void>>
+    beginTransaction: (config: ConnectionConfig, sessionId: string) => Promise<IpcResponse<void>>
+    commitTransaction: (config: ConnectionConfig, sessionId: string) => Promise<IpcResponse<void>>
+    rollbackTransaction: (config: ConnectionConfig, sessionId: string) => Promise<IpcResponse<void>>
     execute: (config: ConnectionConfig, batch: EditBatch) => Promise<IpcResponse<EditResult>>
     previewSql: (
       batch: EditBatch
@@ -155,6 +239,45 @@ interface DataPeekApi {
       query: string,
       analyze: boolean
     ) => Promise<IpcResponse<{ plan: unknown; durationMs: number }>>
+    queryWithTelemetry: (
+      config: ConnectionConfig,
+      query: string,
+      executionId?: string,
+      queryTimeoutMs?: number,
+      sessionId?: string
+    ) => Promise<IpcResponse<MultiStatementResultWithTelemetry & { results: unknown[] }>>
+    benchmark: (
+      config: ConnectionConfig,
+      query: string,
+      runCount: number
+    ) => Promise<IpcResponse<BenchmarkResult>>
+    analyzePerformance: (
+      config: ConnectionConfig,
+      query: string,
+      queryHistory: QueryHistoryItemForAnalysis[],
+      analysisConfig?: Partial<PerformanceAnalysisConfig>
+    ) => Promise<IpcResponse<PerformanceAnalysisResult>>
+    columnStats: (
+      config: ConnectionConfig,
+      request: ColumnStatsRequest
+    ) => Promise<IpcResponse<ColumnStats>>
+    importCsv: (
+      config: ConnectionConfig,
+      request: CsvImportRequest,
+      rows: unknown[][]
+    ) => Promise<IpcResponse<CsvImportResult>>
+    cancelImport: () => Promise<IpcResponse<void>>
+    onImportProgress: (callback: (progress: CsvImportProgress) => void) => () => void
+    generateData: (
+      config: ConnectionConfig,
+      genConfig: DataGenConfig
+    ) => Promise<IpcResponse<DataGenResult>>
+    cancelGenerate: () => Promise<IpcResponse<void>>
+    generatePreview: (
+      config: ConnectionConfig,
+      genConfig: DataGenConfig
+    ) => Promise<IpcResponse<{ rows: unknown[][] }>>
+    onGenerateProgress: (callback: (progress: DataGenProgress) => void) => () => void
   }
   ddl: {
     createTable: (
@@ -186,7 +309,13 @@ interface DataPeekApi {
     onExecuteQuery: (callback: () => void) => () => void
     onFormatSql: (callback: () => void) => () => void
     onClearResults: (callback: () => void) => () => void
+    onToggleWatch: (callback: () => void) => () => void
+    onToggleTimeMachine: (callback: () => void) => () => void
     onToggleSidebar: (callback: () => void) => () => void
+    onOpenSettings: (callback: () => void) => () => void
+    onSaveChanges: (callback: () => void) => () => void
+    onDiscardChanges: (callback: () => void) => () => void
+    onAddRow: (callback: () => void) => () => void
   }
   license: {
     check: () => Promise<IpcResponse<LicenseStatus>>
@@ -198,6 +327,7 @@ interface DataPeekApi {
       type?: LicenseType,
       daysValid?: number
     ) => Promise<IpcResponse<LicenseStatus>>
+    openCustomerPortal: () => Promise<IpcResponse<void>>
   }
   savedQueries: {
     list: () => Promise<IpcResponse<SavedQuery[]>>
@@ -207,16 +337,136 @@ interface DataPeekApi {
     incrementUsage: (id: string) => Promise<IpcResponse<SavedQuery>>
     onOpenDialog: (callback: () => void) => () => void
   }
+  queryHistory: {
+    list: () => Promise<IpcResponse<QueryHistoryEntry[]>>
+    add: (entry: QueryHistoryEntry) => Promise<IpcResponse<QueryHistoryEntry>>
+    remove: (id: string) => Promise<IpcResponse<void>>
+    clear: (connectionId?: string) => Promise<IpcResponse<void>>
+  }
+  snippets: {
+    list: () => Promise<IpcResponse<Snippet[]>>
+    add: (snippet: Snippet) => Promise<IpcResponse<Snippet>>
+    update: (id: string, updates: Partial<Snippet>) => Promise<IpcResponse<Snippet>>
+    delete: (id: string) => Promise<IpcResponse<void>>
+  }
+  scheduledQueries: {
+    list: () => Promise<IpcResponse<ScheduledQuery[]>>
+    get: (id: string) => Promise<IpcResponse<ScheduledQuery>>
+    create: (input: CreateScheduledQueryInput) => Promise<IpcResponse<ScheduledQuery>>
+    update: (id: string, updates: UpdateScheduledQueryInput) => Promise<IpcResponse<ScheduledQuery>>
+    delete: (id: string) => Promise<IpcResponse<void>>
+    pause: (id: string) => Promise<IpcResponse<ScheduledQuery>>
+    resume: (id: string) => Promise<IpcResponse<ScheduledQuery>>
+    runNow: (id: string) => Promise<IpcResponse<ScheduledQueryRun>>
+    getRuns: (queryId: string, limit?: number) => Promise<IpcResponse<ScheduledQueryRun[]>>
+    getAllRuns: (limit?: number) => Promise<IpcResponse<ScheduledQueryRun[]>>
+    clearRuns: (queryId: string) => Promise<IpcResponse<void>>
+    validateCron: (expression: string) => Promise<IpcResponse<{ valid: boolean; error?: string }>>
+    getNextRuns: (
+      expression: string,
+      count?: number,
+      timezone?: string
+    ) => Promise<IpcResponse<number[]>>
+  }
+  dashboards: {
+    list: () => Promise<IpcResponse<Dashboard[]>>
+    get: (id: string) => Promise<IpcResponse<Dashboard>>
+    create: (input: CreateDashboardInput) => Promise<IpcResponse<Dashboard>>
+    update: (id: string, updates: UpdateDashboardInput) => Promise<IpcResponse<Dashboard>>
+    delete: (id: string) => Promise<IpcResponse<void>>
+    duplicate: (id: string) => Promise<IpcResponse<Dashboard>>
+    addWidget: (dashboardId: string, widget: CreateWidgetInput) => Promise<IpcResponse<Widget>>
+    updateWidget: (
+      dashboardId: string,
+      widgetId: string,
+      updates: UpdateWidgetInput
+    ) => Promise<IpcResponse<Widget>>
+    deleteWidget: (dashboardId: string, widgetId: string) => Promise<IpcResponse<void>>
+    updateWidgetLayouts: (
+      dashboardId: string,
+      layouts: Record<string, WidgetLayout>
+    ) => Promise<IpcResponse<Dashboard>>
+    executeWidget: (widget: Widget) => Promise<IpcResponse<WidgetRunResult>>
+    executeAllWidgets: (dashboardId: string) => Promise<IpcResponse<WidgetRunResult[]>>
+    getByTag: (tag: string) => Promise<IpcResponse<Dashboard[]>>
+    getAllTags: () => Promise<IpcResponse<string[]>>
+    updateRefreshSchedule: (
+      dashboardId: string,
+      schedule: Dashboard['refreshSchedule']
+    ) => Promise<IpcResponse<Dashboard>>
+    getNextRefreshTime: (
+      schedule: NonNullable<Dashboard['refreshSchedule']>
+    ) => Promise<IpcResponse<number | null>>
+    validateCron: (expression: string) => Promise<IpcResponse<{ valid: boolean; error?: string }>>
+    getNextRefreshTimes: (
+      expression: string,
+      count?: number,
+      timezone?: string
+    ) => Promise<IpcResponse<number[]>>
+    onRefreshComplete: (
+      callback: (data: { dashboardId: string; results: WidgetRunResult[] }) => void
+    ) => () => void
+  }
+  updater: {
+    onUpdateAvailable: (callback: (version: string) => void) => () => void
+    onUpdateDownloaded: (callback: (version: string) => void) => () => void
+    onDownloadProgress: (callback: (percent: number) => void) => () => void
+    onError: (callback: (message: string) => void) => () => void
+    quitAndInstall: () => void
+  }
   ai: {
     getConfig: () => Promise<IpcResponse<AIConfig | null>>
     setConfig: (config: AIConfig) => Promise<IpcResponse<void>>
     clearConfig: () => Promise<IpcResponse<void>>
     validateKey: (config: AIConfig) => Promise<IpcResponse<{ valid: boolean; error?: string }>>
+    detectHarness: (
+      provider?: AIProvider
+    ) => Promise<
+      IpcResponse<{ available: boolean; path?: string; version?: string; error?: string }>
+    >
+    generateDashboard: (
+      prompt: string,
+      schemas: SchemaInfo[],
+      dbType: string,
+      connectionId?: string
+    ) => Promise<{
+      success: boolean
+      spec?: {
+        title: string
+        widgets: Array<{
+          title: string
+          kind: 'kpi' | 'chart' | 'table'
+          sql: string
+          chartType?: 'bar' | 'line' | 'pie' | 'area' | null
+          format?: 'number' | 'currency' | 'percent' | 'duration' | null
+          xKey?: string | null
+          yKeys?: string[] | null
+        }>
+      }
+      error?: string
+    }>
     chat: (
       messages: AIMessage[],
       schemas: SchemaInfo[],
-      dbType: string
-    ) => Promise<IpcResponse<AIChatResponse>>
+      dbType: string,
+      connectionId?: string
+    ) => Promise<
+      IpcResponse<AIChatResponse> & {
+        meta?: { grounded: boolean; agentic: boolean; turns?: number }
+      }
+    >
+    chatStream: (
+      messages: AIMessage[],
+      schemas: SchemaInfo[],
+      dbType: string,
+      connectionId: string | undefined,
+      resumeSessionId: string | undefined,
+      onEvent: (event: AIChatStreamEvent) => void
+    ) => Promise<
+      IpcResponse<AIChatResponse> & {
+        meta?: { grounded: boolean; agentic: boolean; turns?: number; sessionId?: string }
+      }
+    >
     // Chat history persistence (legacy API)
     getChatHistory: (connectionId: string) => Promise<IpcResponse<StoredChatMessage[]>>
     saveChatHistory: (
@@ -237,6 +487,130 @@ interface DataPeekApi {
       updates: { messages?: StoredChatMessage[]; title?: string }
     ) => Promise<IpcResponse<ChatSession | null>>
     deleteSession: (connectionId: string, sessionId: string) => Promise<IpcResponse<boolean>>
+    // Multi-provider configuration
+    getMultiProviderConfig: () => Promise<IpcResponse<AIMultiProviderConfig | null>>
+    setMultiProviderConfig: (config: AIMultiProviderConfig | null) => Promise<IpcResponse<void>>
+    getProviderConfig: (provider: AIProvider) => Promise<IpcResponse<AIProviderConfig | null>>
+    setProviderConfig: (
+      provider: AIProvider,
+      config: AIProviderConfig
+    ) => Promise<IpcResponse<void>>
+    removeProviderConfig: (provider: AIProvider) => Promise<IpcResponse<void>>
+    setActiveProvider: (provider: AIProvider) => Promise<IpcResponse<void>>
+    setActiveModel: (provider: AIProvider, model: string) => Promise<IpcResponse<void>>
+  }
+  pgNotify: {
+    subscribe: (
+      connectionId: string,
+      config: ConnectionConfig,
+      channel: string
+    ) => Promise<IpcResponse<void>>
+    unsubscribe: (connectionId: string, channel: string) => Promise<IpcResponse<void>>
+    send: (config: ConnectionConfig, channel: string, payload: string) => Promise<IpcResponse<void>>
+    getChannels: (connectionId: string) => Promise<IpcResponse<PgNotificationChannel[]>>
+    getHistory: (
+      connectionId: string,
+      limit?: number
+    ) => Promise<IpcResponse<PgNotificationEvent[]>>
+    clearHistory: (connectionId: string) => Promise<IpcResponse<void>>
+    onEvent: (callback: (event: PgNotificationEvent) => void) => () => void
+    onStatus: (callback: (status: PgNotificationConnectionStatus) => void) => () => void
+    reconnect: (connectionId: string) => Promise<IpcResponse<void>>
+    getStatus: (connectionId: string) => Promise<IpcResponse<PgNotificationConnectionStatus | null>>
+    getAllStatuses: () => Promise<IpcResponse<PgNotificationConnectionStatus[]>>
+  }
+  intel: {
+    run: (
+      config: ConnectionConfig,
+      checks?: SchemaIntelCheckId[]
+    ) => Promise<IpcResponse<SchemaIntelReport>>
+  }
+  health: {
+    activeQueries: (config: ConnectionConfig) => Promise<IpcResponse<ActiveQuery[]>>
+    tableSizes: (
+      config: ConnectionConfig,
+      schema?: string
+    ) => Promise<IpcResponse<{ dbSize: DatabaseSizeInfo; tables: TableSizeInfo[] }>>
+    cacheStats: (config: ConnectionConfig) => Promise<IpcResponse<CacheStats>>
+    locks: (config: ConnectionConfig) => Promise<IpcResponse<LockInfo[]>>
+    killQuery: (
+      config: ConnectionConfig,
+      pid: number
+    ) => Promise<IpcResponse<{ success: boolean; error?: string }>>
+  }
+  pgDump: {
+    export: (
+      config: ConnectionConfig,
+      options: PgExportOptions
+    ) => Promise<IpcResponse<PgExportResult>>
+    cancelExport: () => Promise<IpcResponse<void>>
+    onExportProgress: (callback: (progress: PgExportProgress) => void) => () => void
+    import: (
+      config: ConnectionConfig,
+      options: PgImportOptions
+    ) => Promise<IpcResponse<PgImportResult>>
+    cancelImport: () => Promise<IpcResponse<void>>
+    onImportProgress: (callback: (progress: PgImportProgress) => void) => () => void
+  }
+  notebooks: {
+    list: () => Promise<IpcResponse<Notebook[]>>
+    get: (id: string) => Promise<IpcResponse<NotebookWithCells>>
+    create: (input: CreateNotebookInput) => Promise<IpcResponse<Notebook>>
+    update: (id: string, updates: UpdateNotebookInput) => Promise<IpcResponse<Notebook>>
+    delete: (id: string) => Promise<IpcResponse<void>>
+    duplicate: (id: string, connectionId: string) => Promise<IpcResponse<Notebook>>
+    addCell: (notebookId: string, input: AddCellInput) => Promise<IpcResponse<NotebookCell>>
+    updateCell: (cellId: string, updates: UpdateCellInput) => Promise<IpcResponse<NotebookCell>>
+    deleteCell: (cellId: string) => Promise<IpcResponse<void>>
+    reorderCells: (notebookId: string, cellIds: string[]) => Promise<IpcResponse<void>>
+  }
+  timeMachine: {
+    capture: (payload: TimeMachineCapturePayload) => Promise<IpcResponse<TimeMachineRunMeta>>
+    listRuns: (connectionId: string, sql: string) => Promise<IpcResponse<TimeMachineListResult>>
+    getSnapshot: (id: string) => Promise<IpcResponse<TimeMachineSnapshot>>
+    deleteRun: (id: string) => Promise<IpcResponse<void>>
+    clearQuery: (connectionId: string, sql: string) => Promise<IpcResponse<void>>
+    clearAll: (connectionId?: string) => Promise<IpcResponse<void>>
+    stats: () => Promise<IpcResponse<TimeMachineStats>>
+  }
+  step: {
+    start: (
+      config: ConnectionConfig,
+      request: StartStepRequest
+    ) => Promise<IpcResponse<StartStepResponse>>
+    next: (sessionId: string) => Promise<IpcResponse<NextStepResponse>>
+    skip: (sessionId: string) => Promise<IpcResponse<SkipStepResponse>>
+    continue: (sessionId: string) => Promise<IpcResponse<ContinueStepResponse>>
+    retry: (sessionId: string) => Promise<IpcResponse<RetryStepResponse>>
+    setBreakpoints: (sessionId: string, breakpoints: number[]) => Promise<IpcResponse<void>>
+    stop: (sessionId: string) => Promise<IpcResponse<StopStepResponse>>
+  }
+  files: {
+    openFilePicker: () => Promise<string | null>
+  }
+  window: {
+    minimize: () => Promise<void>
+    maximize: () => Promise<void>
+    close: () => Promise<void>
+    setConnectionInfo: (connectionName: string | null) => void
+  }
+  mcp: {
+    status: () => Promise<IpcResponse<McpServerStatus>>
+    setEnabled: (enabled: boolean) => Promise<IpcResponse<McpServerStatus>>
+    setPort: (port: number) => Promise<IpcResponse<McpServerStatus>>
+    regenerateToken: () => Promise<IpcResponse<McpServerStatus>>
+    respondToApproval: (id: string, approved: boolean) => Promise<IpcResponse<void>>
+    onApprovalRequest: (callback: (req: McpApprovalRequest) => void) => () => void
+    onApprovalResolved: (callback: (payload: { id: string }) => void) => () => void
+  }
+  audit: {
+    status: () => Promise<IpcResponse<AuditStatus>>
+    setEnabled: (enabled: boolean) => Promise<IpcResponse<AuditStatus>>
+    setRetention: (days: number) => Promise<IpcResponse<AuditStatus>>
+    verify: () => Promise<IpcResponse<AuditVerifyResult>>
+    export: (
+      format: 'csv' | 'json'
+    ) => Promise<IpcResponse<{ path: string; entries: number } | null>>
   }
 }
 

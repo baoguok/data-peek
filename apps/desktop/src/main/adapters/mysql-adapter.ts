@@ -1,4 +1,5 @@
 import mysql from 'mysql2/promise'
+import { randomUUID } from 'crypto'
 import type {
   ConnectionConfig,
   SchemaInfo,
@@ -12,14 +13,60 @@ import type {
   IndexDefinition,
   SequenceInfo,
   CustomTypeInfo,
-  StatementResult
+  StatementResult,
+  RoutineInfo,
+  RoutineParameterInfo,
+  TriggerInfo,
+  ColumnStats,
+  ColumnStatsType,
+  CommonValue,
+  ActiveQuery,
+  TableSizeInfo,
+  CacheStats,
+  LockInfo,
+  DatabaseSizeInfo,
+  SchemaIntelCheckId,
+  SchemaIntelReport
 } from '@shared/index'
+import { runMysqlSchemaIntel } from '../schema-intel/mysql'
 import type {
   DatabaseAdapter,
   AdapterQueryResult,
   AdapterMultiQueryResult,
-  ExplainResult
+  ExplainResult,
+  QueryOptions
 } from '../db-adapter'
+import { registerQuery, unregisterQuery } from '../query-tracker'
+import { splitStatements } from '../lib/sql-parser'
+import { telemetryCollector, TELEMETRY_PHASES } from '../telemetry-collector'
+import { toMySQLConfig } from './mysql-client-config'
+import { withMySQLConnection, withMySQLTransaction } from './mysql-pool-manager'
+
+// Re-exported because it was part of this module's surface before it moved out to break
+// an import cycle with the pool manager.
+export { toMySQLConfig }
+
+/** Split SQL into statements for MySQL */
+const splitMySqlStatements = (sql: string) => splitStatements(sql, 'mysql')
+
+/**
+ * Values mysql2 accepts as prepared-statement parameters.
+ *
+ * Mirrors mysql2's internal `ExecuteValues`, which it doesn't export. `DatabaseAdapter`
+ * hands params down as `unknown[]` because that signature is shared across every driver,
+ * so this is the type at the boundary where those values meet mysql2.
+ */
+type MySQLBindValue =
+  | string
+  | number
+  | bigint
+  | boolean
+  | Date
+  | null
+  | Buffer
+  | Uint8Array
+  | MySQLBindValue[]
+  | { [key: string]: MySQLBindValue }
 
 /**
  * MySQL type codes to type name mapping
@@ -59,29 +106,15 @@ const MYSQL_TYPE_MAP: Record<number, string> = {
 /**
  * Resolve MySQL type code to human-readable type name
  */
-function resolveMySQLType(typeCode: number): string {
+export function resolveMySQLType(typeCode: number): string {
   return MYSQL_TYPE_MAP[typeCode] ?? `unknown(${typeCode})`
-}
-
-/**
- * Create MySQL connection config from our ConnectionConfig
- */
-function toMySQLConfig(config: ConnectionConfig): mysql.ConnectionOptions {
-  return {
-    host: config.host,
-    port: config.port,
-    user: config.user,
-    password: config.password,
-    database: config.database,
-    ssl: config.ssl ? {} : undefined
-  }
 }
 
 /**
  * Normalize row from MySQL query to lowercase keys
  * MySQL can return column names in different cases depending on configuration
  */
-function normalizeRow<T extends Record<string, unknown>>(row: Record<string, unknown>): T {
+export function normalizeRow<T extends Record<string, unknown>>(row: Record<string, unknown>): T {
   const normalized: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(row)) {
     normalized[key.toLowerCase()] = value
@@ -90,141 +123,9 @@ function normalizeRow<T extends Record<string, unknown>>(row: Record<string, unk
 }
 
 /**
- * Split SQL into individual statements, respecting string literals and comments
- */
-function splitStatements(sql: string): string[] {
-  const statements: string[] = []
-  let current = ''
-  let i = 0
-
-  while (i < sql.length) {
-    const char = sql[i]
-    const nextChar = sql[i + 1]
-
-    // Handle single-quoted strings
-    if (char === "'") {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") {
-          current += "''"
-          i += 2
-        } else if (sql[i] === '\\' && sql[i + 1] === "'") {
-          // MySQL escape sequence
-          current += "\\'"
-          i += 2
-        } else if (sql[i] === "'") {
-          current += "'"
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle double-quoted strings (when ANSI_QUOTES mode)
-    if (char === '"') {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === '"' && sql[i + 1] === '"') {
-          current += '""'
-          i += 2
-        } else if (sql[i] === '"') {
-          current += '"'
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle backtick-quoted identifiers (MySQL-specific)
-    if (char === '`') {
-      current += char
-      i++
-      while (i < sql.length) {
-        if (sql[i] === '`' && sql[i + 1] === '`') {
-          current += '``'
-          i += 2
-        } else if (sql[i] === '`') {
-          current += '`'
-          i++
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Handle line comments (-- or #)
-    if ((char === '-' && nextChar === '-') || char === '#') {
-      if (char === '#') {
-        current += '#'
-        i++
-      } else {
-        current += '--'
-        i += 2
-      }
-      while (i < sql.length && sql[i] !== '\n') {
-        current += sql[i]
-        i++
-      }
-      continue
-    }
-
-    // Handle block comments (/* */)
-    if (char === '/' && nextChar === '*') {
-      current += '/*'
-      i += 2
-      while (i < sql.length) {
-        if (sql[i] === '*' && sql[i + 1] === '/') {
-          current += '*/'
-          i += 2
-          break
-        } else {
-          current += sql[i]
-          i++
-        }
-      }
-      continue
-    }
-
-    // Statement separator
-    if (char === ';') {
-      const stmt = current.trim()
-      if (stmt) {
-        statements.push(stmt)
-      }
-      current = ''
-      i++
-      continue
-    }
-
-    current += char
-    i++
-  }
-
-  const lastStmt = current.trim()
-  if (lastStmt) {
-    statements.push(lastStmt)
-  }
-
-  return statements
-}
-
-/**
  * Check if a SQL statement is data-returning (SELECT, SHOW, etc.)
  */
-function isDataReturningStatement(sql: string): boolean {
+export function isDataReturningStatement(sql: string): boolean {
   const normalized = sql.trim().toUpperCase()
   if (normalized.startsWith('SELECT')) return true
   if (normalized.startsWith('SHOW')) return true
@@ -243,14 +144,15 @@ export class MySQLAdapter implements DatabaseAdapter {
   readonly dbType = 'mysql' as const
 
   async connect(config: ConnectionConfig): Promise<void> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-    await connection.end()
+    // Warm the pool AND verify the socket end-to-end. Checking out a connection alone
+    // can hand back a cached idle one without a round-trip; SELECT 1 proves it's live.
+    await withMySQLConnection(config, async (connection) => {
+      await connection.query('SELECT 1')
+    })
   }
 
   async query(config: ConnectionConfig, sql: string): Promise<AdapterQueryResult> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
+    return withMySQLConnection(config, async (connection) => {
       const [rows, fields] = await connection.query(sql)
 
       const queryFields: QueryField[] = (fields as mysql.FieldPacket[]).map((f) => ({
@@ -266,83 +168,166 @@ export class MySQLAdapter implements DatabaseAdapter {
         fields: queryFields,
         rowCount: resultRows.length
       }
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
-  async queryMultiple(config: ConnectionConfig, sql: string): Promise<AdapterMultiQueryResult> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
+  async queryMultiple(
+    config: ConnectionConfig,
+    sql: string,
+    options?: QueryOptions
+  ): Promise<AdapterMultiQueryResult> {
+    const collectTelemetry = options?.collectTelemetry ?? false
+    const executionId = options?.executionId ?? randomUUID()
+
+    // Start telemetry collection if requested
+    if (collectTelemetry) {
+      telemetryCollector.startQuery(executionId, false)
+      telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+    }
 
     const totalStart = Date.now()
     const results: StatementResult[] = []
+    let totalRowCount = 0
 
-    try {
-      const statements = splitStatements(sql)
+    return withMySQLConnection(config, async (connection) => {
+      // Closes over the pool acquisition, which is the only connection-level cost left
+      // now that pooling amortises the handshake — and the one worth seeing, since it
+      // spikes when the pool saturates. There is no per-query DB handshake to report.
+      if (collectTelemetry) {
+        telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.TCP_HANDSHAKE)
+      }
 
-      for (let i = 0; i < statements.length; i++) {
-        const statement = statements[i]
-        const stmtStart = Date.now()
+      // Whether this call set a session-scoped timeout that must be undone before the
+      // connection goes back to the pool.
+      let timeoutWasSet = false
+      try {
+        // Set query timeout if specified (0 = no timeout)
+        // Note: max_execution_time only affects SELECT statements in MySQL 5.7.8+
+        const queryTimeoutMs = options?.queryTimeoutMs
+        if (
+          typeof queryTimeoutMs === 'number' &&
+          Number.isFinite(queryTimeoutMs) &&
+          queryTimeoutMs > 0
+        ) {
+          const safeTimeout = Math.floor(queryTimeoutMs)
+          await connection.query(`SET SESSION max_execution_time = ${safeTimeout}`)
+          timeoutWasSet = true
+        }
 
-        try {
-          const [rows, fields] = await connection.query(statement)
-          const stmtDuration = Date.now() - stmtStart
+        // Register for cancellation support
+        if (options?.executionId) {
+          registerQuery(options.executionId, { type: 'mysql', connection })
+        }
+        const statements = splitMySqlStatements(sql)
 
-          const queryFields: QueryField[] =
-            (fields as mysql.FieldPacket[] | undefined)?.map((f) => ({
-              name: f.name,
-              dataType: resolveMySQLType(f.type ?? 253),
-              dataTypeID: f.type ?? 253
-            })) || []
+        for (let i = 0; i < statements.length; i++) {
+          const statement = statements[i]
+          const stmtStart = Date.now()
 
-          const resultRows = Array.isArray(rows) ? rows : []
-          const isDataReturning = isDataReturningStatement(statement)
+          try {
+            // Start execution phase timing
+            if (collectTelemetry) {
+              telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+            }
 
-          // For non-SELECT statements, rowCount is the affected rows
-          let rowCount: number
-          if (isDataReturning) {
-            rowCount = resultRows.length
-          } else {
-            const header = rows as mysql.ResultSetHeader
-            rowCount = header.affectedRows ?? 0
+            const [rows, fields] = await connection.query(statement)
+
+            if (collectTelemetry) {
+              telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.EXECUTION)
+              telemetryCollector.startPhase(executionId, TELEMETRY_PHASES.PARSE)
+            }
+
+            const stmtDuration = Date.now() - stmtStart
+
+            const queryFields: QueryField[] =
+              (fields as mysql.FieldPacket[] | undefined)?.map((f) => ({
+                name: f.name,
+                dataType: resolveMySQLType(f.type ?? 253),
+                dataTypeID: f.type ?? 253
+              })) || []
+
+            const resultRows = Array.isArray(rows) ? rows : []
+            const isDataReturning = isDataReturningStatement(statement)
+
+            // For non-SELECT statements, rowCount is the affected rows
+            let rowCount: number
+            if (isDataReturning) {
+              rowCount = resultRows.length
+            } else {
+              const header = rows as mysql.ResultSetHeader
+              rowCount = header.affectedRows ?? 0
+            }
+            totalRowCount += rowCount
+
+            results.push({
+              statement,
+              statementIndex: i,
+              rows: resultRows as Record<string, unknown>[],
+              fields: queryFields,
+              rowCount,
+              durationMs: stmtDuration,
+              isDataReturning
+            })
+
+            if (collectTelemetry) {
+              telemetryCollector.endPhase(executionId, TELEMETRY_PHASES.PARSE)
+            }
+          } catch (error) {
+            const stmtDuration = Date.now() - stmtStart
+            const errorMessage = error instanceof Error ? error.message : String(error)
+
+            results.push({
+              statement,
+              statementIndex: i,
+              rows: [],
+              fields: [{ name: 'error', dataType: 'text' }],
+              rowCount: 0,
+              durationMs: stmtDuration,
+              isDataReturning: false
+            })
+
+            // Cancel telemetry on error
+            if (collectTelemetry) {
+              telemetryCollector.cancel(executionId)
+            }
+
+            throw new Error(
+              `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
+            )
           }
+        }
 
-          results.push({
-            statement,
-            statementIndex: i,
-            rows: resultRows as Record<string, unknown>[],
-            fields: queryFields,
-            rowCount,
-            durationMs: stmtDuration,
-            isDataReturning
-          })
-        } catch (error) {
-          const stmtDuration = Date.now() - stmtStart
-          const errorMessage = error instanceof Error ? error.message : String(error)
+        const result: AdapterMultiQueryResult = {
+          results,
+          totalDurationMs: Date.now() - totalStart
+        }
 
-          results.push({
-            statement,
-            statementIndex: i,
-            rows: [],
-            fields: [{ name: 'error', dataType: 'text' }],
-            rowCount: 0,
-            durationMs: stmtDuration,
-            isDataReturning: false
-          })
+        // Finalize telemetry
+        if (collectTelemetry) {
+          result.telemetry = telemetryCollector.finalize(executionId, totalRowCount)
+        }
 
-          throw new Error(
-            `Error in statement ${i + 1}: ${errorMessage}\n\nStatement:\n${statement}`
-          )
+        return result
+      } finally {
+        // Unregister from tracker
+        if (options?.executionId) {
+          unregisterQuery(options.executionId)
+        }
+        // The connection is about to go back to the pool, so undo the session-scoped
+        // timeout — otherwise the next unrelated query on this connection silently
+        // inherits it. If the reset itself fails the session state is unknown, so
+        // destroy the connection rather than let the pool hand it to someone else;
+        // mysql2 replaces it on the next checkout. (A cancelled query has already
+        // destroyed the socket, which is why the reset can fail at all.)
+        if (timeoutWasSet) {
+          try {
+            await connection.query('SET SESSION max_execution_time = 0')
+          } catch {
+            connection.destroy()
+          }
         }
       }
-
-      return {
-        results,
-        totalDurationMs: Date.now() - totalStart
-      }
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
   async execute(
@@ -350,50 +335,34 @@ export class MySQLAdapter implements DatabaseAdapter {
     sql: string,
     params: unknown[]
   ): Promise<{ rowCount: number | null }> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
-      const [result] = await connection.execute(sql, params)
+    return withMySQLConnection(config, async (connection) => {
+      const [result] = await connection.execute(sql, params as MySQLBindValue[])
       const affectedRows = (result as mysql.ResultSetHeader).affectedRows ?? null
       return { rowCount: affectedRows }
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
   async executeTransaction(
     config: ConnectionConfig,
     statements: Array<{ sql: string; params: unknown[] }>
   ): Promise<{ rowsAffected: number; results: Array<{ rowCount: number | null }> }> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
-      await connection.beginTransaction()
-
+    return withMySQLTransaction(config, async (connection) => {
       const results: Array<{ rowCount: number | null }> = []
       let rowsAffected = 0
 
       for (const stmt of statements) {
-        const [result] = await connection.execute(stmt.sql, stmt.params)
+        const [result] = await connection.execute(stmt.sql, stmt.params as MySQLBindValue[])
         const affectedRows = (result as mysql.ResultSetHeader).affectedRows ?? 0
         results.push({ rowCount: affectedRows })
         rowsAffected += affectedRows
       }
 
-      await connection.commit()
       return { rowsAffected, results }
-    } catch (error) {
-      await connection.rollback().catch(() => {})
-      throw error
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
   async getSchemas(config: ConnectionConfig): Promise<SchemaInfo[]> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
+    return withMySQLConnection(config, async (connection) => {
       // In MySQL, "schema" = "database"
       // We'll show all databases as schemas, excluding system databases
       const [schemasRows] = await connection.query(`
@@ -512,13 +481,157 @@ export class MySQLAdapter implements DatabaseAdapter {
         })
       }
 
+      // Get all routines (stored procedures and functions)
+      const [routinesRows] = await connection.query(`
+        SELECT
+          routine_schema,
+          routine_name,
+          routine_type,
+          data_type as return_type,
+          routine_comment as comment,
+          specific_name
+        FROM information_schema.routines
+        WHERE routine_schema NOT IN ('mysql', 'performance_schema', 'information_schema', 'sys')
+        ORDER BY routine_schema, routine_name
+      `)
+
+      const routinesRaw = routinesRows as Array<Record<string, unknown>>
+      const routines = routinesRaw.map((row) =>
+        normalizeRow<{
+          routine_schema: string
+          routine_name: string
+          routine_type: string
+          return_type: string | null
+          comment: string | null
+          specific_name: string
+        }>(row)
+      )
+
+      // Get routine parameters
+      const [paramsRows] = await connection.query(`
+        SELECT
+          specific_schema,
+          specific_name,
+          parameter_name,
+          data_type,
+          parameter_mode,
+          ordinal_position
+        FROM information_schema.parameters
+        WHERE specific_schema NOT IN ('mysql', 'performance_schema', 'information_schema', 'sys')
+          AND parameter_name IS NOT NULL
+        ORDER BY specific_schema, specific_name, ordinal_position
+      `)
+
+      const paramsRaw = paramsRows as Array<Record<string, unknown>>
+      const params = paramsRaw.map((row) =>
+        normalizeRow<{
+          specific_schema: string
+          specific_name: string
+          parameter_name: string | null
+          data_type: string
+          parameter_mode: string | null
+          ordinal_position: number
+        }>(row)
+      )
+
+      // Build parameters lookup map
+      const paramsMap = new Map<string, RoutineParameterInfo[]>()
+      for (const row of params) {
+        const key = `${row.specific_schema}.${row.specific_name}`
+        if (!paramsMap.has(key)) {
+          paramsMap.set(key, [])
+        }
+        paramsMap.get(key)!.push({
+          name: row.parameter_name || '',
+          dataType: row.data_type,
+          mode: (row.parameter_mode?.toUpperCase() || 'IN') as 'IN' | 'OUT' | 'INOUT',
+          ordinalPosition: row.ordinal_position
+        })
+      }
+
+      // Get all triggers
+      const [triggersRows] = await connection.query(`
+        SELECT
+          trigger_schema,
+          trigger_name,
+          event_object_table AS table_name,
+          action_timing,
+          event_manipulation,
+          action_orientation,
+          action_statement,
+          action_condition
+        FROM information_schema.triggers
+        WHERE trigger_schema NOT IN ('mysql', 'performance_schema', 'information_schema', 'sys')
+        ORDER BY trigger_schema, event_object_table, trigger_name
+      `)
+
+      const triggersRaw = triggersRows as Array<Record<string, unknown>>
+      const triggers = triggersRaw.map((row) =>
+        normalizeRow<{
+          trigger_schema: string
+          trigger_name: string
+          table_name: string
+          action_timing: string
+          event_manipulation: string
+          action_orientation: string | null
+          action_statement: string
+          action_condition: string | null
+        }>(row)
+      )
+
+      // Build triggers lookup map. Each MySQL trigger fires on a single event.
+      const triggersMap = new Map<string, TriggerInfo[]>()
+      for (const row of triggers) {
+        if (!triggersMap.has(row.trigger_schema)) {
+          triggersMap.set(row.trigger_schema, [])
+        }
+        const timing = (row.action_timing?.toUpperCase() || 'BEFORE') as TriggerInfo['timing']
+        const event = row.event_manipulation?.toUpperCase() || ''
+        const definition =
+          `CREATE TRIGGER \`${row.trigger_name}\` ${timing} ${event} ` +
+          `ON \`${row.table_name}\`\nFOR EACH ROW ${row.action_statement}`
+
+        triggersMap.get(row.trigger_schema)!.push({
+          name: row.trigger_name,
+          schema: row.trigger_schema,
+          table: row.table_name,
+          timing,
+          events: event ? [event] : [],
+          orientation: (row.action_orientation?.toUpperCase() as 'ROW' | 'STATEMENT') || 'ROW',
+          // MySQL has no notion of disabled triggers
+          enabled: true,
+          condition: row.action_condition || undefined,
+          definition
+        })
+      }
+
+      // Build routines lookup map
+      const routinesMap = new Map<string, RoutineInfo[]>()
+      for (const row of routines) {
+        if (!routinesMap.has(row.routine_schema)) {
+          routinesMap.set(row.routine_schema, [])
+        }
+        const paramsKey = `${row.routine_schema}.${row.specific_name}`
+        const routineParams = paramsMap.get(paramsKey) || []
+
+        routinesMap.get(row.routine_schema)!.push({
+          name: row.routine_name,
+          type: row.routine_type === 'PROCEDURE' ? 'procedure' : 'function',
+          returnType: row.return_type || undefined,
+          parameters: routineParams,
+          comment: row.comment || undefined
+        })
+      }
+
       // Build schema structure
       const schemaMap = new Map<string, SchemaInfo>()
 
       for (const row of schemas) {
         schemaMap.set(row.schema_name, {
           name: row.schema_name,
-          tables: []
+          tables: [],
+          routines: routinesMap.get(row.schema_name) || [],
+          triggers: triggersMap.get(row.schema_name) || []
         })
       }
 
@@ -571,15 +684,11 @@ export class MySQLAdapter implements DatabaseAdapter {
       }
 
       return Array.from(schemaMap.values())
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
   async explain(config: ConnectionConfig, sql: string, analyze: boolean): Promise<ExplainResult> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
+    return withMySQLConnection(config, async (connection) => {
       // MySQL uses EXPLAIN ANALYZE (8.0.18+) or just EXPLAIN
       const explainQuery = analyze ? `EXPLAIN ANALYZE ${sql}` : `EXPLAIN FORMAT=JSON ${sql}`
 
@@ -606,9 +715,7 @@ export class MySQLAdapter implements DatabaseAdapter {
         plan,
         durationMs: duration
       }
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
   async getTableDDL(
@@ -616,9 +723,7 @@ export class MySQLAdapter implements DatabaseAdapter {
     schema: string,
     table: string
   ): Promise<TableDefinition> {
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
+    return withMySQLConnection(config, async (connection) => {
       // Get columns with full metadata
       const [columnsRows] = await connection.query(
         `
@@ -858,12 +963,9 @@ export class MySQLAdapter implements DatabaseAdapter {
         indexes,
         comment: tableCommentResult[0]?.table_comment || undefined
       }
-    } finally {
-      await connection.end()
-    }
+    })
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   async getSequences(_config: ConnectionConfig): Promise<SequenceInfo[]> {
     // MySQL doesn't have sequences - it uses AUTO_INCREMENT
     // Return empty array as sequences are a PostgreSQL concept
@@ -871,10 +973,7 @@ export class MySQLAdapter implements DatabaseAdapter {
   }
 
   async getTypes(config: ConnectionConfig): Promise<CustomTypeInfo[]> {
-    // Get MySQL ENUM types from columns
-    const connection = await mysql.createConnection(toMySQLConfig(config))
-
-    try {
+    return withMySQLConnection(config, async (connection) => {
       // MySQL doesn't have standalone enum types, they're defined per column
       // We'll extract unique enum definitions from columns
       const [enumRows] = await connection.query(`
@@ -909,8 +1008,394 @@ export class MySQLAdapter implements DatabaseAdapter {
       }
 
       return types
-    } finally {
-      await connection.end()
+    })
+  }
+
+  private classifyColumnType(dataType: string): ColumnStatsType {
+    const lower = dataType.toLowerCase()
+    if (
+      lower.includes('int') ||
+      lower.includes('decimal') ||
+      lower.includes('numeric') ||
+      lower.includes('float') ||
+      lower.includes('double') ||
+      lower.includes('real') ||
+      lower.includes('bit')
+    ) {
+      return 'numeric'
     }
+    if (lower.includes('date') || lower.includes('time') || lower.includes('year')) {
+      return 'datetime'
+    }
+    if (lower === 'boolean' || lower === 'tinyint(1)') {
+      return 'boolean'
+    }
+    if (
+      lower.includes('char') ||
+      lower.includes('text') ||
+      lower.includes('varchar') ||
+      lower.includes('enum') ||
+      lower.includes('set')
+    ) {
+      return 'text'
+    }
+    return 'other'
+  }
+
+  async getColumnStats(
+    config: ConnectionConfig,
+    schema: string,
+    table: string,
+    column: string,
+    dataType: string
+  ): Promise<ColumnStats> {
+    return withMySQLConnection(config, async (connection) => {
+      const statsType = this.classifyColumnType(dataType)
+      const quoteIdent = (name: string) => '`' + name.replace(/`/g, '``') + '`'
+      const quotedTable = `${quoteIdent(schema)}.${quoteIdent(table)}`
+      const quotedCol = quoteIdent(column)
+
+      const [baseRows] = await connection.query(`
+        SELECT
+          COUNT(*) AS total_rows,
+          COUNT(*) - COUNT(${quotedCol}) AS null_count,
+          COUNT(DISTINCT ${quotedCol}) AS distinct_count
+        FROM ${quotedTable}
+      `)
+
+      const baseRow = (baseRows as Array<Record<string, unknown>>)[0]
+      const totalRows = Number(baseRow.total_rows)
+      const nullCount = Number(baseRow.null_count)
+      const distinctCount = Number(baseRow.distinct_count)
+      const nullPercentage = totalRows > 0 ? (nullCount / totalRows) * 100 : 0
+      const distinctPercentage = totalRows > 0 ? (distinctCount / totalRows) * 100 : 0
+
+      const stats: ColumnStats = {
+        column,
+        dataType,
+        statsType,
+        totalRows,
+        nullCount,
+        nullPercentage,
+        distinctCount,
+        distinctPercentage
+      }
+
+      if (statsType === 'numeric') {
+        const [numRows] = await connection.query(`
+          SELECT
+            MIN(${quotedCol}) AS min_val,
+            MAX(${quotedCol}) AS max_val,
+            AVG(${quotedCol}) AS avg_val,
+            STDDEV(${quotedCol}) AS stddev_val
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        const numRow = (numRows as Array<Record<string, unknown>>)[0]
+        stats.min = numRow?.min_val != null ? String(numRow.min_val) : null
+        stats.max = numRow?.max_val != null ? String(numRow.max_val) : null
+        stats.avg = numRow?.avg_val != null ? Number(numRow.avg_val) : null
+        stats.stdDev = numRow?.stddev_val != null ? Number(numRow.stddev_val) : null
+
+        if (totalRows > 0) {
+          const [minMaxRows] = await connection.query(`
+            SELECT MIN(${quotedCol}) AS min_val, MAX(${quotedCol}) AS max_val
+            FROM ${quotedTable}
+            WHERE ${quotedCol} IS NOT NULL
+          `)
+          const mmRow = (minMaxRows as Array<Record<string, unknown>>)[0]
+          const minVal = Number(mmRow?.min_val)
+          const maxVal = Number(mmRow?.max_val)
+
+          if (!isNaN(minVal) && !isNaN(maxVal) && minVal < maxVal) {
+            const bucketSize = (maxVal - minVal) / 10
+            const cases = Array.from({ length: 10 }, (_, i) => {
+              const lo = minVal + i * bucketSize
+              const hi = minVal + (i + 1) * bucketSize
+              const label = i + 1
+              if (i === 9) {
+                return `WHEN ${quotedCol} >= ${lo} THEN ${label}`
+              }
+              return `WHEN ${quotedCol} >= ${lo} AND ${quotedCol} < ${hi} THEN ${label}`
+            }).join('\n              ')
+
+            const [histRows] = await connection.query(`
+              SELECT
+                bucket,
+                COUNT(*) AS cnt
+              FROM (
+                SELECT CASE
+                  ${cases}
+                  ELSE 1
+                END AS bucket
+                FROM ${quotedTable}
+                WHERE ${quotedCol} IS NOT NULL
+              ) t
+              GROUP BY bucket
+              ORDER BY bucket
+            `)
+
+            const histResult = histRows as Array<Record<string, unknown>>
+            if (histResult.length > 0) {
+              stats.histogram = histResult.map((row) => {
+                const b = Number(row.bucket) - 1
+                return {
+                  min: minVal + b * bucketSize,
+                  max: minVal + (b + 1) * bucketSize,
+                  count: Number(row.cnt)
+                }
+              })
+            }
+          }
+        }
+      } else if (statsType === 'text') {
+        const [textRows] = await connection.query(`
+          SELECT
+            MIN(CHAR_LENGTH(${quotedCol})) AS min_length,
+            MAX(CHAR_LENGTH(${quotedCol})) AS max_length,
+            AVG(CHAR_LENGTH(${quotedCol})) AS avg_length
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        const textRow = (textRows as Array<Record<string, unknown>>)[0]
+        stats.minLength = textRow?.min_length != null ? Number(textRow.min_length) : null
+        stats.maxLength = textRow?.max_length != null ? Number(textRow.max_length) : null
+        stats.avgLength = textRow?.avg_length != null ? Number(textRow.avg_length) : null
+
+        const [commonRows] = await connection.query(`
+          SELECT
+            ${quotedCol} AS val,
+            COUNT(*) AS cnt,
+            ROUND(COUNT(*) * 100.0 / ${totalRows}, 2) AS pct
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+          GROUP BY ${quotedCol}
+          ORDER BY cnt DESC
+          LIMIT 5
+        `)
+
+        const commonResult = commonRows as Array<Record<string, unknown>>
+        const commonValues: CommonValue[] = commonResult.map((row) => ({
+          value: row.val != null ? String(row.val) : null,
+          count: Number(row.cnt),
+          percentage: Number(row.pct)
+        }))
+        stats.commonValues = commonValues
+      } else if (statsType === 'datetime') {
+        const [dtRows] = await connection.query(`
+          SELECT
+            MIN(${quotedCol}) AS min_val,
+            MAX(${quotedCol}) AS max_val
+          FROM ${quotedTable}
+          WHERE ${quotedCol} IS NOT NULL
+        `)
+
+        const dtRow = (dtRows as Array<Record<string, unknown>>)[0]
+        stats.min = dtRow?.min_val != null ? String(dtRow.min_val) : null
+        stats.max = dtRow?.max_val != null ? String(dtRow.max_val) : null
+      } else if (statsType === 'boolean') {
+        const [boolRows] = await connection.query(`
+          SELECT
+            SUM(CASE WHEN ${quotedCol} = 1 THEN 1 ELSE 0 END) AS true_count,
+            SUM(CASE WHEN ${quotedCol} = 0 THEN 1 ELSE 0 END) AS false_count
+          FROM ${quotedTable}
+        `)
+
+        const boolRow = (boolRows as Array<Record<string, unknown>>)[0]
+        stats.trueCount = Number(boolRow?.true_count ?? 0)
+        stats.falseCount = Number(boolRow?.false_count ?? 0)
+      }
+
+      return stats
+    })
+  }
+
+  async getActiveQueries(config: ConnectionConfig): Promise<ActiveQuery[]> {
+    return withMySQLConnection(config, async (connection) => {
+      const [rows] = await connection.query(`
+        SELECT
+          ID AS pid,
+          USER AS user,
+          DB AS db,
+          STATE AS state,
+          TIME AS time_sec,
+          INFO AS query,
+          COMMAND AS command
+        FROM information_schema.processlist
+        WHERE COMMAND != 'Sleep'
+          AND ID != CONNECTION_ID()
+          AND INFO IS NOT NULL
+        ORDER BY TIME DESC
+      `)
+
+      return (rows as Array<Record<string, unknown>>).map((row) => ({
+        pid: Number(row.pid),
+        user: String(row.user ?? ''),
+        database: String(row.db ?? ''),
+        state: String(row.state ?? row.command ?? ''),
+        duration: `${Number(row.time_sec ?? 0)}s`,
+        durationMs: Number(row.time_sec ?? 0) * 1000,
+        query: String(row.query ?? '')
+      }))
+    })
+  }
+
+  async getTableSizes(
+    config: ConnectionConfig,
+    schema?: string
+  ): Promise<{ dbSize: DatabaseSizeInfo; tables: TableSizeInfo[] }> {
+    return withMySQLConnection(config, async (connection) => {
+      const dbName = schema || config.database || ''
+
+      const [dbSizeRows] = await connection.query(
+        `
+        SELECT
+          SUM(data_length + index_length) AS total_size_bytes
+        FROM information_schema.tables
+        WHERE table_schema = ?
+        `,
+        [dbName]
+      )
+      const dbRow = (dbSizeRows as Array<Record<string, unknown>>)[0]
+      const totalSizeBytes = Number(dbRow?.total_size_bytes ?? 0)
+
+      const dbSize: DatabaseSizeInfo = {
+        totalSize: this.formatBytes(totalSizeBytes),
+        totalSizeBytes
+      }
+
+      const [tableRows] = await connection.query(
+        `
+        SELECT
+          table_schema AS table_schema,
+          table_name AS table_name,
+          table_rows AS row_count_estimate,
+          data_length AS data_size_bytes,
+          index_length AS index_size_bytes,
+          data_length + index_length AS total_size_bytes
+        FROM information_schema.tables
+        WHERE table_schema = ?
+          AND table_type = 'BASE TABLE'
+        ORDER BY data_length + index_length DESC
+        `,
+        [dbName]
+      )
+
+      const tables: TableSizeInfo[] = (tableRows as Array<Record<string, unknown>>).map((row) => {
+        const dataSizeBytes = Number(row.data_size_bytes ?? 0)
+        const indexSizeBytes = Number(row.index_size_bytes ?? 0)
+        const tSizeBytes = Number(row.total_size_bytes ?? 0)
+        return {
+          schema: String(row.table_schema ?? ''),
+          table: String(row.table_name ?? ''),
+          rowCountEstimate: Number(row.row_count_estimate ?? 0),
+          dataSize: this.formatBytes(dataSizeBytes),
+          dataSizeBytes,
+          indexSize: this.formatBytes(indexSizeBytes),
+          indexSizeBytes,
+          totalSize: this.formatBytes(tSizeBytes),
+          totalSizeBytes: tSizeBytes
+        }
+      })
+
+      return { dbSize, tables }
+    })
+  }
+
+  async getCacheStats(config: ConnectionConfig): Promise<CacheStats> {
+    return withMySQLConnection(config, async (connection) => {
+      const [rows] = await connection.query(`
+        SHOW STATUS LIKE 'Innodb_buffer_pool_read%'
+      `)
+
+      const statusMap = new Map<string, number>()
+      for (const row of rows as Array<Record<string, unknown>>) {
+        statusMap.set(String(row.Variable_name), Number(row.Value ?? 0))
+      }
+
+      const readRequests = statusMap.get('Innodb_buffer_pool_read_requests') ?? 0
+      const reads = statusMap.get('Innodb_buffer_pool_reads') ?? 0
+      const bufferCacheHitRatio =
+        readRequests > 0 ? Math.round(((readRequests - reads) / readRequests) * 10000) / 100 : 0
+
+      return {
+        bufferCacheHitRatio,
+        indexHitRatio: bufferCacheHitRatio
+      }
+    })
+  }
+
+  async getLocks(config: ConnectionConfig): Promise<LockInfo[]> {
+    return withMySQLConnection(config, async (connection) => {
+      // Let query failures (e.g. missing performance_schema grants) propagate so the
+      // db:locks handler surfaces a real error instead of an empty "no locks" result.
+      const [rows] = await connection.query(`
+          SELECT
+            r.REQUESTING_ENGINE_TRANSACTION_ID AS blocked_trx,
+            r.BLOCKING_ENGINE_TRANSACTION_ID AS blocking_trx,
+            w.PROCESSLIST_ID AS blocked_pid,
+            w.PROCESSLIST_USER AS blocked_user,
+            w.PROCESSLIST_INFO AS blocked_query,
+            b.PROCESSLIST_ID AS blocking_pid,
+            b.PROCESSLIST_USER AS blocking_user,
+            b.PROCESSLIST_INFO AS blocking_query,
+            r.LOCK_TYPE AS lock_type,
+            CONCAT(r.OBJECT_SCHEMA, '.', r.OBJECT_NAME) AS relation,
+            TIMESTAMPDIFF(SECOND, w.PROCESSLIST_TIME, 0) AS wait_sec
+          FROM performance_schema.data_lock_waits r
+          JOIN performance_schema.threads w_t ON w_t.THREAD_ID = r.REQUESTING_THREAD_ID
+          JOIN performance_schema.processlist w ON w.ID = w_t.PROCESSLIST_ID
+          JOIN performance_schema.threads b_t ON b_t.THREAD_ID = r.BLOCKING_THREAD_ID
+          JOIN performance_schema.processlist b ON b.ID = b_t.PROCESSLIST_ID
+        `)
+
+      return (rows as Array<Record<string, unknown>>).map((row) => {
+        const waitSec = Math.abs(Number(row.wait_sec ?? 0))
+        return {
+          blockedPid: Number(row.blocked_pid ?? 0),
+          blockedUser: String(row.blocked_user ?? ''),
+          blockedQuery: String(row.blocked_query ?? ''),
+          blockingPid: Number(row.blocking_pid ?? 0),
+          blockingUser: String(row.blocking_user ?? ''),
+          blockingQuery: String(row.blocking_query ?? ''),
+          lockType: String(row.lock_type ?? ''),
+          relation: row.relation ? String(row.relation) : undefined,
+          waitDuration: `${waitSec}s`,
+          waitDurationMs: waitSec * 1000
+        }
+      })
+    })
+  }
+
+  async killQuery(
+    config: ConnectionConfig,
+    pid: number
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      return await withMySQLConnection(config, async (connection) => {
+        await connection.query(`KILL QUERY ${Number(pid)}`)
+        return { success: true }
+      })
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  }
+
+  async runSchemaIntel(
+    config: ConnectionConfig,
+    checks?: SchemaIntelCheckId[]
+  ): Promise<SchemaIntelReport> {
+    return withMySQLConnection(config, async (connection) => {
+      return await runMysqlSchemaIntel(connection, config.database, checks)
+    })
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 bytes'
+    const units = ['bytes', 'kB', 'MB', 'GB', 'TB']
+    const i = Math.floor(Math.log(bytes) / Math.log(1024))
+    return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
   }
 }
